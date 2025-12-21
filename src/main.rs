@@ -25,8 +25,9 @@ use targets::TargetDatabase;
 const TARGETS_FILE: &str = "targets.json";
 
 // Pipeline buffer size (GPU batches in flight)
-// Large buffer prevents blocking GPU when verifier is slow (e.g., disk I/O)
-const PIPELINE_DEPTH: usize = 64;
+// With smaller batches (8M vs 134M), we need more depth for continuous GPU utilization
+// 256 batches × 8.4M = ~2.1B keys in flight for smooth pipelining
+const PIPELINE_DEPTH: usize = 256;
 
 // Batch for verification: (base_key, matches)
 type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
@@ -147,39 +148,61 @@ fn run_pipelined(
         }
     });
 
-    // CPU verification thread with FP tracking and deduplication
+    // CPU verification with PARALLEL processing using rayon
+    // This is the critical fix: single-threaded verification was the bottleneck
     let verify_fp = Arc::new(AtomicU64::new(0)); // Track bloom false positives
     let verify_fp_clone = verify_fp.clone();
+    
+    // Shared set for deduplication (thread-safe)
+    use std::sync::Mutex;
+    use std::collections::HashSet;
+    let found_keys: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+    let found_keys_clone = found_keys.clone();
+    
     let verify_handle = thread::spawn(move || {
-        use std::collections::HashSet;
-        // Deduplicate found keys - same key can match multiple address types
-        // (compressed pubkey hash, uncompressed pubkey hash, P2SH script hash)
-        let mut found_keys: HashSet<[u8; 32]> = HashSet::new();
+        use rayon::prelude::*;
         
         while !verify_shutdown.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((base_key, matches)) => {
-                    for pm in matches {
-                        if let Some((addr, atype, privkey)) =
-                            verify_match(&base_key, &pm, &targets)
-                        {
-                            // CRITICAL: Deduplicate - same key can match multiple address types
-                            if found_keys.insert(privkey) {
-                                verify_found.fetch_add(1, Ordering::Relaxed);
-                                
-                                // CRITICAL: WIF format depends on pubkey compression!
-                                // Uncompressed pubkeys (legacy P2PKH) need uncompressed WIF
-                                // Compressed and P2SH always use compressed WIF
-                                let compressed = pm.match_type != gpu::MatchType::Uncompressed;
-                                report(&privkey, &addr, atype, compressed);
-                            }
-                        } else {
-                            // Bloom filter false positive (expected behavior)
-                            verify_fp_clone.fetch_add(1, Ordering::Relaxed);
-                        }
+            // Collect multiple batches for better parallelism
+            let mut batches: Vec<VerifyBatch> = Vec::with_capacity(32);
+            
+            // Drain available batches (non-blocking after first)
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(batch) => {
+                    batches.push(batch);
+                    // Grab more if available (non-blocking)
+                    while let Ok(b) = rx.try_recv() {
+                        batches.push(b);
+                        if batches.len() >= 64 { break; } // Cap to prevent memory bloat
                     }
                 }
                 Err(_) => continue, // Timeout, check shutdown
+            }
+            
+            // Process all collected batches in parallel using rayon
+            let results: Vec<_> = batches.par_iter()
+                .flat_map(|(base_key, matches)| {
+                    matches.par_iter().filter_map(|pm| {
+                        if let Some((addr, atype, privkey)) = verify_match(base_key, pm, &targets) {
+                            let compressed = pm.match_type != gpu::MatchType::Uncompressed;
+                            Some((addr, atype, privkey, compressed))
+                        } else {
+                            // Count false positives (atomic, safe)
+                            verify_fp_clone.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    })
+                })
+                .collect();
+            
+            // Process verified matches (sequential for deduplication & I/O)
+            for (addr, atype, privkey, compressed) in results {
+                let mut keys = found_keys_clone.lock().unwrap();
+                if keys.insert(privkey) {
+                    drop(keys); // Release lock before I/O
+                    verify_found.fetch_add(1, Ordering::Relaxed);
+                    report(&privkey, &addr, atype, compressed);
+                }
             }
         }
     });
@@ -224,8 +247,8 @@ fn run_pipelined(
 // ============================================================================
 
 /// Maximum key_index that GPU can generate: MAX_THREADS × KEYS_PER_THREAD
-/// 262_144 × 512 = 134_217_728
-const MAX_KEY_OFFSET: u64 = 262_144 * 512;
+/// 32_768 × 256 = 8_388_608 (~8.4M keys/batch)
+const MAX_KEY_OFFSET: u64 = 32_768 * 256;
 
 fn generate_random_key() -> [u8; 32] {
     use rand::RngCore;

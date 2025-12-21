@@ -11,11 +11,14 @@ use crate::types::Hash160;
 // CONFIG
 // ============================================================================
 
-/// Maximum threads per dispatch (262144 × 512 = 134M keys/batch)
-const MAX_THREADS: usize = 262_144;
+/// Maximum threads per dispatch (32768 × 256 = ~8.4M keys/batch)
+/// Smaller batches = faster GPU response time, better thermal management on M1
+/// Also reduces pipeline latency for CPU verification
+const MAX_THREADS: usize = 32_768;
 
 /// Keys processed per thread
-const KEYS_PER_THREAD: u32 = 512;
+/// Reduced from 512 to 256 to prevent GPU watchdog timeouts and thermal throttling
+const KEYS_PER_THREAD: u32 = 256;
 
 /// Match buffer size (bloom false positives can be high with large target sets)
 /// For 60M targets with 0.05% FP rate: 134M keys × 0.0005 = ~67K expected matches
@@ -38,9 +41,10 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
-        // Use n*20 for very low false positive rate (~0.05% with 7 hash functions)
-        // This reduces match buffer pressure significantly
-        let num_bits = (n * 20).next_power_of_two().max(1024);
+        // Use n*32 for extremely low false positive rate (~0.001% with 7 hash functions)
+        // This dramatically reduces CPU verification pressure
+        // With 50M targets: n*32 = 1.6B bits = 200MB, worth it for 80-90% FP reduction
+        let num_bits = (n * 32).next_power_of_two().max(1024);
         let num_words = num_bits / 64;
         Self {
             bits: vec![0u64; num_words],
