@@ -272,74 +272,72 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     }
     println!("  [✓] CPU reference calculations verified");
     
-    // Now test GPU: scan a batch starting from key=1 and verify matches
+    // Now test GPU: scan a batch and verify GPU hashes match CPU
     println!("  [🔍] Testing GPU hash calculations...");
     
-    // Create a temporary target set with our known hashes
-    let test_hash: [u8; 20] = hex::decode("751e76e8199196d454941c45d1b3a323f1433bd6")
-        .unwrap().try_into().unwrap();
-    
-    // Check if our test hash is in the bloom filter (it should produce a match)
-    // We need to scan from key=1 and check if key_index=0 returns the correct hash
     let base_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
         .unwrap().try_into().unwrap();
     
     match scanner.scan_batch(&base_key) {
         Ok(matches) => {
-            // Look for key_index = 0 (which is base_key itself = private key 1)
-            let mut found_key_0 = false;
-            for m in &matches {
-                if m.key_index == 0 {
-                    found_key_0 = true;
-                    // Verify the hash matches what we expect
-                    let hash_bytes = m.hash.as_bytes();
+            println!("      Bloom filter hits in batch: {}", matches.len());
+            
+            // CRITICAL TEST: Verify EVERY match from GPU against CPU calculation
+            // This is the definitive test - if even ONE hash differs, GPU is broken
+            let mut verified_count = 0;
+            let mut failed_count = 0;
+            let check_limit = matches.len().min(10); // Check up to 10 matches
+            
+            for (i, m) in matches.iter().take(check_limit).enumerate() {
+                // Reconstruct private key: base_key + key_index
+                let mut priv_key = base_key;
+                let mut carry = m.key_index as u64;
+                for byte in priv_key.iter_mut().rev() {
+                    let sum = *byte as u64 + (carry & 0xFF);
+                    *byte = sum as u8;
+                    carry = (carry >> 8) + (sum >> 8);
+                }
+                
+                // Calculate hash on CPU
+                if let Ok(secret) = SecretKey::from_slice(&priv_key) {
+                    let pubkey = secret.public_key();
                     
-                    match m.match_type {
+                    let cpu_hash: [u8; 20] = match m.match_type {
                         gpu::MatchType::Compressed => {
-                            if *hash_bytes == test_hash {
-                                println!("  [✓] GPU compressed hash CORRECT for key=1");
-                            } else {
-                                eprintln!("  [✗] GPU compressed hash WRONG for key=1!");
-                                eprintln!("      Expected: {}", hex::encode(test_hash));
-                                eprintln!("      Got:      {}", hex::encode(hash_bytes));
-                                all_passed = false;
-                            }
+                            let comp = pubkey.to_encoded_point(true);
+                            crypto::hash160(comp.as_bytes())
                         }
                         gpu::MatchType::Uncompressed => {
-                            // We expect uncompressed hash: 91b24bf9f5288532960ac687abb035127b1d28a5
-                            let expected_uncomp: [u8; 20] = hex::decode("91b24bf9f5288532960ac687abb035127b1d28a5")
-                                .unwrap().try_into().unwrap();
-                            if *hash_bytes == expected_uncomp {
-                                println!("  [✓] GPU uncompressed hash CORRECT for key=1");
-                            } else {
-                                eprintln!("  [✗] GPU uncompressed hash WRONG for key=1!");
-                                eprintln!("      Expected: {}", hex::encode(expected_uncomp));
-                                eprintln!("      Got:      {}", hex::encode(hash_bytes));
-                                all_passed = false;
-                            }
+                            let uncomp = pubkey.to_encoded_point(false);
+                            crypto::hash160(uncomp.as_bytes())
                         }
                         gpu::MatchType::P2SH => {
-                            // We expect P2SH hash: bcfeb728b584253d5f3f70bcb780e9ef218a68f4
-                            let expected_p2sh: [u8; 20] = hex::decode("bcfeb728b584253d5f3f70bcb780e9ef218a68f4")
-                                .unwrap().try_into().unwrap();
-                            if *hash_bytes == expected_p2sh {
-                                println!("  [✓] GPU P2SH hash CORRECT for key=1");
-                            } else {
-                                eprintln!("  [✗] GPU P2SH hash WRONG for key=1!");
-                                eprintln!("      Expected: {}", hex::encode(expected_p2sh));
-                                eprintln!("      Got:      {}", hex::encode(hash_bytes));
-                                all_passed = false;
-                            }
+                            let comp = pubkey.to_encoded_point(true);
+                            let comp_hash = crypto::hash160(comp.as_bytes());
+                            address::p2sh_script_hash(&comp_hash)
                         }
+                    };
+                    
+                    let gpu_hash = m.hash.as_bytes();
+                    
+                    if cpu_hash == *gpu_hash {
+                        verified_count += 1;
+                    } else {
+                        failed_count += 1;
+                        eprintln!("  [✗] HASH MISMATCH at index {}!", i);
+                        eprintln!("      key_index: {}, type: {:?}", m.key_index, m.match_type);
+                        eprintln!("      GPU: {}", hex::encode(gpu_hash));
+                        eprintln!("      CPU: {}", hex::encode(cpu_hash));
+                        all_passed = false;
                     }
                 }
             }
             
-            if !found_key_0 {
-                // This might be OK if the hash isn't in bloom filter
-                // But we should at least check that SOME matches exist
-                println!("  [⚠] Key 0 not in matches (expected if hash not in bloom filter)");
-                println!("      Total matches in batch: {} (these are bloom filter hits)", matches.len());
+            if failed_count == 0 && verified_count > 0 {
+                println!("  [✓] Verified {}/{} GPU hashes match CPU exactly", verified_count, check_limit);
+            } else if verified_count == 0 {
+                eprintln!("  [✗] No matches to verify!");
+                all_passed = false;
             }
         }
         Err(e) => {
