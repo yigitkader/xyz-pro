@@ -510,10 +510,11 @@ kernel void scan_keys(
         #undef STEP_ADD
     }
 
-    // Montgomery batch inversion (BATCH_SIZE = 16)
+    // Montgomery batch inversion (BATCH_SIZE = 32)
     // Larger batch = fewer mod_inv calls = better performance
-    // 16 is optimal (2^4) for Montgomery batch inversion
-    #define BATCH_SIZE 16
+    // 32 gives 2x fewer mod_inv calls than 16, at cost of more register pressure
+    // For Apple Silicon's large register file, 32 is optimal
+    #define BATCH_SIZE 32
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_Zinv[BATCH_SIZE];
     bool batch_valid[BATCH_SIZE]; // Track valid (non-zero Z) points
 

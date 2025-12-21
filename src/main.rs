@@ -223,10 +223,130 @@ fn run_self_test() -> bool {
     all_passed
 }
 
+/// GPU pipelining self-test - verifies that async dispatch/collect works correctly
+/// This catches race conditions and buffer synchronization issues
+fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64 as AU64};
+    use std::time::Instant;
+    
+    println!("[🔍] Running GPU pipeline test...");
+    
+    let mut all_passed = true;
+    let shutdown = AtomicBool::new(false);
+    
+    // Test 1: Run a few pipelined batches and verify no crashes/hangs
+    let start = Instant::now();
+    let batch_count = AtomicU32::new(0);
+    let total_matches = AU64::new(0);
+    
+    // Use known test key for reproducibility
+    let test_key_counter = AU64::new(1);
+    let keys_per_batch = scanner.keys_per_batch();
+    
+    let result = scanner.scan_pipelined(
+        // Key generator - use sequential keys for testing
+        || {
+            let counter = test_key_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
+            let mut key = [0u8; 32];
+            key[24..32].copy_from_slice(&counter.to_be_bytes());
+            
+            // Stop after 5 batches
+            if batch_count.load(Ordering::Relaxed) >= 5 {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+            key
+        },
+        // Batch handler
+        |_base_key, matches| {
+            batch_count.fetch_add(1, Ordering::Relaxed);
+            total_matches.fetch_add(matches.len() as u64, Ordering::Relaxed);
+        },
+        &shutdown,
+    );
+    
+    let batch_count = batch_count.load(Ordering::Relaxed);
+    let total_matches = total_matches.load(Ordering::Relaxed);
+    let _ = total_matches; // Suppress unused warning
+    
+    let elapsed = start.elapsed();
+    
+    match result {
+        Ok(()) => {
+            // Verify we processed expected number of batches
+            if batch_count >= 5 {
+                let keys_scanned = batch_count as u64 * scanner.keys_per_batch();
+                let speed = keys_scanned as f64 / elapsed.as_secs_f64();
+                println!("  [✓] GPU pipeline: {} batches, {:.1}M keys in {:.2}s ({:.1}M/s)", 
+                    batch_count, 
+                    keys_scanned as f64 / 1_000_000.0,
+                    elapsed.as_secs_f64(),
+                    speed / 1_000_000.0
+                );
+                
+                // Sanity check: should complete in reasonable time (<30s for 5 batches)
+                if elapsed.as_secs() > 30 {
+                    eprintln!("  [✗] GPU pipeline too slow: {}s for 5 batches", elapsed.as_secs());
+                    all_passed = false;
+                }
+            } else {
+                eprintln!("  [✗] GPU pipeline incomplete: only {} batches processed", batch_count);
+                all_passed = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("  [✗] GPU pipeline error: {}", e);
+            all_passed = false;
+        }
+    }
+    
+    // Test 2: Verify double-buffering doesn't cause data corruption
+    // Run two batches with known keys and verify results are consistent
+    println!("  [🔍] Testing double-buffer consistency...");
+    
+    let test_key_a: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+        .unwrap().try_into().unwrap();
+    let test_key_b: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000100000000000000000001")
+        .unwrap().try_into().unwrap();
+    
+    // Run same keys twice and verify consistent results
+    let result_a1 = scanner.scan_batch(&test_key_a);
+    let result_b1 = scanner.scan_batch(&test_key_b);
+    let result_a2 = scanner.scan_batch(&test_key_a);
+    let result_b2 = scanner.scan_batch(&test_key_b);
+    
+    match (result_a1, result_b1, result_a2, result_b2) {
+        (Ok(a1), Ok(b1), Ok(a2), Ok(b2)) => {
+            // Same keys should produce same match counts (bloom filter is deterministic)
+            if a1.len() == a2.len() && b1.len() == b2.len() {
+                println!("  [✓] Double-buffer consistency verified");
+            } else {
+                eprintln!("  [✗] Double-buffer inconsistency detected!");
+                eprintln!("      Key A: {} vs {} matches", a1.len(), a2.len());
+                eprintln!("      Key B: {} vs {} matches", b1.len(), b2.len());
+                all_passed = false;
+            }
+        }
+        _ => {
+            eprintln!("  [✗] Double-buffer test failed with errors");
+            all_passed = false;
+        }
+    }
+    
+    if all_passed {
+        println!("[✓] GPU pipeline test passed\n");
+    } else {
+        eprintln!("[✗] GPU PIPELINE TEST FAILED!\n");
+    }
+    
+    all_passed
+}
+
 // Pipeline buffer size (GPU batches in flight)
-// With smaller batches (8M vs 134M), we need more depth for continuous GPU utilization
-// 256 batches × 8.4M = ~2.1B keys in flight for smooth pipelining
-const PIPELINE_DEPTH: usize = 256;
+// With true async pipelining, only 3 buffers needed:
+// - One being processed by GPU
+// - One being verified by CPU
+// - One being prepared for next submission
+const PIPELINE_DEPTH: usize = 3;
 
 // Batch for verification: (base_key, matches)
 type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
@@ -266,6 +386,12 @@ fn main() {
             return;
         }
     };
+
+    // Run GPU pipeline test to verify async operations work correctly
+    if !run_gpu_pipeline_test(&gpu) {
+        eprintln!("\n[FATAL] GPU pipeline test failed. Exiting to prevent data corruption.");
+        std::process::exit(1);
+    }
 
     // State
     let counter = Arc::new(AtomicU64::new(0));
@@ -324,34 +450,31 @@ fn run_pipelined(
     let gpu_counter = counter.clone();
     let verify_found = found.clone();
 
-    // GPU thread: continuous scanning
+    // GPU thread: TRUE ASYNC PIPELINING via scan_pipelined()
+    // GPU works on batch N while we process results from batch N-1
     let keys_per_batch = gpu.keys_per_batch();
     let gpu_handle = thread::spawn(move || {
-        while !gpu_shutdown.load(Ordering::Relaxed) {
-            let base_key = generate_random_key(keys_per_batch);
-
-            match gpu.scan_batch(&base_key) {
-                Ok(matches) => {
-                    let batch_size = gpu.keys_per_batch();
-                    gpu_counter.fetch_add(batch_size, Ordering::Relaxed);
-
-                    // Send to verification - BLOCKING to NEVER lose matches
-                    // GPU will wait if verifier is slow, but no match is ever dropped
-                    if !matches.is_empty() {
-                        if let Err(e) = tx.send((base_key, matches)) {
-                            // Channel disconnected = verifier thread died
-                            eprintln!("[!] CRITICAL: Verifier thread disconnected: {}", e);
-                            gpu_shutdown.store(true, Ordering::SeqCst);
-                            break;
-                        }
+        let result = gpu.scan_pipelined(
+            // Key generator closure
+            || generate_random_key(keys_per_batch),
+            // Batch result handler closure
+            |base_key, matches| {
+                gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
+                
+                // Send to verification (blocking to never lose matches)
+                if !matches.is_empty() {
+                    if let Err(e) = tx.send((base_key, matches)) {
+                        eprintln!("[!] CRITICAL: Verifier thread disconnected: {}", e);
+                        gpu_shutdown.store(true, Ordering::SeqCst);
                     }
                 }
-                Err(e) => {
-                    eprintln!("[!] GPU error: {}", e);
-                    gpu_shutdown.store(true, Ordering::SeqCst);
-                    break;
-                }
-            }
+            },
+            &gpu_shutdown,
+        );
+        
+        if let Err(e) = result {
+            eprintln!("[!] GPU error: {}", e);
+            gpu_shutdown.store(true, Ordering::SeqCst);
         }
     });
 

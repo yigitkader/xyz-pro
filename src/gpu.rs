@@ -226,17 +226,19 @@ fn compute_step_table(keys_per_thread: u32) -> [[u8; 64]; 20] {
 // ============================================================================
 
 /// Double buffer set for pipelined GPU execution
+/// Each buffer set has its own command queue for true parallel execution
 struct BufferSet {
+    queue: CommandQueue,  // Separate queue per buffer for independent execution
     base_point_buf: Buffer,
     match_data_buf: Buffer,
     match_count_buf: Buffer,
 }
 
 pub struct OptimizedScanner {
-    queue: CommandQueue,
     pipeline: ComputePipelineState,
 
-    // Double buffers for pipelining (GPU processes A while CPU prepares B)
+    // Double buffers with separate queues for TRUE pipelining
+    // Queue 0 runs buffer 0 work, Queue 1 runs buffer 1 work independently
     buffer_sets: [BufferSet; 2],
     current_buffer: std::sync::atomic::AtomicUsize,
 
@@ -295,7 +297,6 @@ impl OptimizedScanner {
         let config = GpuConfig::detect(&device);
         config.print_summary();
 
-        let queue = device.new_command_queue();
         let opts = CompileOptions::new();
 
         // Load shader
@@ -330,19 +331,25 @@ impl OptimizedScanner {
         let storage = MTLResourceOptions::StorageModeShared;
         let match_buffer_size = config.match_buffer_size;
 
-        // Double buffer sets for pipelined execution
+        // Double buffer sets with SEPARATE QUEUES for TRUE parallel pipelining
+        // Each queue can run independently, allowing batch N to process
+        // while we collect results from batch N-1
         let buffer_sets = [
             BufferSet {
+                queue: device.new_command_queue(),  // Queue 0 for buffer 0
                 base_point_buf: device.new_buffer(64, storage),
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
             BufferSet {
+                queue: device.new_command_queue(),  // Queue 1 for buffer 1
                 base_point_buf: device.new_buffer(64, storage),
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
         ];
+        
+        println!("[GPU] Dual command queues for true parallel pipelining");
 
         // Shared read-only buffers
         let step_table_buf = device.new_buffer_with_data(
@@ -397,7 +404,6 @@ impl OptimizedScanner {
         );
 
         Ok(Self {
-            queue,
             pipeline,
             buffer_sets,
             current_buffer: std::sync::atomic::AtomicUsize::new(0),
@@ -411,11 +417,9 @@ impl OptimizedScanner {
         })
     }
 
-    /// Scan a range of keys starting from base_key
-    /// Uses double buffering for async GPU/CPU overlap
-    pub fn scan_batch(&self, base_key: &[u8; 32]) -> Result<Vec<PotentialMatch>> {
-        // Get current buffer index and swap for next call
-        let buf_idx = self.current_buffer.fetch_xor(1, Ordering::Relaxed);
+    /// Dispatch a batch to GPU and return immediately (non-blocking)
+    /// Each buffer has its own queue, so dispatches are truly independent
+    fn dispatch_batch(&self, base_key: &[u8; 32], buf_idx: usize) -> Result<()> {
         let buffers = &self.buffer_sets[buf_idx];
 
         // Compute base point from base_key
@@ -438,8 +442,8 @@ impl OptimizedScanner {
             *ptr = 0;
         }
 
-        // Dispatch
-        let cmd = self.queue.new_command_buffer();
+        // Dispatch on THIS BUFFER'S QUEUE (independent from other buffer's queue)
+        let cmd = buffers.queue.new_command_buffer();
 
         let grid = MTLSize {
             width: self.config.max_threads as u64,
@@ -467,16 +471,37 @@ impl OptimizedScanner {
         }
 
         cmd.commit();
-        cmd.wait_until_completed();
+        // Note: NOT waiting - returns immediately
+        // This buffer's queue is now processing independently
+        
+        Ok(())
+    }
+    
+    /// Wait for GPU to complete and collect results from specified buffer
+    /// Uses this buffer's dedicated queue, so only waits for THIS buffer's work
+    fn wait_and_collect(&self, buf_idx: usize) -> Result<Vec<PotentialMatch>> {
+        let buffers = &self.buffer_sets[buf_idx];
+        
+        // Sync point on THIS BUFFER'S QUEUE (not the other buffer's queue!)
+        // This ensures only this buffer's compute work is waited for
+        let sync_cmd = buffers.queue.new_command_buffer();
+        {
+            let blit = sync_cmd.new_blit_command_encoder();
+            // Synchronize the buffers - waits for prior compute work on this queue
+            blit.synchronize_resource(&buffers.match_count_buf);
+            blit.synchronize_resource(&buffers.match_data_buf);
+            blit.end_encoding();
+        }
+        sync_cmd.commit();
+        sync_cmd.wait_until_completed();
 
-        // Read results from current buffer
+        // Read results from buffer
         let raw_match_count = unsafe {
             let ptr = buffers.match_count_buf.contents() as *const u32;
             *ptr
         };
         
         // CRITICAL: Buffer overflow means we lost matches - this is unacceptable
-        // Either upgrade to a higher-tier GPU or reduce target set size
         let match_buffer_size = self.config.match_buffer_size;
         if raw_match_count as usize > match_buffer_size {
             return Err(ScannerError::Gpu(format!(
@@ -523,6 +548,52 @@ impl OptimizedScanner {
         }
 
         Ok(matches)
+    }
+    
+    /// Scan a range of keys starting from base_key (SYNCHRONOUS)
+    #[allow(dead_code)]
+    pub fn scan_batch(&self, base_key: &[u8; 32]) -> Result<Vec<PotentialMatch>> {
+        let buf_idx = self.current_buffer.fetch_xor(1, Ordering::Relaxed);
+        self.dispatch_batch(base_key, buf_idx)?;
+        self.wait_and_collect(buf_idx)
+    }
+    
+    /// Process batches with TRUE GPU/CPU pipelining
+    /// GPU works on batch N while CPU processes results from batch N-1
+    /// This is the high-performance scanning method
+    pub fn scan_pipelined<F, G>(&self, mut key_gen: F, mut on_batch: G, shutdown: &std::sync::atomic::AtomicBool) -> Result<()>
+    where
+        F: FnMut() -> [u8; 32],
+        G: FnMut([u8; 32], Vec<PotentialMatch>),
+    {
+        // Track previous batch info
+        let mut prev_batch: Option<([u8; 32], usize)> = None;
+        let mut current_buf = 0usize;
+        
+        while !shutdown.load(Ordering::Relaxed) {
+            // Step 1: Dispatch NEW batch (non-blocking)
+            let base_key = key_gen();
+            self.dispatch_batch(&base_key, current_buf)?;
+            
+            // Step 2: While GPU works on new batch, collect PREVIOUS results
+            // This is the key: GPU and CPU work in parallel!
+            if let Some((prev_key, prev_buf)) = prev_batch.take() {
+                let matches = self.wait_and_collect(prev_buf)?;
+                on_batch(prev_key, matches);
+            }
+            
+            // Step 3: Current batch becomes previous for next iteration
+            prev_batch = Some((base_key, current_buf));
+            current_buf = 1 - current_buf; // Swap buffer (0 -> 1 -> 0 -> ...)
+        }
+        
+        // Collect final batch on shutdown
+        if let Some((prev_key, prev_buf)) = prev_batch {
+            let matches = self.wait_and_collect(prev_buf)?;
+            on_batch(prev_key, matches);
+        }
+        
+        Ok(())
     }
 
     pub fn keys_per_batch(&self) -> u64 {
