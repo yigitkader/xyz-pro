@@ -323,19 +323,23 @@ impl OptimizedScanner {
             *ptr
         };
         
-        // Warn if buffer overflow
+        // CRITICAL: Buffer overflow means we lost matches - this is unacceptable
+        // Either increase MATCH_BUFFER_SIZE or reduce target set size
         if raw_match_count as usize > MATCH_BUFFER_SIZE {
-            eprintln!("[!] WARNING: Match buffer overflow! {} matches found, {} lost", 
-                      raw_match_count, raw_match_count as usize - MATCH_BUFFER_SIZE);
+            return Err(ScannerError::Gpu(format!(
+                "CRITICAL: Match buffer overflow! {} matches found, buffer size {}. \
+                 {} potential matches were lost. Increase MATCH_BUFFER_SIZE or reduce target set.",
+                raw_match_count, MATCH_BUFFER_SIZE, raw_match_count as usize - MATCH_BUFFER_SIZE
+            )));
         }
         
-        let match_count = (raw_match_count as usize).min(MATCH_BUFFER_SIZE);
+        let match_count = raw_match_count as usize;
 
         let keys_scanned = (self.max_threads * self.keys_per_thread as usize) as u64;
         self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);
 
         let mut matches = Vec::with_capacity(match_count);
-        if match_count > 0 && match_count <= MATCH_BUFFER_SIZE {
+        if match_count > 0 {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
             unsafe {
                 let ptr = self.match_data_buf.contents() as *const u8;

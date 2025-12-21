@@ -181,6 +181,12 @@ ulong4 mod_mul(ulong4 a, ulong4 b) {
 inline ulong4 mod_sqr(ulong4 a) { return mod_mul(a, a); }
 
 ulong4 mod_inv(ulong4 a) {
+    // GUARD: mod_inv(0) is undefined in mathematics
+    // Return 0 to signal invalid input - callers should check IsZero(Z) before calling
+    if (IsZero(a)) {
+        return ulong4{0, 0, 0, 0};
+    }
+    
     ulong4 res = {1, 0, 0, 0};
     ulong4 base = a;
     ulong exp[4] = {0xFFFFFFFEFFFFFC2DULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL};

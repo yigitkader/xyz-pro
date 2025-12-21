@@ -126,16 +126,22 @@ fn run_pipelined(
                     let batch_size = gpu.keys_per_batch();
                     gpu_counter.fetch_add(batch_size, Ordering::Relaxed);
 
-                    // Send to verification (non-blocking if full)
+                    // Send to verification with timeout - never drop matches silently
                     if !matches.is_empty() {
-                        if tx.try_send((base_key, matches)).is_err() {
-                            // Channel full, drop oldest or this batch
-                            // In practice, verification is fast enough
+                        match tx.send_timeout((base_key, matches), Duration::from_secs(5)) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("[!] CRITICAL: Failed to send matches to verifier: {}", e);
+                                eprintln!("[!] Matches may have been lost. Shutting down...");
+                                gpu_shutdown.store(true, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("[!] GPU error: {}", e);
+                    gpu_shutdown.store(true, Ordering::SeqCst);
                     break;
                 }
             }
@@ -198,21 +204,55 @@ fn run_pipelined(
 // KEY GENERATION
 // ============================================================================
 
+/// Maximum key_index that GPU can generate: MAX_THREADS × KEYS_PER_THREAD
+/// 262_144 × 512 = 134_217_728
+const MAX_KEY_OFFSET: u64 = 262_144 * 512;
+
 fn generate_random_key() -> [u8; 32] {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
     let mut key = [0u8; 32];
     let mut attempts = 0u32;
+    
     loop {
         rng.fill_bytes(&mut key);
-        if crypto::is_valid_private_key(&key) {
+        
+        // Check 1: Basic validity (0 < key < N)
+        if !crypto::is_valid_private_key(&key) {
+            attempts += 1;
+            if attempts > 10_000 {
+                // RNG is fundamentally broken - this should never happen
+                eprintln!("[FATAL] RNG failure - generated {} invalid keys", attempts);
+                std::process::exit(1);
+            }
+            continue;
+        }
+        
+        // Check 2: Ensure key + MAX_KEY_OFFSET doesn't overflow curve order
+        // This prevents invalid keys when GPU adds key_index to base_key
+        let mut temp = key;
+        let mut carry = MAX_KEY_OFFSET;
+        for byte in temp.iter_mut().rev() {
+            let sum = *byte as u64 + (carry & 0xFF);
+            *byte = sum as u8;
+            carry = (carry >> 8) + (sum >> 8);
+        }
+        
+        // If carry is non-zero, we had 256-bit overflow
+        if carry != 0 {
+            attempts += 1;
+            continue;
+        }
+        
+        // Check if key + MAX_KEY_OFFSET is still valid (< N)
+        if crypto::is_valid_private_key(&temp) {
             return key;
         }
+        
         attempts += 1;
-        // This should practically never happen (probability ~1/2^224)
-        // but defensive programming requires a safety limit
-        if attempts > 1000 {
-            panic!("[FATAL] Failed to generate valid private key after 1000 attempts - RNG may be broken");
+        if attempts > 10_000 {
+            eprintln!("[FATAL] RNG failure - generated {} invalid keys", attempts);
+            std::process::exit(1);
         }
     }
 }

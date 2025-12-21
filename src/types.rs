@@ -19,20 +19,14 @@ impl Hash160 {
     pub fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
-
-    #[inline(always)]
-    fn prefix_u64(&self) -> u64 {
-        u64::from_le_bytes([
-            self.0[0], self.0[1], self.0[2], self.0[3],
-            self.0[4], self.0[5], self.0[6], self.0[7],
-        ])
-    }
 }
 
 impl Hash for Hash160 {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.prefix_u64());
+        // Use all 20 bytes to minimize hash collisions
+        // FxHash and other fast hashers work well with full data
+        state.write(&self.0);
     }
 }
 
