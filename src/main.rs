@@ -25,7 +25,8 @@ use targets::TargetDatabase;
 const TARGETS_FILE: &str = "targets.json";
 
 // Pipeline buffer size (GPU batches in flight)
-const PIPELINE_DEPTH: usize = 2;
+// Large buffer prevents blocking GPU when verifier is slow (e.g., disk I/O)
+const PIPELINE_DEPTH: usize = 64;
 
 // Batch for verification: (base_key, matches)
 type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
@@ -126,16 +127,14 @@ fn run_pipelined(
                     let batch_size = gpu.keys_per_batch();
                     gpu_counter.fetch_add(batch_size, Ordering::Relaxed);
 
-                    // Send to verification with timeout - never drop matches silently
+                    // Send to verification - BLOCKING to NEVER lose matches
+                    // GPU will wait if verifier is slow, but no match is ever dropped
                     if !matches.is_empty() {
-                        match tx.send_timeout((base_key, matches), Duration::from_secs(5)) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!("[!] CRITICAL: Failed to send matches to verifier: {}", e);
-                                eprintln!("[!] Matches may have been lost. Shutting down...");
-                                gpu_shutdown.store(true, Ordering::SeqCst);
-                                break;
-                            }
+                        if let Err(e) = tx.send((base_key, matches)) {
+                            // Channel disconnected = verifier thread died
+                            eprintln!("[!] CRITICAL: Verifier thread disconnected: {}", e);
+                            gpu_shutdown.store(true, Ordering::SeqCst);
+                            break;
                         }
                     }
                 }

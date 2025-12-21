@@ -474,7 +474,7 @@ inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
 // ============================================================================
 
 // Match buffer size - must match MATCH_BUFFER_SIZE in gpu.rs
-#define MAX_MATCHES 262144
+#define MAX_MATCHES 1048576
 
 kernel void scan_keys(
     constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
@@ -515,31 +515,55 @@ kernel void scan_keys(
     // 16 is optimal (2^4) for Montgomery batch inversion
     #define BATCH_SIZE 16
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_Zinv[BATCH_SIZE];
+    bool batch_valid[BATCH_SIZE]; // Track valid (non-zero Z) points
 
     uint keys_done = 0;
     while (keys_done < kpt) {
         uint batch_count = min((uint)BATCH_SIZE, kpt - keys_done);
 
-        // Phase 1: Generate batch points
+        // Phase 1: Generate batch points and track validity
         for (uint b = 0; b < batch_count; b++) {
             batch_X[b] = cur_X; batch_Y[b] = cur_Y; batch_Z[b] = cur_Z;
+            batch_valid[b] = !IsZero(cur_Z); // Mark if point is valid (not infinity)
             jac_add_affine(cur_X, cur_Y, cur_Z, SECP256K1_GX, SECP256K1_GY, cur_X, cur_Y, cur_Z);
         }
 
-        // Phase 2: Montgomery batch inversion
+        // Phase 2: Montgomery batch inversion - SKIP Z=0 POINTS!
+        // Build product chain only with valid (non-zero) Z values
         ulong4 products[BATCH_SIZE];
-        products[0] = batch_Z[0];
-        for (uint b = 1; b < batch_count; b++) products[b] = mod_mul(products[b-1], batch_Z[b]);
-        ulong4 inv = mod_inv(products[batch_count - 1]);
-        for (uint b = batch_count - 1; b > 0; b--) {
-            batch_Zinv[b] = mod_mul(inv, products[b - 1]);
-            inv = mod_mul(inv, batch_Z[b]);
+        int product_map[BATCH_SIZE]; // Maps product index to batch index
+        int valid_count = 0;
+        
+        for (uint b = 0; b < batch_count; b++) {
+            if (batch_valid[b]) {
+                if (valid_count == 0) {
+                    products[0] = batch_Z[b];
+                } else {
+                    products[valid_count] = mod_mul(products[valid_count - 1], batch_Z[b]);
+                }
+                product_map[valid_count] = b;
+                valid_count++;
+            } else {
+                batch_Zinv[b] = ulong4{0, 0, 0, 0}; // Invalid point gets zero inverse
+            }
         }
-        batch_Zinv[0] = inv;
+        
+        // Only invert if we have valid points
+        if (valid_count > 0) {
+            ulong4 inv = mod_inv(products[valid_count - 1]);
+            
+            // Work backwards through valid points only
+            for (int i = valid_count - 1; i > 0; i--) {
+                int b = product_map[i];
+                batch_Zinv[b] = mod_mul(inv, products[i - 1]);
+                inv = mod_mul(inv, batch_Z[b]);
+            }
+            batch_Zinv[product_map[0]] = inv;
+        }
 
         // Phase 3: Convert to affine, hash, check bloom
         for (uint b = 0; b < batch_count; b++) {
-            if (IsZero(batch_Z[b])) continue;
+            if (!batch_valid[b]) continue; // Skip invalid (infinity) points
             ulong4 z_inv2 = mod_sqr(batch_Zinv[b]);
             ulong4 z_inv3 = mod_mul(z_inv2, batch_Zinv[b]);
             ulong4 ax = mod_mul(batch_X[b], z_inv2);
@@ -554,44 +578,39 @@ kernel void scan_keys(
             // match_type: 0=compressed, 1=uncompressed, 2=p2sh
             uint key = base_offset + keys_done + b;
             
+            // Optimized match saving: check buffer space BEFORE atomic increment
+            // This reduces contention when buffer is near capacity
+            #define SAVE_MATCH(hash_arr, type_val) do { \
+                uint cur = atomic_load_explicit(match_count, memory_order_relaxed); \
+                if (cur < MAX_MATCHES) { \
+                    uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed); \
+                    if (idx < MAX_MATCHES) { \
+                        uint off = idx * 52; \
+                        match_data[off+0] = key; match_data[off+1] = key>>8; \
+                        match_data[off+2] = key>>16; match_data[off+3] = key>>24; \
+                        match_data[off+4] = type_val; \
+                        for (int p = 5; p < 32; p++) match_data[off+p] = 0; \
+                        for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = hash_arr[hh]; \
+                    } \
+                } \
+            } while(0)
+            
             // Check compressed
             if (bloom_check(h_comp, bloom, bloom_sz)) {
-                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-                if (idx < MAX_MATCHES) {
-                    uint off = idx * 52;
-                    match_data[off+0] = key; match_data[off+1] = key>>8;
-                    match_data[off+2] = key>>16; match_data[off+3] = key>>24;
-                    match_data[off+4] = 0; // compressed
-                    for (int p = 5; p < 32; p++) match_data[off+p] = 0;
-                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = h_comp[hh];
-                }
+                SAVE_MATCH(h_comp, 0);
             }
             
             // Check uncompressed
             if (bloom_check(h_uncomp, bloom, bloom_sz)) {
-                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-                if (idx < MAX_MATCHES) {
-                    uint off = idx * 52;
-                    match_data[off+0] = key; match_data[off+1] = key>>8;
-                    match_data[off+2] = key>>16; match_data[off+3] = key>>24;
-                    match_data[off+4] = 1; // uncompressed
-                    for (int p = 5; p < 32; p++) match_data[off+p] = 0;
-                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = h_uncomp[hh];
-                }
+                SAVE_MATCH(h_uncomp, 1);
             }
             
             // Check P2SH
             if (bloom_check(h_p2sh, bloom, bloom_sz)) {
-                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-                if (idx < MAX_MATCHES) {
-                    uint off = idx * 52;
-                    match_data[off+0] = key; match_data[off+1] = key>>8;
-                    match_data[off+2] = key>>16; match_data[off+3] = key>>24;
-                    match_data[off+4] = 2; // p2sh
-                    for (int p = 5; p < 32; p++) match_data[off+p] = 0;
-                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = h_p2sh[hh];
-                }
+                SAVE_MATCH(h_p2sh, 2);
             }
+            
+            #undef SAVE_MATCH
         }
         keys_done += batch_count;
     }

@@ -19,8 +19,8 @@ const KEYS_PER_THREAD: u32 = 512;
 
 /// Match buffer size (bloom false positives can be high with large target sets)
 /// For 60M targets with 0.1% FP rate: 134M keys × 0.001 = ~134K expected matches
-/// We use 256K to be safe
-const MATCH_BUFFER_SIZE: usize = 262_144;
+/// We use 1M for 4x safety margin to prevent any match loss
+const MATCH_BUFFER_SIZE: usize = 1_048_576;
 
 // ============================================================================
 // BLOOM FILTER
@@ -33,8 +33,9 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
-        // Use n*15 for lower false positive rate (~0.1% with 7 hash functions)
-        let num_bits = (n * 15).next_power_of_two().max(1024);
+        // Use n*20 for very low false positive rate (~0.05% with 7 hash functions)
+        // This reduces match buffer pressure significantly
+        let num_bits = (n * 20).next_power_of_two().max(1024);
         let num_words = num_bits / 64;
         Self {
             bits: vec![0u64; num_words],

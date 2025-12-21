@@ -77,8 +77,11 @@ impl TargetDatabase {
             .filter_map(|addr| Self::decode(addr))
             .collect();
 
-        let mut targets = FxHashMap::default();
-        targets.reserve(results.len());
+        // Pre-allocate with exact capacity to avoid resize during inserts
+        let mut targets = FxHashMap::with_capacity_and_hasher(
+            results.len(),
+            Default::default()
+        );
 
         for (hash, addr_type) in results {
             targets.insert(hash, addr_type);
@@ -159,8 +162,11 @@ impl TargetDatabase {
             })
             .collect();
 
-        let mut targets = FxHashMap::default();
-        targets.reserve(entries.len());
+        // Pre-allocate with exact capacity to avoid resize during inserts
+        let mut targets = FxHashMap::with_capacity_and_hasher(
+            entries.len(),
+            Default::default()
+        );
         for (hash, addr_type) in entries {
             targets.insert(hash, addr_type);
         }
