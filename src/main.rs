@@ -915,10 +915,11 @@ pub enum ThermalState {
     Critical,    // Severe throttling detected
 }
 
-/// Thermal monitor using adaptive performance tracking
-/// Detects throttling without requiring sudo or special permissions
+/// ADAPTIVE Thermal monitor with trend-based analysis
+/// Uses rolling performance history for smarter throttling detection
+/// Avoids unnecessary pauses from single-batch spikes
 pub struct ThermalMonitor {
-    /// Baseline batch duration (first few batches)
+    /// Baseline batch duration (established during warm-up)
     baseline_duration_us: std::sync::atomic::AtomicU64,
     /// Number of samples for baseline
     baseline_samples: std::sync::atomic::AtomicU32,
@@ -926,6 +927,8 @@ pub struct ThermalMonitor {
     throttle_count: std::sync::atomic::AtomicU32,
     /// Consecutive normal batches (for recovery detection)
     normal_count: std::sync::atomic::AtomicU32,
+    /// Performance history for trend analysis (last 20 batches)
+    perf_history: std::sync::Mutex<std::collections::VecDeque<u64>>,
 }
 
 impl ThermalMonitor {
@@ -935,27 +938,37 @@ impl ThermalMonitor {
             baseline_samples: std::sync::atomic::AtomicU32::new(0),
             throttle_count: std::sync::atomic::AtomicU32::new(0),
             normal_count: std::sync::atomic::AtomicU32::new(0),
+            perf_history: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(20)),
         }
     }
     
     /// Record a batch duration and detect thermal throttling
+    /// IMPROVED: Uses trend analysis (last 10 batches avg) instead of single-batch spikes
     /// Returns recommended action: None = continue, Some(ms) = sleep for cooling
     pub fn record_batch(&self, duration_us: u64) -> Option<u64> {
         use std::sync::atomic::Ordering;
         
         let samples = self.baseline_samples.load(Ordering::Relaxed);
         
-        // First 10 batches: establish baseline
-        if samples < 10 {
-            let current = self.baseline_duration_us.load(Ordering::Relaxed);
-            let new_avg = if samples == 0 {
-                duration_us
-            } else {
-                // Running average
-                (current * samples as u64 + duration_us) / (samples as u64 + 1)
-            };
-            self.baseline_duration_us.store(new_avg, Ordering::Relaxed);
+        // Phase 1: Warm-up (first 20 batches)
+        // During warm-up, establish baseline at operating temperature
+        if samples < 20 {
+            // First 5 batches: system is cold, ignore (ramping up)
+            if samples >= 5 {
+                let current = self.baseline_duration_us.load(Ordering::Relaxed);
+                // Use running minimum (optimistic baseline = best performance seen)
+                let new_baseline = if current == 0 { duration_us } else { current.min(duration_us) };
+                self.baseline_duration_us.store(new_baseline, Ordering::Relaxed);
+            }
+            
             self.baseline_samples.fetch_add(1, Ordering::Relaxed);
+            
+            // At sample 20, baseline is established
+            if samples == 19 {
+                let baseline = self.baseline_duration_us.load(Ordering::Relaxed);
+                println!("[🌡️] Thermal baseline established: {:.2}ms per batch", 
+                    baseline as f64 / 1000.0);
+            }
             return None;
         }
         
@@ -964,36 +977,64 @@ impl ThermalMonitor {
             return None;
         }
         
-        // Throttling detection: batch takes >50% longer than baseline
-        let throttle_threshold = baseline * 3 / 2; // 1.5x baseline
-        let severe_threshold = baseline * 2;       // 2x baseline
+        // Phase 2: Update rolling performance history
+        {
+            let mut history = self.perf_history.lock().unwrap();
+            history.push_back(duration_us);
+            if history.len() > 20 {
+                history.pop_front();
+            }
+        }
         
-        if duration_us > severe_threshold {
-            // Severe throttling - recommend longer cooldown
+        // Phase 3: Trend-based throttling detection
+        // Use last 10 batches average instead of single batch
+        // This prevents unnecessary pauses from momentary spikes
+        let recent_avg = {
+            let history = self.perf_history.lock().unwrap();
+            if history.len() >= 10 {
+                history.iter().rev().take(10).sum::<u64>() / 10
+            } else {
+                duration_us
+            }
+        };
+        
+        // Calculate performance ratio (lower = slower = hotter)
+        let trend_ratio = baseline as f64 / recent_avg as f64;
+        
+        // IMPROVED thresholds based on trend rather than single-batch
+        // Old: duration > baseline * 1.5 → throttle (too sensitive)
+        // New: trend < 0.85 (15% slower avg) → mild throttle
+        //      trend < 0.70 (30% slower avg) → aggressive throttle
+        
+        if trend_ratio < 0.70 {
+            // Critical: >30% slower than baseline
             self.throttle_count.fetch_add(1, Ordering::Relaxed);
             self.normal_count.store(0, Ordering::Relaxed);
             
             let consecutive = self.throttle_count.load(Ordering::Relaxed);
             if consecutive >= 3 {
-                // Multiple consecutive severe throttles - aggressive cooling
-                return Some(1000); // 1 second pause
+                return Some(2000); // 2 second pause for critical
             }
-            return Some(500); // 500ms pause
-        } else if duration_us > throttle_threshold {
-            // Mild throttling
+            return Some(1000); // 1 second pause
+        } else if trend_ratio < 0.85 {
+            // Warm: 15-30% slower than baseline  
             self.throttle_count.fetch_add(1, Ordering::Relaxed);
             self.normal_count.store(0, Ordering::Relaxed);
             
             let consecutive = self.throttle_count.load(Ordering::Relaxed);
-            if consecutive >= 5 {
-                return Some(200); // Short pause after several throttled batches
+            if consecutive >= 5 && consecutive % 5 == 0 {
+                return Some(500); // 500ms pause every 5 throttled batches
             }
+        } else if trend_ratio < 0.95 {
+            // Slightly warm: 5-15% slower - no pause but track
+            // Reset normal count but don't increment throttle
+            self.normal_count.store(0, Ordering::Relaxed);
         } else {
-            // Normal performance
+            // Normal performance (within 5% of baseline)
             self.normal_count.fetch_add(1, Ordering::Relaxed);
             
-            // Reset throttle counter after 5 normal batches
-            if self.normal_count.load(Ordering::Relaxed) >= 5 {
+            // Reset throttle counter after 10 normal batches
+            if self.normal_count.load(Ordering::Relaxed) >= 10 {
                 self.throttle_count.store(0, Ordering::Relaxed);
             }
         }
@@ -1001,10 +1042,10 @@ impl ThermalMonitor {
         None
     }
     
-    /// Check if baseline has been established (first 10 batches recorded)
+    /// Check if baseline has been established (first 20 batches recorded)
     pub fn has_baseline(&self) -> bool {
         use std::sync::atomic::Ordering;
-        self.baseline_samples.load(Ordering::Relaxed) >= 10
+        self.baseline_samples.load(Ordering::Relaxed) >= 20
     }
     
     /// Get current thermal state for display

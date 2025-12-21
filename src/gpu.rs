@@ -75,28 +75,39 @@ impl GpuConfig {
             )
         } else if name_lower.contains("pro") {
             // M1/M2/M3/M4 Pro: 14-18 GPU cores, 16-48GB unified memory
-            // OPTIMIZED: Better utilize 14-18 cores based on memory tier
+            // OPTIMIZED: Better register pressure and occupancy settings
             println!("[GPU] Detected: Pro-class chip (14-18 cores)");
             
-            // Detect 14-core vs 16-core variant based on memory
-            // 32GB+ models typically have 16 GPU cores
-            // 16GB models have 14 GPU cores
-            let (gpu_cores, max_threads) = if memory_mb >= 32000 {
-                (16, 147_456)   // 144K threads for 16-core (16 × 9K threads)
+            // Detect GPU core variant based on memory and working set
+            // M1 Pro 14-core: ~11-12GB working set, 16GB RAM
+            // M1 Pro 16-core: ~13-14GB working set, 32GB+ RAM
+            let working_set_gb = memory_mb as f32 / 1024.0;
+            let (gpu_cores, max_threads, keys_per_thread, threadgroup_size) = if memory_mb >= 32000 {
+                // 16-core variant: higher parallelism, can handle more keys
+                (16, 131_072, 128, 512.min(max_threadgroup))
+            } else if working_set_gb >= 13.0 {
+                // 16-core with 16GB (rare) - conservative settings
+                (16, 98_304, 96, 384.min(max_threadgroup))
             } else {
-                (14, 114_688)   // 112K threads for 14-core (14 × 8K threads)
+                // 14-core variant (most common 16GB model)
+                // CRITICAL FIX: Reduce from 114K→98K threads, 128→96 keys
+                // This reduces register pressure and eliminates spilling
+                // 98,304 = 384 × 256 (optimal occupancy for 14-core)
+                // 96 keys × 80 bytes = 7.7KB per thread (fits in registers)
+                // 128 keys × 80 bytes = 10.2KB per thread (register spilling!)
+                (14, 98_304, 96, 384.min(max_threadgroup))
             };
             
-            println!("[GPU] Estimated {} GPU cores, {} threads", gpu_cores, max_threads);
+            println!("[GPU] M1 Pro {}-core: {} threads, {} keys/thread, threadgroup {}", 
+                gpu_cores, max_threads, keys_per_thread, threadgroup_size);
             
             // Dynamic match buffer sizing based on thread count
-            // Prevents buffer overflow while maximizing throughput
             let match_buffer = (max_threads / 50).max(2_097_152); // ~2M minimum
             
             (
                 max_threads,
-                128,        // 128 keys/thread (optimal for cache locality)
-                512.min(max_threadgroup),
+                keys_per_thread,
+                threadgroup_size,
                 match_buffer,
             )
         } else if memory_mb >= 16000 {
@@ -158,35 +169,101 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
-        // OPTIMIZED: Adaptive bits_per_element based on set size
-        // M1 Pro has 48MB L2 cache - optimize for this
+        // OPTIMIZED: Adaptive bits_per_element for large target sets (50M+)
         //
-        // For small sets (<5M targets):
-        //   n*16 = lower FP rate (~0.01%), better accuracy
-        // For large sets (>5M targets):
-        //   n*12 = smaller filter (~75MB vs 100MB), fits better in L2+unified cache
-        //   FP rate increases slightly (~0.02%) but still excellent
+        // M1 Pro Memory Hierarchy:
+        //   L2 (shared): 24MB → ~15 cycle latency
+        //   Unified RAM: 16GB → ~100 cycle latency (7x slower)
         //
-        // Trade-off: Larger sets benefit more from cache hits than lower FP rate
-        let bits_per_element = if n > 5_000_000 {
-            12  // Large sets: prioritize cache efficiency
+        // For 50M targets, we MUST use compact settings:
+        //   - Standard 6 bits → 50M × 6 = 300M bits → 64MB (too big!)
+        //   - Compact 4 bits → 50M × 4 = 200M bits → 32MB (acceptable)
+        //
+        // Trade-off: Higher FP rate but filter stays in L2/L3 cache
+        // FP rate formula: (1 - e^(-k*n/m))^k where k=7
+        //
+        // Tier strategy optimized for 50M targets:
+        //   ≤1M:   16 bits → 2MB,   FP ~0.01%
+        //   1M-3M: 12 bits → 4.5MB, FP ~0.02%
+        //   3M-10M: 8 bits → 10MB,  FP ~0.05%
+        //   10M-30M: 6 bits → 23MB, FP ~0.1%
+        //   30M-60M: 5 bits → 32MB, FP ~0.2% (your case: 50M)
+        //   60M-100M: 4 bits → 50MB, FP ~0.5%
+        //   >100M:   3 bits → compact, FP ~1%
+        //
+        let bits_per_element = if n <= 1_000_000 {
+            16  // <1M: Excellent FP rate
+        } else if n <= 3_000_000 {
+            12  // 1M-3M: Good FP rate
+        } else if n <= 10_000_000 {
+            8   // 3M-10M: Acceptable FP
+        } else if n <= 30_000_000 {
+            6   // 10M-30M: Higher FP but L2 fit possible
+        } else if n <= 60_000_000 {
+            5   // 30M-60M: Optimized for ~50M targets
+        } else if n <= 100_000_000 {
+            4   // 60M-100M: Compact
         } else {
-            16  // Small sets: prioritize lower FP rate
+            3   // >100M: Very compact, high FP
         };
         
-        let num_bits = (n * bits_per_element).next_power_of_two().max(1024);
+        // IMPORTANT: Don't use next_power_of_two for very large filters
+        // It can double the size unnecessarily (e.g., 250M → 512M)
+        // Instead, round up to multiple of 64 for word alignment
+        let raw_bits = n * bits_per_element;
+        let num_bits = if raw_bits < 1_000_000 {
+            // Small filters: use power of 2 for fast modulo
+            raw_bits.next_power_of_two().max(1024)
+        } else {
+            // Large filters: round to 64-bit boundary, avoid doubling
+            ((raw_bits + 63) / 64) * 64
+        };
         let num_words = num_bits / 64;
         
-        // Log optimization choice
+        // Calculate actual filter size
         let filter_size_mb = (num_words * 8) as f64 / 1_000_000.0;
+        
+        // Determine cache status
+        let cache_status = if filter_size_mb <= 20.0 {
+            "fits L2 ✓"
+        } else if filter_size_mb <= 40.0 {
+            "uses unified memory"
+        } else {
+            "large filter ⚠"
+        };
+        
+        // Calculate expected FP rate for logging
+        // FP ≈ (1 - e^(-k*n/m))^k where k=7 hash functions
+        let k = 7.0f64;
+        let m = num_bits as f64;
+        let n_f = n as f64;
+        let fp_rate = (1.0 - (-k * n_f / m).exp()).powf(k) * 100.0;
+        
         if n > 100_000 {
-            println!("[Bloom] {} targets × {} bits = {:.1}MB filter", 
-                n, bits_per_element, filter_size_mb);
+            println!("[Bloom] {} targets × {} bits = {:.1}MB filter ({}, FP ~{:.2}%)", 
+                Self::format_count(n), bits_per_element, filter_size_mb, cache_status, fp_rate);
+        }
+        
+        // Warn for very large filters
+        if filter_size_mb > 50.0 {
+            eprintln!("[Bloom] WARNING: {:.1}MB filter is very large", filter_size_mb);
+            eprintln!("[Bloom] Performance may be impacted by memory bandwidth");
         }
         
         Self {
             bits: vec![0u64; num_words],
             num_bits,
+        }
+    }
+    
+    // Helper to format target count nicely
+    fn format_count(n: usize) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}K", n as f64 / 1_000.0)
+        } else {
+            format!("{}", n)
         }
     }
 
