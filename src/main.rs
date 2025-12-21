@@ -1001,6 +1001,12 @@ impl ThermalMonitor {
         None
     }
     
+    /// Check if baseline has been established (first 10 batches recorded)
+    pub fn has_baseline(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.baseline_samples.load(Ordering::Relaxed) >= 10
+    }
+    
     /// Get current thermal state for display
     pub fn get_state(&self) -> ThermalState {
         use std::sync::atomic::Ordering;
@@ -1302,19 +1308,15 @@ fn run_pipelined(
                 let batch_duration = last_batch_time.elapsed();
                 last_batch_time = Instant::now();
                 
-                // Check for thermal throttling (skip first batch as it includes warmup)
-                if thermal_monitor.baseline_samples.load(Ordering::Relaxed) > 0 {
-                    if let Some(cooldown_ms) = thermal_monitor.record_batch(batch_duration.as_micros() as u64) {
-                        thermal_pauses += 1;
-                        if thermal_pauses == 1 || thermal_pauses % 10 == 0 {
-                            eprintln!("\n[🌡️] Thermal throttling detected, cooling {}ms (pause #{})", 
-                                cooldown_ms, thermal_pauses);
-                        }
-                        thread::sleep(Duration::from_millis(cooldown_ms));
+                // Record batch duration for thermal monitoring
+                // First 10 batches establish baseline, then throttling detection begins
+                if let Some(cooldown_ms) = thermal_monitor.record_batch(batch_duration.as_micros() as u64) {
+                    thermal_pauses += 1;
+                    if thermal_pauses == 1 || thermal_pauses % 10 == 0 {
+                        eprintln!("\n[🌡️] Thermal throttling detected, cooling {}ms (pause #{})", 
+                            cooldown_ms, thermal_pauses);
                     }
-                } else {
-                    // Record baseline
-                    thermal_monitor.record_batch(batch_duration.as_micros() as u64);
+                    thread::sleep(Duration::from_millis(cooldown_ms));
                 }
                 
                 gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
