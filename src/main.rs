@@ -565,6 +565,58 @@ const PIPELINE_DEPTH: usize = 3;
 // Batch for verification: (base_key, matches)
 type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
 
+/// Detect number of Performance cores on Apple Silicon
+/// Uses macOS sysctl to get accurate P-core count (excludes E-cores)
+/// Falls back to conservative estimate based on total CPU count
+fn get_performance_core_count() -> usize {
+    // Try macOS sysctl first (most accurate for Apple Silicon)
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        
+        // Try to get P-core count directly via sysctl
+        // hw.perflevel0.physicalcpu = number of Performance cores
+        if let Ok(output) = Command::new("sysctl")
+            .args(["-n", "hw.perflevel0.physicalcpu"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(count_str) = std::str::from_utf8(&output.stdout) {
+                    if let Ok(count) = count_str.trim().parse::<usize>() {
+                        if count > 0 && count <= 32 {
+                            return count;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: estimate based on total physical CPUs
+        // Apple Silicon typically: P-cores = total / 2 (roughly)
+        // But safer to be conservative for unknown chips
+        if let Ok(output) = Command::new("sysctl")
+            .args(["-n", "hw.physicalcpu"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(count_str) = std::str::from_utf8(&output.stdout) {
+                    if let Ok(total) = count_str.trim().parse::<usize>() {
+                        // Conservative estimate: assume half are P-cores
+                        // M1 base: 8 total → 4 P-cores ✓
+                        // M1 Pro:  10 total → 5 (conservative, actually 8) 
+                        // M1 Max:  12 total → 6 (conservative, actually 10)
+                        let estimated = (total / 2).max(2);
+                        return estimated.min(8); // Cap at 8 for safety
+                    }
+                }
+            }
+        }
+    }
+    
+    // Default fallback for non-macOS or if detection fails
+    4
+}
+
 fn main() {
     println!("\n\x1b[1;36m╔═══════════════════════════════════════════════════════╗");
     println!("║     XYZ-PRO  •  Bitcoin Key Scanner  •  Metal GPU      ║");
@@ -574,17 +626,26 @@ fn main() {
     // OPTIMIZATION: Configure Rayon thread pool for P-cores only
     // Apple Silicon has Performance cores (fast) and Efficiency cores (slow)
     // Using only P-cores avoids E-core overhead and improves verification speed
-    // M1/M2/M3 Pro/Max: 8-10 P-cores, so 8 threads is optimal
+    // 
+    // P-core counts by chip:
+    //   M1 base:  4 P-cores + 4 E-cores → use 4 threads
+    //   M1 Pro:   8 P-cores + 2 E-cores → use 6-8 threads
+    //   M1 Max:  10 P-cores + 2 E-cores → use 8 threads
+    //   M1 Ultra: 20 P-cores + 4 E-cores → use 12 threads
+    //
+    // We detect chip type via macOS sysctl to get actual P-core count
+    let p_core_count = get_performance_core_count();
+    
     use rayon::ThreadPoolBuilder;
     if let Err(e) = ThreadPoolBuilder::new()
-        .num_threads(8)  // Performance cores only (exclude efficiency cores)
+        .num_threads(p_core_count)  // P-cores only (exclude E-cores)
         .thread_name(|i| format!("verify-{}", i))
         .build_global()
     {
         eprintln!("[!] Failed to configure Rayon thread pool: {}", e);
         // Continue with default pool
     } else {
-        println!("[CPU] Rayon: 8 threads (P-cores only)");
+        println!("[CPU] Rayon: {} threads (P-cores only)", p_core_count);
     }
 
     // CRITICAL: Run self-test before anything else
