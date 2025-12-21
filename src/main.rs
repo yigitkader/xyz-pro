@@ -147,7 +147,9 @@ fn run_pipelined(
         }
     });
 
-    // CPU verification thread
+    // CPU verification thread with FP tracking
+    let verify_fp = Arc::new(AtomicU64::new(0)); // Track bloom false positives
+    let verify_fp_clone = verify_fp.clone();
     let verify_handle = thread::spawn(move || {
         while !verify_shutdown.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -158,6 +160,9 @@ fn run_pipelined(
                         {
                             verify_found.fetch_add(1, Ordering::Relaxed);
                             report(&privkey, &addr, atype);
+                        } else {
+                            // Bloom filter false positive (expected behavior)
+                            verify_fp_clone.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -178,13 +183,15 @@ fn run_pipelined(
             let elapsed = start.elapsed().as_secs_f64();
             let speed = (count - last_count) as f64 / last_stat.elapsed().as_secs_f64();
             let avg = count as f64 / elapsed;
+            let fp_count = verify_fp.load(Ordering::Relaxed);
 
             print!(
-                "\r[⚡] {} keys | {} (avg {}) | {} found | {}    ",
+                "\r[⚡] {} keys | {} (avg {}) | {} found | {} FP | {}    ",
                 format_num(count),
                 format_speed(speed),
                 format_speed(avg),
                 found.load(Ordering::Relaxed),
+                format_num(fp_count),
                 format_time(elapsed)
             );
             stdout().flush().ok();

@@ -246,7 +246,21 @@ impl OptimizedScanner {
 
         println!("[GPU] Keys/batch: {} M", keys_per_batch / 1_000_000);
         println!("[GPU] Memory: {:.2} MB", mem_mb);
-        println!("[GPU] Bloom filter: {} words ({} KB)", bloom.size_words(), bloom.size_words() * 8 / 1024);
+        
+        // Calculate and log expected Bloom filter false positive rate
+        // FP rate ≈ (1 - e^(-k*n/m))^k where k=7 hash functions, n=items, m=bits
+        let n = target_hashes.len() as f64;
+        let m = (bloom.size_words() * 64) as f64;
+        let k = 7.0f64;
+        let fp_rate = (1.0 - (-k * n / m).exp()).powf(k);
+        let expected_fp_per_batch = (keys_per_batch as f64) * fp_rate;
+        
+        println!("[GPU] Bloom filter: {} words ({} KB), FP rate: {:.4}%, ~{:.0} FP/batch", 
+            bloom.size_words(), 
+            bloom.size_words() * 8 / 1024,
+            fp_rate * 100.0,
+            expected_fp_per_batch
+        );
 
         Ok(Self {
             queue,
