@@ -214,7 +214,7 @@ fn run_pipelined(
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
 
-        if last_stat.elapsed() >= Duration::from_millis(500) {
+        if last_stat.elapsed() >= Duration::from_millis(200) {
             let count = counter.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let speed = (count - last_count) as f64 / last_stat.elapsed().as_secs_f64();
@@ -247,17 +247,24 @@ fn run_pipelined(
 // ============================================================================
 
 /// Maximum key_index that GPU can generate: MAX_THREADS × KEYS_PER_THREAD
-/// 32_768 × 256 = 8_388_608 (~8.4M keys/batch)
-const MAX_KEY_OFFSET: u64 = 32_768 * 256;
+/// 131_072 × 64 = 8_388_608 (~8.4M keys/batch)
+const MAX_KEY_OFFSET: u64 = 131_072 * 64;
 
 fn generate_random_key() -> [u8; 32] {
     use rand::RngCore;
-    let mut rng = rand::thread_rng();
+    use std::cell::RefCell;
+    
+    // Thread-local RNG - created once per thread, reused for all calls
+    // This avoids the overhead of creating a new RNG for each key generation
+    thread_local! {
+        static RNG: RefCell<rand::rngs::ThreadRng> = RefCell::new(rand::thread_rng());
+    }
+    
     let mut key = [0u8; 32];
     let mut attempts = 0u32;
     
     loop {
-        rng.fill_bytes(&mut key);
+        RNG.with(|rng| rng.borrow_mut().fill_bytes(&mut key));
         
         // Check 1: Basic validity (0 < key < N)
         if !crypto::is_valid_private_key(&key) {

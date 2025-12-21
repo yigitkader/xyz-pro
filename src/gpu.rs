@@ -11,14 +11,18 @@ use crate::types::Hash160;
 // CONFIG
 // ============================================================================
 
-/// Maximum threads per dispatch (32768 × 256 = ~8.4M keys/batch)
-/// Smaller batches = faster GPU response time, better thermal management on M1
-/// Also reduces pipeline latency for CPU verification
-const MAX_THREADS: usize = 32_768;
+/// Maximum threads per dispatch (131072 × 64 = ~8.4M keys/batch)
+/// Higher thread count with lower keys/thread = better GPU occupancy
+/// More threads = better latency hiding for memory operations
+const MAX_THREADS: usize = 131_072;
 
 /// Keys processed per thread
-/// Reduced from 512 to 256 to prevent GPU watchdog timeouts and thermal throttling
-const KEYS_PER_THREAD: u32 = 256;
+/// Reduced from 256 to 64 to:
+/// 1. Prevent GPU watchdog timeouts
+/// 2. Reduce register pressure (better occupancy)
+/// 3. Allow more frequent stats updates (no more "0/s" display)
+/// 4. Better thermal management on M1
+const KEYS_PER_THREAD: u32 = 64;
 
 /// Match buffer size (bloom false positives can be high with large target sets)
 /// For 60M targets with 0.05% FP rate: 134M keys × 0.0005 = ~67K expected matches
@@ -124,18 +128,26 @@ fn compute_step_table(keys_per_thread: u32) -> [[u8; 64]; 20] {
 // OPTIMIZED SCANNER
 // ============================================================================
 
+/// Double buffer set for pipelined GPU execution
+struct BufferSet {
+    base_point_buf: Buffer,
+    match_data_buf: Buffer,
+    match_count_buf: Buffer,
+}
+
 pub struct OptimizedScanner {
     queue: CommandQueue,
     pipeline: ComputePipelineState,
 
-    // Buffers
-    base_point_buf: Buffer,
+    // Double buffers for pipelining (GPU processes A while CPU prepares B)
+    buffer_sets: [BufferSet; 2],
+    current_buffer: std::sync::atomic::AtomicUsize,
+
+    // Shared buffers (read-only, no double buffering needed)
     step_table_buf: Buffer,
     bloom_buf: Buffer,
     bloom_size_buf: Buffer,
     kpt_buf: Buffer,
-    match_data_buf: Buffer,
-    match_count_buf: Buffer,
 
     // Config
     max_threads: usize,
@@ -218,7 +230,21 @@ impl OptimizedScanner {
         // Allocate buffers
         let storage = MTLResourceOptions::StorageModeShared;
 
-        let base_point_buf = device.new_buffer(64, storage);
+        // Double buffer sets for pipelined execution
+        let buffer_sets = [
+            BufferSet {
+                base_point_buf: device.new_buffer(64, storage),
+                match_data_buf: device.new_buffer((MATCH_BUFFER_SIZE * 52) as u64, storage),
+                match_count_buf: device.new_buffer(4, storage),
+            },
+            BufferSet {
+                base_point_buf: device.new_buffer(64, storage),
+                match_data_buf: device.new_buffer((MATCH_BUFFER_SIZE * 52) as u64, storage),
+                match_count_buf: device.new_buffer(4, storage),
+            },
+        ];
+
+        // Shared read-only buffers
         let step_table_buf = device.new_buffer_with_data(
             step_table.as_ptr() as *const _,
             (20 * 64) as u64,
@@ -245,15 +271,17 @@ impl OptimizedScanner {
             storage,
         );
 
-        let match_data_buf = device.new_buffer((MATCH_BUFFER_SIZE * 52) as u64, storage);
-        let match_count_buf = device.new_buffer(4, storage);
-
         let keys_per_batch = MAX_THREADS * KEYS_PER_THREAD as usize;
-        let mem_mb = (64 + 20 * 64 + bloom_data.len() * 8 + 4 + 4 + MATCH_BUFFER_SIZE * 52 + 4) as f64 / 1_000_000.0;
+        // Double buffer memory: 2x (base_point + match_data + match_count)
+        let double_buf_mem = 2 * (64 + MATCH_BUFFER_SIZE * 52 + 4);
+        let shared_mem = 20 * 64 + bloom_data.len() * 8 + 4 + 4;
+        let mem_mb = (double_buf_mem + shared_mem) as f64 / 1_000_000.0;
         
-        println!("[GPU] Match buffer: {} entries ({:.1} MB)", MATCH_BUFFER_SIZE, (MATCH_BUFFER_SIZE * 52) as f64 / 1_000_000.0);
+        println!("[GPU] Double buffering enabled for async pipelining");
+        println!("[GPU] Match buffer: {} entries × 2 ({:.1} MB)", MATCH_BUFFER_SIZE, (MATCH_BUFFER_SIZE * 52 * 2) as f64 / 1_000_000.0);
 
-        println!("[GPU] Keys/batch: {} M", keys_per_batch / 1_000_000);
+        println!("[GPU] Keys/batch: {} M (threads={}, keys/thread={})", 
+            keys_per_batch / 1_000_000, MAX_THREADS, KEYS_PER_THREAD);
         println!("[GPU] Memory: {:.2} MB", mem_mb);
         
         // Calculate and log expected Bloom filter false positive rate
@@ -274,13 +302,12 @@ impl OptimizedScanner {
         Ok(Self {
             queue,
             pipeline,
-            base_point_buf,
+            buffer_sets,
+            current_buffer: std::sync::atomic::AtomicUsize::new(0),
             step_table_buf,
             bloom_buf,
             bloom_size_buf,
             kpt_buf,
-            match_data_buf,
-            match_count_buf,
             max_threads: MAX_THREADS,
             keys_per_thread: KEYS_PER_THREAD,
             total_scanned: AtomicU64::new(0),
@@ -289,7 +316,12 @@ impl OptimizedScanner {
     }
 
     /// Scan a range of keys starting from base_key
+    /// Uses double buffering for async GPU/CPU overlap
     pub fn scan_batch(&self, base_key: &[u8; 32]) -> Result<Vec<PotentialMatch>> {
+        // Get current buffer index and swap for next call
+        let buf_idx = self.current_buffer.fetch_xor(1, Ordering::Relaxed);
+        let buffers = &self.buffer_sets[buf_idx];
+
         // Compute base point from base_key
         let secret = SecretKey::from_slice(base_key)
             .map_err(|e| ScannerError::Gpu(format!("invalid key: {}", e)))?;
@@ -299,14 +331,14 @@ impl OptimizedScanner {
 
         // Copy base point (x || y)
         unsafe {
-            let ptr = self.base_point_buf.contents() as *mut u8;
+            let ptr = buffers.base_point_buf.contents() as *mut u8;
             std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
             std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
         }
 
         // Reset match count
         unsafe {
-            let ptr = self.match_count_buf.contents() as *mut u32;
+            let ptr = buffers.match_count_buf.contents() as *mut u32;
             *ptr = 0;
         }
 
@@ -327,13 +359,13 @@ impl OptimizedScanner {
         {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.pipeline);
-            enc.set_buffer(0, Some(&self.base_point_buf), 0);
+            enc.set_buffer(0, Some(&buffers.base_point_buf), 0);
             enc.set_buffer(1, Some(&self.step_table_buf), 0);
             enc.set_buffer(2, Some(&self.bloom_buf), 0);
             enc.set_buffer(3, Some(&self.bloom_size_buf), 0);
             enc.set_buffer(4, Some(&self.kpt_buf), 0);
-            enc.set_buffer(5, Some(&self.match_data_buf), 0);
-            enc.set_buffer(6, Some(&self.match_count_buf), 0);
+            enc.set_buffer(5, Some(&buffers.match_data_buf), 0);
+            enc.set_buffer(6, Some(&buffers.match_count_buf), 0);
             enc.dispatch_threads(grid, group);
             enc.end_encoding();
         }
@@ -341,9 +373,9 @@ impl OptimizedScanner {
         cmd.commit();
         cmd.wait_until_completed();
 
-        // Read results
+        // Read results from current buffer
         let raw_match_count = unsafe {
-            let ptr = self.match_count_buf.contents() as *const u32;
+            let ptr = buffers.match_count_buf.contents() as *const u32;
             *ptr
         };
         
@@ -366,7 +398,7 @@ impl OptimizedScanner {
         if match_count > 0 {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
             unsafe {
-                let ptr = self.match_data_buf.contents() as *const u8;
+                let ptr = buffers.match_data_buf.contents() as *const u8;
                 for i in 0..match_count {
                     let off = i * 52;
                     // Read key_index (4 bytes)
