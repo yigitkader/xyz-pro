@@ -14,15 +14,18 @@ use crate::error::{Result, ScannerError};
 use crate::types::{hash160_to_address, AddressType, Hash160};
 
 // ============================================================================
-// BINARY FORMAT
+// BINARY FORMAT v2 (Future-proof: supports >4 billion records)
 // ============================================================================
-// Header: "XYZPRO01" (8 bytes) + count (4 bytes, LE) = 12 bytes
+// Header: "XYZPRO02" (8 bytes) + count (8 bytes, LE) = 16 bytes
 // Records: [hash160 (20 bytes) + type (1 byte)] × count = 21 bytes each
-// Total: 12 + (N × 21) bytes
+// Total: 16 + (N × 21) bytes
 // ============================================================================
 
-const MAGIC: &[u8; 8] = b"XYZPRO01";
+const MAGIC: &[u8; 8] = b"XYZPRO02";
+const MAGIC_V1: &[u8; 8] = b"XYZPRO01"; // Legacy support
 const RECORD_SIZE: usize = 21; // 20 byte hash + 1 byte type
+const HEADER_SIZE_V2: usize = 16; // 8 magic + 8 count
+const HEADER_SIZE_V1: usize = 12; // 8 magic + 4 count (legacy)
 
 #[derive(Deserialize)]
 struct TargetFile {
@@ -90,27 +93,46 @@ impl TargetDatabase {
     }
 
     /// Binary formatından yükle (çok hızlı!)
+    /// Supports both v1 (u32 count) and v2 (u64 count) formats
     fn load_binary(path: &str) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Header kontrolü
-        if mmap.len() < 12 {
+        // Header kontrolü (minimum v1 header)
+        if mmap.len() < HEADER_SIZE_V1 {
             return Err(ScannerError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Binary file too small",
             )));
         }
 
-        if &mmap[0..8] != MAGIC {
+        // Detect version and parse header
+        let (count, header_size) = if &mmap[0..8] == MAGIC {
+            // v2 format: u64 count
+            if mmap.len() < HEADER_SIZE_V2 {
+                return Err(ScannerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Binary v2 file too small for header",
+                )));
+            }
+            let count = u64::from_le_bytes([
+                mmap[8], mmap[9], mmap[10], mmap[11],
+                mmap[12], mmap[13], mmap[14], mmap[15],
+            ]) as usize;
+            (count, HEADER_SIZE_V2)
+        } else if &mmap[0..8] == MAGIC_V1 {
+            // v1 format: u32 count (legacy)
+            println!("[*] Loading legacy v1 binary format...");
+            let count = u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
+            (count, HEADER_SIZE_V1)
+        } else {
             return Err(ScannerError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid binary magic",
+                "Invalid binary magic (expected XYZPRO01 or XYZPRO02)",
             )));
-        }
+        };
 
-        let count = u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
-        let expected_size = 12 + count * RECORD_SIZE;
+        let expected_size = header_size + count * RECORD_SIZE;
 
         if mmap.len() < expected_size {
             return Err(ScannerError::Io(std::io::Error::new(
@@ -126,7 +148,7 @@ impl TargetDatabase {
         println!("[*] Loading {} records from binary...", count);
 
         // Paralel yükleme
-        let data = &mmap[12..];
+        let data = &mmap[header_size..];
         let entries: Vec<_> = (0..count)
             .into_par_iter()
             .filter_map(|i| {
@@ -146,14 +168,14 @@ impl TargetDatabase {
         Ok(Self { targets })
     }
 
-    /// Binary formatında kaydet
+    /// Binary formatında kaydet (v2 format with u64 count)
     fn save_binary(&self, path: &str) -> Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, file); // 1MB buffer
 
-        // Header
+        // Header v2: magic (8) + count (8) = 16 bytes
         writer.write_all(MAGIC)?;
-        writer.write_all(&(self.targets.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.targets.len() as u64).to_le_bytes())?;
 
         // Records
         for (hash, addr_type) in &self.targets {
