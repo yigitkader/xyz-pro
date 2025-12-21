@@ -75,13 +75,29 @@ impl GpuConfig {
             )
         } else if name_lower.contains("pro") {
             // M1/M2/M3/M4 Pro: 14-18 GPU cores, 16-48GB unified memory
-            // High parallelism
+            // OPTIMIZED: Better utilize 14-18 cores based on memory tier
             println!("[GPU] Detected: Pro-class chip (14-18 cores)");
+            
+            // Detect 14-core vs 16-core variant based on memory
+            // 32GB+ models typically have 16 GPU cores
+            // 16GB models have 14 GPU cores
+            let (gpu_cores, max_threads) = if memory_mb >= 32000 {
+                (16, 147_456)   // 144K threads for 16-core (16 × 9K threads)
+            } else {
+                (14, 114_688)   // 112K threads for 14-core (14 × 8K threads)
+            };
+            
+            println!("[GPU] Estimated {} GPU cores, {} threads", gpu_cores, max_threads);
+            
+            // Dynamic match buffer sizing based on thread count
+            // Prevents buffer overflow while maximizing throughput
+            let match_buffer = (max_threads / 50).max(2_097_152); // ~2M minimum
+            
             (
-                98_304,     // 96K threads (optimized for 14-18 cores)
-                128,        // 128 keys/thread = 12.6M keys/batch (matches BATCH_SIZE)
+                max_threads,
+                128,        // 128 keys/thread (optimal for cache locality)
                 512.min(max_threadgroup),
-                1_572_864,  // 1.5M match buffer
+                match_buffer,
             )
         } else if memory_mb >= 16000 {
             // Base M-series with high memory (16GB+)
@@ -142,13 +158,32 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
-        // OPTIMIZED: n*16 for better GPU cache hit rate
-        // n*32 = 200MB (doesn't fit in L2 cache ~48MB on M1 Max)
-        // n*16 = 100MB (closer to L2 cache, better locality)
-        // FP rate: ~0.01% (vs 0.001% with n*32) - still excellent
-        // Expected performance gain: +15-25% due to better cache behavior
-        let num_bits = (n * 16).next_power_of_two().max(1024);
+        // OPTIMIZED: Adaptive bits_per_element based on set size
+        // M1 Pro has 48MB L2 cache - optimize for this
+        //
+        // For small sets (<5M targets):
+        //   n*16 = lower FP rate (~0.01%), better accuracy
+        // For large sets (>5M targets):
+        //   n*12 = smaller filter (~75MB vs 100MB), fits better in L2+unified cache
+        //   FP rate increases slightly (~0.02%) but still excellent
+        //
+        // Trade-off: Larger sets benefit more from cache hits than lower FP rate
+        let bits_per_element = if n > 5_000_000 {
+            12  // Large sets: prioritize cache efficiency
+        } else {
+            16  // Small sets: prioritize lower FP rate
+        };
+        
+        let num_bits = (n * bits_per_element).next_power_of_two().max(1024);
         let num_words = num_bits / 64;
+        
+        // Log optimization choice
+        let filter_size_mb = (num_words * 8) as f64 / 1_000_000.0;
+        if n > 100_000 {
+            println!("[Bloom] {} targets × {} bits = {:.1}MB filter", 
+                n, bits_per_element, filter_size_mb);
+        }
+        
         Self {
             bits: vec![0u64; num_words],
             num_bits,

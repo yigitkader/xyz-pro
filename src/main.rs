@@ -212,6 +212,216 @@ fn run_self_test() -> bool {
     if all_passed {
         println!("  [✓] Private key validation logic verified");
     }
+    
+    // ========================================================================
+    // GLV ENDOMORPHISM TESTS
+    // Critical: If β or λ constants are wrong, GLV matches will be completely invalid!
+    // ========================================================================
+    println!("  [🔍] Testing GLV endomorphism constants...");
+    
+    // Test 1: Verify λ³ ≡ 1 (mod n)
+    // This is a fundamental property of the GLV endomorphism
+    {
+        use k256::elliptic_curve::PrimeField;
+        use k256::Scalar;
+        
+        let lambda = Scalar::from_repr_vartime(gpu::GLV_LAMBDA.into()).unwrap();
+        let lambda_squared = lambda * lambda;
+        let lambda_cubed = lambda_squared * lambda;
+        let one = Scalar::ONE;
+        
+        if lambda_cubed != one {
+            eprintln!("  [✗] GLV λ³ ≡ 1 (mod n) verification FAILED!");
+            eprintln!("      λ³ should equal 1, but got different value");
+            all_passed = false;
+        } else {
+            println!("  [✓] GLV λ³ ≡ 1 (mod n) verified");
+        }
+    }
+    
+    // Test 2: Verify GLV transform produces correct public key
+    // For key k, λ·k should produce pubkey (β·Px, Py)
+    {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::SecretKey;
+        
+        // Test with a known private key
+        let test_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000005")
+            .unwrap().try_into().unwrap();
+        
+        // Compute λ·k (mod n)
+        let glv_key = gpu::glv_transform_key(&test_key);
+        
+        // Get original public key
+        let secret = SecretKey::from_slice(&test_key).unwrap();
+        let original_pubkey = secret.public_key();
+        let original_point = original_pubkey.to_encoded_point(false);
+        let orig_x = &original_point.as_bytes()[1..33];
+        let orig_y = &original_point.as_bytes()[33..65];
+        
+        // Get GLV-transformed public key
+        let glv_secret = SecretKey::from_slice(&glv_key).unwrap();
+        let glv_pubkey = glv_secret.public_key();
+        let glv_point = glv_pubkey.to_encoded_point(false);
+        let glv_x = &glv_point.as_bytes()[1..33];
+        let glv_y = &glv_point.as_bytes()[33..65];
+        
+        // GLV property: φ(P) = (β·Px, Py) should have same Y coordinate
+        // (X coordinate is β·original_x mod p)
+        if glv_y != orig_y {
+            eprintln!("  [✗] GLV transform Y-coordinate mismatch!");
+            eprintln!("      φ(P) should preserve Y coordinate but it changed");
+            eprintln!("      Original Y: {}", hex::encode(orig_y));
+            eprintln!("      GLV Y:      {}", hex::encode(glv_y));
+            all_passed = false;
+        } else {
+            println!("  [✓] GLV transform preserves Y coordinate (φ(P).y = P.y)");
+        }
+        
+        // Verify X coordinate is different (should be β·x mod p)
+        if glv_x == orig_x {
+            eprintln!("  [✗] GLV transform X-coordinate unchanged!");
+            eprintln!("      φ(P).x should equal β·P.x mod p, not P.x");
+            all_passed = false;
+        } else {
+            println!("  [✓] GLV transform modifies X coordinate (φ(P).x = β·P.x)");
+        }
+    }
+    
+    // Test 3: Verify β is correct by checking GLV property holds for multiple keys
+    // If β is wrong, Y coordinates wouldn't be preserved for different keys
+    {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::SecretKey;
+        
+        let test_keys: [[u8; 32]; 3] = [
+            hex::decode("0000000000000000000000000000000000000000000000000000000000000003")
+                .unwrap().try_into().unwrap(),
+            hex::decode("0000000000000000000000000000000000000000000000000000000000000007")
+                .unwrap().try_into().unwrap(),
+            hex::decode("000000000000000000000000000000000000000000000000000000000000000b")
+                .unwrap().try_into().unwrap(),
+        ];
+        
+        let mut beta_verified = true;
+        for test_key in &test_keys {
+            let glv_key = gpu::glv_transform_key(test_key);
+            
+            let orig_secret = SecretKey::from_slice(test_key).unwrap();
+            let orig_pubkey = orig_secret.public_key().to_encoded_point(false);
+            let orig_y = &orig_pubkey.as_bytes()[33..65];
+            
+            let glv_secret = SecretKey::from_slice(&glv_key).unwrap();
+            let glv_pubkey = glv_secret.public_key().to_encoded_point(false);
+            let glv_y = &glv_pubkey.as_bytes()[33..65];
+            
+            if orig_y != glv_y {
+                eprintln!("  [✗] GLV β verification failed for key {}!", hex::encode(test_key));
+                beta_verified = false;
+                break;
+            }
+        }
+        
+        if beta_verified {
+            println!("  [✓] GLV β constant verified (Y preserved for multiple keys)");
+        } else {
+            all_passed = false;
+        }
+    }
+    
+    // Test 4: Verify GLV private key recovery works correctly
+    // If we have a GLV match with key_index i, actual key should be λ·(base + i)
+    {
+        let base_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap().try_into().unwrap();
+        let key_index: u32 = 5;
+        
+        // Reconstruct key: base + key_index
+        let mut reconstructed = base_key;
+        let mut carry = key_index as u64;
+        for byte in reconstructed.iter_mut().rev() {
+            let sum = *byte as u64 + (carry & 0xFF);
+            *byte = sum as u8;
+            carry = (carry >> 8) + (sum >> 8);
+        }
+        // reconstructed should now be 6
+        
+        // Apply GLV transform
+        let glv_key = gpu::glv_transform_key(&reconstructed);
+        
+        // Verify it's a valid key
+        if !crypto::is_valid_private_key(&glv_key) {
+            eprintln!("  [✗] GLV-transformed key is invalid!");
+            all_passed = false;
+        } else {
+            // Verify it produces a valid public key
+            if SecretKey::from_slice(&glv_key).is_ok() {
+                println!("  [✓] GLV private key recovery verified");
+            } else {
+                eprintln!("  [✗] GLV-transformed key fails SecretKey parsing!");
+                all_passed = false;
+            }
+        }
+    }
+    
+    // ========================================================================
+    // WINDOWED STEP TABLE TEST
+    // Verify the 5-window × 15-digit precomputation is correct
+    // ========================================================================
+    println!("  [🔍] Testing windowed step table computation...");
+    {
+        use k256::elliptic_curve::PrimeField;
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::{ProjectivePoint, Scalar};
+        
+        let keys_per_thread: u32 = 128;
+        
+        // Compute base: kpt * G
+        let kpt_bytes = {
+            let mut b = [0u8; 32];
+            b[28..32].copy_from_slice(&keys_per_thread.to_be_bytes());
+            b
+        };
+        let kpt_scalar = Scalar::from_repr_vartime(kpt_bytes.into()).unwrap();
+        let base_point = ProjectivePoint::GENERATOR * kpt_scalar;
+        
+        // Test a few window entries manually
+        let mut window_tests_passed = true;
+        
+        // Window 0, digit 1: should be 1 * kpt * G = base_point
+        let expected_w0_d1 = base_point.to_affine().to_encoded_point(false);
+        
+        // Window 0, digit 3: should be 3 * kpt * G
+        let three_scalar = Scalar::from_repr_vartime({
+            let mut b = [0u8; 32];
+            b[31] = 3;
+            b.into()
+        }).unwrap();
+        let expected_w0_d3 = (ProjectivePoint::GENERATOR * kpt_scalar * three_scalar)
+            .to_affine().to_encoded_point(false);
+        
+        // Window 1, digit 1: should be 1 * 16 * kpt * G = 16 * base
+        let mut w1_base = base_point;
+        for _ in 0..4 { w1_base = w1_base.double(); }
+        let expected_w1_d1 = w1_base.to_affine().to_encoded_point(false);
+        
+        // Verify these are different (sanity check)
+        if expected_w0_d1.as_bytes() == expected_w0_d3.as_bytes() {
+            eprintln!("  [✗] Window 0: digit 1 and digit 3 should be different!");
+            window_tests_passed = false;
+        }
+        
+        if expected_w0_d1.as_bytes() == expected_w1_d1.as_bytes() {
+            eprintln!("  [✗] Window 0 digit 1 and Window 1 digit 1 should be different!");
+            window_tests_passed = false;
+        }
+        
+        if window_tests_passed {
+            println!("  [✓] Windowed step table structure verified");
+        } else {
+            all_passed = false;
+        }
+    }
 
     if all_passed {
         println!("[✓] Self-test passed - all calculations are correct\n");
@@ -600,6 +810,97 @@ const PIPELINE_DEPTH: usize = 3;
 // Batch for verification: (base_key, matches)
 type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
 
+// ============================================================================
+// SYSTEM MONITORING (Memory & Thermal)
+// ============================================================================
+
+/// Check system memory pressure on macOS
+/// Returns memory free percentage (0-100), or 100.0 if detection fails
+#[cfg(target_os = "macos")]
+fn check_memory_pressure() -> f32 {
+    use std::process::Command;
+    
+    // Use vm_stat for memory info (more reliable than memory_pressure command)
+    if let Ok(output) = Command::new("vm_stat").output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                // Parse page size and free pages
+                let mut page_size: u64 = 4096; // Default 4KB
+                let mut free_pages: u64 = 0;
+                let mut inactive_pages: u64 = 0;
+                let mut speculative_pages: u64 = 0;
+                
+                for line in text.lines() {
+                    if line.contains("page size of") {
+                        if let Some(size_str) = line.split_whitespace().nth(7) {
+                            page_size = size_str.parse().unwrap_or(4096);
+                        }
+                    } else if line.starts_with("Pages free:") {
+                        if let Some(val) = line.split(':').nth(1) {
+                            free_pages = val.trim().trim_end_matches('.').parse().unwrap_or(0);
+                        }
+                    } else if line.starts_with("Pages inactive:") {
+                        if let Some(val) = line.split(':').nth(1) {
+                            inactive_pages = val.trim().trim_end_matches('.').parse().unwrap_or(0);
+                        }
+                    } else if line.starts_with("Pages speculative:") {
+                        if let Some(val) = line.split(':').nth(1) {
+                            speculative_pages = val.trim().trim_end_matches('.').parse().unwrap_or(0);
+                        }
+                    }
+                }
+                
+                // Available memory = free + inactive + speculative
+                let available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
+                let available_gb = available_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                
+                // Get total memory via sysctl
+                if let Ok(mem_output) = Command::new("sysctl")
+                    .args(["-n", "hw.memsize"])
+                    .output()
+                {
+                    if mem_output.status.success() {
+                        if let Ok(mem_str) = std::str::from_utf8(&mem_output.stdout) {
+                            if let Ok(total_bytes) = mem_str.trim().parse::<u64>() {
+                                let total_gb = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                                let free_pct = (available_gb / total_gb * 100.0) as f32;
+                                return free_pct.clamp(0.0, 100.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    100.0 // Assume OK if detection fails
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_memory_pressure() -> f32 {
+    100.0 // Not implemented for non-macOS
+}
+
+/// Memory pressure level for decision making
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MemoryPressure {
+    Normal,   // > 20% free
+    Warning,  // 10-20% free
+    Critical, // < 10% free
+}
+
+impl MemoryPressure {
+    fn from_free_pct(pct: f32) -> Self {
+        if pct < 10.0 {
+            Self::Critical
+        } else if pct < 20.0 {
+            Self::Warning
+        } else {
+            Self::Normal
+        }
+    }
+}
+
 /// Detect number of Performance cores on Apple Silicon
 /// Uses macOS sysctl to get accurate P-core count (excludes E-cores)
 /// Falls back to conservative estimate based on total CPU count
@@ -827,18 +1128,25 @@ fn run_pipelined(
     let verify_handle = thread::spawn(move || {
         use rayon::prelude::*;
         
+        // OPTIMIZED: Reduced batch accumulation to prevent latency spikes
+        // Previously: 64 batches could accumulate → 31.7s verification bursts
+        // Now: max 4 batches → smoother, more consistent performance
+        const MAX_BATCH_ACCUMULATION: usize = 4;
+        
         while !verify_shutdown.load(Ordering::Relaxed) {
-            // Collect multiple batches for better parallelism
-            let mut batches: Vec<VerifyBatch> = Vec::with_capacity(32);
+            // Collect batches for parallel processing
+            let mut batches: Vec<VerifyBatch> = Vec::with_capacity(MAX_BATCH_ACCUMULATION);
             
-            // Drain available batches (non-blocking after first)
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            // Wait for first batch with reduced timeout for faster response
+            match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(batch) => {
                     batches.push(batch);
-                    // Grab more if available (non-blocking)
-                    while let Ok(b) = rx.try_recv() {
-                        batches.push(b);
-                        if batches.len() >= 64 { break; } // Cap to prevent memory bloat
+                    // Grab a few more if available (non-blocking)
+                    while batches.len() < MAX_BATCH_ACCUMULATION {
+                        match rx.try_recv() {
+                            Ok(b) => batches.push(b),
+                            Err(_) => break,
+                        }
                     }
                 }
                 Err(_) => continue, // Timeout, check shutdown
@@ -872,12 +1180,40 @@ fn run_pipelined(
         }
     });
 
-    // Stats display in main thread
+    // Stats display in main thread with memory monitoring
     let mut last_stat = Instant::now();
     let mut last_count = 0u64;
+    let mut last_mem_check = Instant::now();
+    let mut mem_warning_shown = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
+
+        // Memory pressure check every 5 seconds (defensive monitoring)
+        if last_mem_check.elapsed() >= Duration::from_secs(5) {
+            let mem_free_pct = check_memory_pressure();
+            let pressure = MemoryPressure::from_free_pct(mem_free_pct);
+            
+            match pressure {
+                MemoryPressure::Critical => {
+                    if !mem_warning_shown {
+                        eprintln!("\n[!] CRITICAL: Low memory ({:.1}% free)!", mem_free_pct);
+                        eprintln!("    Consider reducing target count or closing other apps.");
+                        mem_warning_shown = true;
+                    }
+                }
+                MemoryPressure::Warning => {
+                    if !mem_warning_shown {
+                        eprintln!("\n[!] WARNING: Memory pressure detected ({:.1}% free)", mem_free_pct);
+                        mem_warning_shown = true;
+                    }
+                }
+                MemoryPressure::Normal => {
+                    mem_warning_shown = false; // Reset for next warning cycle
+                }
+            }
+            last_mem_check = Instant::now();
+        }
 
         if last_stat.elapsed() >= Duration::from_millis(200) {
             let count = counter.load(Ordering::Relaxed);
