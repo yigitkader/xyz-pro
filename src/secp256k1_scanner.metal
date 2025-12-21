@@ -510,11 +510,12 @@ kernel void scan_keys(
         #undef STEP_ADD
     }
 
-    // Montgomery batch inversion (BATCH_SIZE = 32)
-    // Larger batch = fewer mod_inv calls = better performance
-    // 32 gives 2x fewer mod_inv calls than 16, at cost of more register pressure
-    // For Apple Silicon's large register file, 32 is optimal
-    #define BATCH_SIZE 32
+    // Montgomery batch inversion (BATCH_SIZE = 64)
+    // CRITICAL OPTIMIZATION: 64 = keys_per_thread means SINGLE mod_inv per thread
+    // mod_inv is the most expensive operation (~512 mod_mul equivalent)
+    // Batch 32 = 2 mod_inv, Batch 64 = 1 mod_inv = 50% reduction in EC compute!
+    // Trade-off: More register pressure, but Apple Silicon has large register file
+    #define BATCH_SIZE 64
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_Zinv[BATCH_SIZE];
     bool batch_valid[BATCH_SIZE]; // Track valid (non-zero Z) points
 
