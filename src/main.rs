@@ -147,10 +147,15 @@ fn run_pipelined(
         }
     });
 
-    // CPU verification thread with FP tracking
+    // CPU verification thread with FP tracking and deduplication
     let verify_fp = Arc::new(AtomicU64::new(0)); // Track bloom false positives
     let verify_fp_clone = verify_fp.clone();
     let verify_handle = thread::spawn(move || {
+        use std::collections::HashSet;
+        // Deduplicate found keys - same key can match multiple address types
+        // (compressed pubkey hash, uncompressed pubkey hash, P2SH script hash)
+        let mut found_keys: HashSet<[u8; 32]> = HashSet::new();
+        
         while !verify_shutdown.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok((base_key, matches)) => {
@@ -158,8 +163,11 @@ fn run_pipelined(
                         if let Some((addr, atype, privkey)) =
                             verify_match(&base_key, &pm, &targets)
                         {
-                            verify_found.fetch_add(1, Ordering::Relaxed);
-                            report(&privkey, &addr, atype);
+                            // CRITICAL: Deduplicate - same key can match multiple address types
+                            if found_keys.insert(privkey) {
+                                verify_found.fetch_add(1, Ordering::Relaxed);
+                                report(&privkey, &addr, atype);
+                            }
                         } else {
                             // Bloom filter false positive (expected behavior)
                             verify_fp_clone.fetch_add(1, Ordering::Relaxed);
@@ -308,8 +316,11 @@ fn verify_match(
                 return None; // Hash mismatch - bloom false positive
             }
 
-            // Check in targets - try direct first (P2PKH/P2WPKH), then P2SH
-            if let Some((addr, atype)) = targets.check(&comp_h160) {
+            // OPTIMIZATION: Use check_direct() instead of check()
+            // GPU already computes P2SH separately as MatchType::P2SH
+            // So here we only need to check P2PKH and P2WPKH (direct hash match)
+            // This avoids redundant P2SH script hash computation
+            if let Some((addr, atype)) = targets.check_direct(&comp_h160) {
                 return Some((addr, atype, priv_key));
             }
         }
