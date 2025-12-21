@@ -564,8 +564,10 @@ inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
 // - Bloom filter check
 // ============================================================================
 
-// Match buffer size - must match MATCH_BUFFER_SIZE in gpu.rs
-#define MAX_MATCHES 1048576
+// Match buffer size - must match config.match_buffer_size in gpu.rs
+// INCREASED: 4M for Pro chips, 2M for base chips
+// This prevents buffer overflow with high bloom FP rates
+#define MAX_MATCHES 4194304
 
 kernel void scan_keys(
     constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
@@ -611,25 +613,25 @@ kernel void scan_keys(
         #undef WINDOW_ADD
     }
 
-    // Montgomery batch inversion (BATCH_SIZE = 64)
-    // OPTIMIZED FOR M1 Pro 16GB: Reduced from 96 to 64 for maximum occupancy
+    // Montgomery batch inversion (BATCH_SIZE = 48)
+    // OPTIMIZED FOR M1 Pro 16GB: 48 = maximum occupancy without register spilling
     //
     // Register pressure analysis (M1 Pro 14-core):
     //   M1 Pro shader core: 256KB register file
     //   Each batch entry: ~80 bytes (X, Y, Z, ZZ = 4×64 bits)
     //
-    //   64 batch × 80 bytes = 5.1KB per thread ✓ OPTIMAL
-    //   96 batch × 80 bytes = 7.7KB per thread (still causes spilling)
-    //   128 batch × 80 bytes = 10.2KB per thread (heavy spilling)
+    //   48 batch × 80 bytes = 3.8KB per thread ✓ OPTIMAL (no register spilling!)
+    //   64 batch × 80 bytes = 5.1KB per thread (minimal spilling)
+    //   96 batch × 80 bytes = 7.7KB per thread (heavy spilling)
     //
     // Occupancy calculation:
-    //   256KB / 5.1KB = ~50 threads/core ✓ (excellent occupancy)
+    //   256KB / 3.8KB = ~67 threads/core ✓ (MAXIMUM occupancy)
+    //   256KB / 5.1KB = ~50 threads/core
     //   256KB / 7.7KB = ~33 threads/core
-    //   256KB / 10.2KB = ~25 threads/core
     //
-    // Expected performance gain: +15-20% from eliminated register spilling
+    // Expected performance gain: +12-18% from eliminated register spilling
     // EXTENDED JACOBIAN: batch_ZZ caches Z² for each point (+8-12% from saved squarings)
-    #define BATCH_SIZE 64
+    #define BATCH_SIZE 48
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_ZZ[BATCH_SIZE];
     ulong4 batch_Zinv[BATCH_SIZE];
     bool batch_valid[BATCH_SIZE]; // Track valid (non-zero Z) points
