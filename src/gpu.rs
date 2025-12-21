@@ -311,10 +311,18 @@ impl OptimizedScanner {
         cmd.wait_until_completed();
 
         // Read results
-        let match_count = unsafe {
+        let raw_match_count = unsafe {
             let ptr = self.match_count_buf.contents() as *const u32;
-            (*ptr).min(1024) as usize
+            *ptr
         };
+        
+        // Warn if buffer overflow
+        if raw_match_count > 1024 {
+            eprintln!("[!] WARNING: Match buffer overflow! {} matches found, {} lost", 
+                      raw_match_count, raw_match_count - 1024);
+        }
+        
+        let match_count = (raw_match_count as usize).min(1024);
 
         let keys_scanned = (self.max_threads * self.keys_per_thread as usize) as u64;
         self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);

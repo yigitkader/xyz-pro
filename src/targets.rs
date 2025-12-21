@@ -95,21 +95,25 @@ impl TargetDatabase {
         self.targets.len()
     }
 
-    /// Check if pubkey_hash matches any target
+    /// Direct hash lookup - works for any hash type (pubkey_hash or script_hash)
+    /// Use this when you already have the exact hash to look up
+    #[inline]
+    pub fn check_direct(&self, hash: &Hash160) -> Option<(&str, AddressType)> {
+        self.targets.get(hash).map(|(addr, atype)| (addr.as_str(), *atype))
+    }
+
+    /// Check if pubkey_hash matches any target (P2PKH, P2WPKH, or P2SH)
+    /// This also computes P2SH script_hash from pubkey_hash and checks that
     pub fn check(&self, pubkey_hash: &Hash160) -> Option<(&str, AddressType)> {
         // Direct check for P2PKH and P2WPKH
-        if let Some((addr, addr_type)) = self.targets.get(pubkey_hash) {
-            return Some((addr.as_str(), *addr_type));
+        if let Some(result) = self.check_direct(pubkey_hash) {
+            return Some(result);
         }
 
-        // Check P2SH (need to compute script hash)
+        // Check P2SH (need to compute script hash from pubkey hash)
         let script_hash = p2sh_script_hash(pubkey_hash.as_bytes());
         let script_hash160 = Hash160::from_slice(&script_hash);
-        if let Some((addr, addr_type)) = self.targets.get(&script_hash160) {
-            return Some((addr.as_str(), *addr_type));
-        }
-
-        None
+        self.check_direct(&script_hash160)
     }
 
     /// Get all hashes for Bloom filter

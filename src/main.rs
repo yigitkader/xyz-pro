@@ -132,10 +132,17 @@ fn generate_random_key() -> [u8; 32] {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
     let mut key = [0u8; 32];
+    let mut attempts = 0u32;
     loop {
         rng.fill_bytes(&mut key);
         if crypto::is_valid_private_key(&key) {
             return key;
+        }
+        attempts += 1;
+        // This should practically never happen (probability ~1/2^224)
+        // but defensive programming requires a safety limit
+        if attempts > 1000 {
+            panic!("[FATAL] Failed to generate valid private key after 1000 attempts - RNG may be broken");
         }
     }
 }
@@ -185,7 +192,7 @@ fn verify_match(
                 return None; // Hash mismatch - bloom false positive
             }
             
-            // Check in targets (direct P2PKH/P2WPKH or P2SH)
+            // Check in targets - try direct first (P2PKH/P2WPKH), then P2SH
             if let Some((addr, atype)) = targets.check(&comp_h160) {
                 return Some((addr.to_string(), atype, priv_key));
             }
@@ -201,8 +208,8 @@ fn verify_match(
                 return None; // Hash mismatch - bloom false positive
             }
             
-            // Check in targets (only P2PKH for uncompressed)
-            if let Some((addr, atype)) = targets.check(&uncomp_h160) {
+            // Check in targets - direct lookup only (uncompressed only for P2PKH legacy)
+            if let Some((addr, atype)) = targets.check_direct(&uncomp_h160) {
                 return Some((addr.to_string(), atype, priv_key));
             }
         }
@@ -218,8 +225,9 @@ fn verify_match(
                 return None; // Hash mismatch - bloom false positive
             }
             
-            // Check in targets - the P2SH script hash should be in targets
-            if let Some((addr, atype)) = targets.check(&types::Hash160::from_slice(&comp_hash)) {
+            // Check in targets using the SCRIPT HASH directly (not pubkey hash!)
+            // P2SH addresses store script_hash in targets, so direct lookup works
+            if let Some((addr, atype)) = targets.check_direct(&p2sh_h160) {
                 return Some((addr.to_string(), atype, priv_key));
             }
         }
