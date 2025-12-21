@@ -9,11 +9,13 @@ mod gpu;
 mod targets;
 mod types;
 
+use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use address::to_wif;
@@ -21,6 +23,12 @@ use gpu::{MatchType, OptimizedScanner, PotentialMatch};
 use targets::TargetDatabase;
 
 const TARGETS_FILE: &str = "targets.json";
+
+// Pipeline buffer size (GPU batches in flight)
+const PIPELINE_DEPTH: usize = 2;
+
+// Batch for verification: (base_key, matches)
+type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
 
 fn main() {
     println!("\n\x1b[1;36m╔═══════════════════════════════════════════════════════╗");
@@ -31,7 +39,7 @@ fn main() {
     // Load targets
     let targets = match TargetDatabase::new(TARGETS_FILE) {
         Ok(t) => {
-            println!("[✓] Loaded {} targets", t.total());
+            println!("[✓] Loaded {} targets ({:.1} MB)", t.total(), t.memory_stats().1 as f64 / 1_000_000.0);
             Arc::new(t)
         }
         Err(e) => {
@@ -62,46 +70,112 @@ fn main() {
     ctrlc::set_handler(move || {
         println!("\n[!] Stopping...");
         shutdown_sig.store(true, Ordering::SeqCst);
-    }).ok();
+    })
+    .ok();
 
-    println!("[▶] Scanning... (Ctrl+C to stop)\n");
+    println!("[▶] Scanning with pipelined GPU/CPU... (Ctrl+C to stop)\n");
 
+    // Double-buffered pipeline
+    run_pipelined(
+        gpu.clone(),
+        targets.clone(),
+        counter.clone(),
+        found.clone(),
+        shutdown.clone(),
+        start,
+    );
+
+    let total = counter.load(Ordering::Relaxed);
+    let time = start.elapsed().as_secs_f64();
+    println!(
+        "\n\n[Done] {} keys in {} @ {}",
+        format_num(total),
+        format_time(time),
+        format_speed(total as f64 / time)
+    );
+}
+
+// ============================================================================
+// PIPELINED EXECUTION (GPU + CPU parallel)
+// ============================================================================
+
+fn run_pipelined(
+    gpu: Arc<OptimizedScanner>,
+    targets: Arc<TargetDatabase>,
+    counter: Arc<AtomicU64>,
+    found: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+    start: Instant,
+) {
+    // Channel: GPU -> CPU verification
+    let (tx, rx): (Sender<VerifyBatch>, Receiver<VerifyBatch>) = bounded(PIPELINE_DEPTH);
+
+    // Clone for threads
+    let gpu_shutdown = shutdown.clone();
+    let verify_shutdown = shutdown.clone();
+    let gpu_counter = counter.clone();
+    let verify_found = found.clone();
+
+    // GPU thread: continuous scanning
+    let gpu_handle = thread::spawn(move || {
+        while !gpu_shutdown.load(Ordering::Relaxed) {
+            let base_key = generate_random_key();
+
+            match gpu.scan_batch(&base_key) {
+                Ok(matches) => {
+                    let batch_size = gpu.keys_per_batch();
+                    gpu_counter.fetch_add(batch_size, Ordering::Relaxed);
+
+                    // Send to verification (non-blocking if full)
+                    if !matches.is_empty() {
+                        if tx.try_send((base_key, matches)).is_err() {
+                            // Channel full, drop oldest or this batch
+                            // In practice, verification is fast enough
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[!] GPU error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // CPU verification thread
+    let verify_handle = thread::spawn(move || {
+        while !verify_shutdown.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok((base_key, matches)) => {
+                    for pm in matches {
+                        if let Some((addr, atype, privkey)) =
+                            verify_match(&base_key, &pm, &targets)
+                        {
+                            verify_found.fetch_add(1, Ordering::Relaxed);
+                            report(&privkey, &addr, atype);
+                        }
+                    }
+                }
+                Err(_) => continue, // Timeout, check shutdown
+            }
+        }
+    });
+
+    // Stats display in main thread
     let mut last_stat = Instant::now();
     let mut last_count = 0u64;
 
-    // Main loop
     while !shutdown.load(Ordering::Relaxed) {
-        // Generate random base key
-        let base_key = generate_random_key();
+        thread::sleep(Duration::from_millis(100));
 
-        // Scan batch
-        match gpu.scan_batch(&base_key) {
-            Ok(matches) => {
-                let batch_size = gpu.keys_per_batch();
-                counter.fetch_add(batch_size, Ordering::Relaxed);
-
-                // Verify matches
-                for pm in matches {
-                    if let Some((addr, atype, privkey)) = verify_match(&base_key, &pm, &targets) {
-                        found.fetch_add(1, Ordering::Relaxed);
-                        report(&privkey, &addr, atype);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[!] GPU error: {}", e);
-                break;
-            }
-        }
-
-        // Stats
         if last_stat.elapsed() >= Duration::from_millis(500) {
             let count = counter.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let speed = (count - last_count) as f64 / last_stat.elapsed().as_secs_f64();
             let avg = count as f64 / elapsed;
 
-            print!("\r[⚡] {} keys | {} (avg {}) | {} found | {}    ",
+            print!(
+                "\r[⚡] {} keys | {} (avg {}) | {} found | {}    ",
                 format_num(count),
                 format_speed(speed),
                 format_speed(avg),
@@ -115,13 +189,9 @@ fn main() {
         }
     }
 
-    let total = counter.load(Ordering::Relaxed);
-    let time = start.elapsed().as_secs_f64();
-    println!("\n\n[Done] {} keys in {} @ {}",
-        format_num(total),
-        format_time(time),
-        format_speed(total as f64 / time)
-    );
+    // Wait for threads to finish
+    gpu_handle.join().ok();
+    verify_handle.join().ok();
 }
 
 // ============================================================================
@@ -164,7 +234,7 @@ fn verify_match(
         *byte = sum as u8;
         carry = (carry >> 8) + (sum >> 8);
     }
-    
+
     // Check for overflow - if carry is non-zero after processing all bytes,
     // the result wrapped around and is invalid
     if carry != 0 {
@@ -186,15 +256,15 @@ fn verify_match(
             let comp = pubkey.to_encoded_point(true);
             let comp_hash = crypto::hash160(comp.as_bytes());
             let comp_h160 = types::Hash160::from_slice(&comp_hash);
-            
+
             // Verify hash matches what GPU found
             if comp_h160 != pm.hash {
                 return None; // Hash mismatch - bloom false positive
             }
-            
+
             // Check in targets - try direct first (P2PKH/P2WPKH), then P2SH
             if let Some((addr, atype)) = targets.check(&comp_h160) {
-                return Some((addr.to_string(), atype, priv_key));
+                return Some((addr, atype, priv_key));
             }
         }
         MatchType::Uncompressed => {
@@ -202,15 +272,15 @@ fn verify_match(
             let uncomp = pubkey.to_encoded_point(false);
             let uncomp_hash = crypto::hash160(uncomp.as_bytes());
             let uncomp_h160 = types::Hash160::from_slice(&uncomp_hash);
-            
+
             // Verify hash matches what GPU found
             if uncomp_h160 != pm.hash {
                 return None; // Hash mismatch - bloom false positive
             }
-            
+
             // Check in targets - direct lookup only (uncompressed only for P2PKH legacy)
             if let Some((addr, atype)) = targets.check_direct(&uncomp_h160) {
-                return Some((addr.to_string(), atype, priv_key));
+                return Some((addr, atype, priv_key));
             }
         }
         MatchType::P2SH => {
@@ -219,16 +289,16 @@ fn verify_match(
             let comp_hash = crypto::hash160(comp.as_bytes());
             let p2sh_hash = address::p2sh_script_hash(&comp_hash);
             let p2sh_h160 = types::Hash160::from_slice(&p2sh_hash);
-            
+
             // Verify hash matches what GPU found
             if p2sh_h160 != pm.hash {
                 return None; // Hash mismatch - bloom false positive
             }
-            
+
             // Check in targets using the SCRIPT HASH directly (not pubkey hash!)
             // P2SH addresses store script_hash in targets, so direct lookup works
             if let Some((addr, atype)) = targets.check_direct(&p2sh_h160) {
-                return Some((addr.to_string(), atype, priv_key));
+                return Some((addr, atype, priv_key));
             }
         }
     }
@@ -258,7 +328,11 @@ fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType) {
     println!("╚═══════════════════════════════════════════════════════╝");
     println!("\x1b[0m");
 
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("found.txt") {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("found.txt")
+    {
         writeln!(f, "[{}] {} | {} | {} | {}", time, addr, atype.as_str(), hex, wif).ok();
     }
 }
@@ -271,20 +345,30 @@ fn format_num(n: u64) -> String {
     let s = n.to_string();
     let mut r = String::new();
     for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { r.push(','); }
+        if i > 0 && i % 3 == 0 {
+            r.push(',');
+        }
         r.push(c);
     }
     r.chars().rev().collect()
 }
 
 fn format_speed(s: f64) -> String {
-    if s < 1_000.0 { format!("{:.0}/s", s) }
-    else if s < 1_000_000.0 { format!("{:.1}K/s", s / 1_000.0) }
-    else { format!("{:.2}M/s", s / 1_000_000.0) }
+    if s < 1_000.0 {
+        format!("{:.0}/s", s)
+    } else if s < 1_000_000.0 {
+        format!("{:.1}K/s", s / 1_000.0)
+    } else {
+        format!("{:.2}M/s", s / 1_000_000.0)
+    }
 }
 
 fn format_time(s: f64) -> String {
-    if s < 60.0 { format!("{:.0}s", s) }
-    else if s < 3600.0 { format!("{:.0}m{:.0}s", s / 60.0, s % 60.0) }
-    else { format!("{:.0}h{:.0}m", s / 3600.0, (s % 3600.0) / 60.0) }
+    if s < 60.0 {
+        format!("{:.0}s", s)
+    } else if s < 3600.0 {
+        format!("{:.0}m{:.0}s", s / 60.0, s % 60.0)
+    } else {
+        format!("{:.0}h{:.0}m", s / 3600.0, (s % 3600.0) / 60.0)
+    }
 }
