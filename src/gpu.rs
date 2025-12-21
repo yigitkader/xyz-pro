@@ -8,31 +8,128 @@ use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
 
 // ============================================================================
-// CONFIG
+// GPU CONFIGURATION - Auto-detected based on Apple Silicon variant
 // ============================================================================
 
-/// Maximum threads per dispatch (131072 × 64 = ~8.4M keys/batch)
-/// Higher thread count with lower keys/thread = better GPU occupancy
-/// More threads = better latency hiding for memory operations
-const MAX_THREADS: usize = 131_072;
+/// GPU configuration profile
+#[derive(Debug, Clone)]
+pub struct GpuConfig {
+    pub name: String,
+    pub max_threads: usize,
+    pub keys_per_thread: u32,
+    pub threadgroup_size: usize,
+    pub match_buffer_size: usize,
+    pub gpu_memory_mb: u64,
+}
 
-/// Keys processed per thread
-/// Reduced from 256 to 64 to:
-/// 1. Prevent GPU watchdog timeouts
-/// 2. Reduce register pressure (better occupancy)
-/// 3. Allow more frequent stats updates (no more "0/s" display)
-/// 4. Better thermal management on M1
-const KEYS_PER_THREAD: u32 = 64;
+impl GpuConfig {
+    /// Detect GPU and return optimal configuration
+    pub fn detect(device: &Device) -> Self {
+        let name = device.name().to_string();
+        let max_threadgroup = device.max_threads_per_threadgroup().width as usize;
+        
+        // Get recommended working set size (available GPU memory)
+        let gpu_memory = device.recommended_max_working_set_size();
+        let gpu_memory_mb = gpu_memory / (1024 * 1024);
+        
+        // Detect Apple Silicon variant from device name
+        let (max_threads, keys_per_thread, threadgroup_size, match_buffer_size) = 
+            Self::config_for_gpu(&name, max_threadgroup, gpu_memory_mb);
+        
+        GpuConfig {
+            name,
+            max_threads,
+            keys_per_thread,
+            threadgroup_size,
+            match_buffer_size,
+            gpu_memory_mb,
+        }
+    }
+    
+    /// Get optimal configuration based on GPU variant
+    fn config_for_gpu(name: &str, max_threadgroup: usize, memory_mb: u64) -> (usize, u32, usize, usize) {
+        let name_lower = name.to_lowercase();
+        
+        // Detect GPU tier based on name and memory
+        // Format: (max_threads, keys_per_thread, threadgroup_size, match_buffer_size)
+        
+        if name_lower.contains("ultra") {
+            // M1/M2/M3/M4 Ultra: 48-64 GPU cores, 64-192GB unified memory
+            // Extremely high parallelism
+            println!("[GPU] Detected: Ultra-class chip (48-64 cores)");
+            (
+                524_288,    // 512K threads
+                64,         // 64 keys/thread = 33.5M keys/batch
+                1024.min(max_threadgroup),
+                4_194_304,  // 4M match buffer
+            )
+        } else if name_lower.contains("max") {
+            // M1/M2/M3/M4 Max: 24-40 GPU cores, 32-128GB unified memory
+            // Very high parallelism
+            println!("[GPU] Detected: Max-class chip (24-40 cores)");
+            (
+                262_144,    // 256K threads
+                64,         // 64 keys/thread = 16.8M keys/batch
+                1024.min(max_threadgroup),
+                2_097_152,  // 2M match buffer
+            )
+        } else if name_lower.contains("pro") {
+            // M1/M2/M3/M4 Pro: 14-18 GPU cores, 16-48GB unified memory
+            // High parallelism
+            println!("[GPU] Detected: Pro-class chip (14-18 cores)");
+            (
+                196_608,    // 192K threads
+                64,         // 64 keys/thread = 12.6M keys/batch
+                512.min(max_threadgroup),
+                1_572_864,  // 1.5M match buffer
+            )
+        } else if memory_mb >= 16000 {
+            // Base M-series with high memory (16GB+)
+            // Could be M2/M3/M4 base with more memory
+            println!("[GPU] Detected: Base chip with {}GB memory", memory_mb / 1024);
+            (
+                131_072,    // 128K threads
+                64,         // 64 keys/thread = 8.4M keys/batch
+                256.min(max_threadgroup),
+                1_048_576,  // 1M match buffer
+            )
+        } else {
+            // M1 base or older: 7-8 GPU cores, 8-16GB unified memory
+            // Conservative settings for thermal management
+            println!("[GPU] Detected: Base chip (7-10 cores)");
+            (
+                131_072,    // 128K threads
+                64,         // 64 keys/thread = 8.4M keys/batch
+                256.min(max_threadgroup),
+                1_048_576,  // 1M match buffer
+            )
+        }
+    }
+    
+    /// Calculate keys per batch
+    pub fn keys_per_batch(&self) -> u64 {
+        (self.max_threads as u64) * (self.keys_per_thread as u64)
+    }
+    
+    /// Print configuration summary
+    pub fn print_summary(&self) {
+        let keys_per_batch = self.keys_per_batch();
+        println!("[GPU] Configuration:");
+        println!("      • Threads: {} ({:.0}K)", self.max_threads, self.max_threads as f64 / 1000.0);
+        println!("      • Keys/thread: {}", self.keys_per_thread);
+        println!("      • Keys/batch: {:.1}M", keys_per_batch as f64 / 1_000_000.0);
+        println!("      • Threadgroup: {}", self.threadgroup_size);
+        println!("      • Match buffer: {:.1}M entries", self.match_buffer_size as f64 / 1_000_000.0);
+        println!("      • GPU Memory: {} MB", self.gpu_memory_mb);
+    }
+}
 
-/// Match buffer size (bloom false positives can be high with large target sets)
-/// For 60M targets with 0.05% FP rate: 134M keys × 0.0005 = ~67K expected matches
-/// We use 1M for ~15x safety margin to prevent any match loss
-/// 
-/// NOTE: For very large target sets (100M+), bloom filter FP rate increases.
-/// If you see "CRITICAL: Match buffer overflow!" errors:
-/// 1. Increase this value (e.g., 2_097_152 for 2M)
-/// 2. Or increase bloom filter size (change n*20 to n*25 or n*30 in BloomFilter::new)
-const MATCH_BUFFER_SIZE: usize = 1_048_576;
+// ============================================================================
+// LEGACY CONSTANTS (for backward compatibility, not used with auto-config)
+// ============================================================================
+
+/// Match buffer size default (overridden by GpuConfig)
+const DEFAULT_MATCH_BUFFER_SIZE: usize = 1_048_576;
 
 // ============================================================================
 // BLOOM FILTER
@@ -149,9 +246,8 @@ pub struct OptimizedScanner {
     bloom_size_buf: Buffer,
     kpt_buf: Buffer,
 
-    // Config
-    max_threads: usize,
-    keys_per_thread: u32,
+    // GPU Configuration (auto-detected)
+    config: GpuConfig,
 
     // Stats
     total_scanned: AtomicU64,
@@ -194,7 +290,10 @@ impl OptimizedScanner {
             .ok_or_else(|| ScannerError::Gpu("No Metal GPU found".into()))?;
 
         println!("[GPU] Device: {}", device.name());
-        println!("[GPU] Max threads/threadgroup: {}", device.max_threads_per_threadgroup().width);
+        
+        // Auto-detect optimal configuration for this GPU
+        let config = GpuConfig::detect(&device);
+        config.print_summary();
 
         let queue = device.new_command_queue();
         let opts = CompileOptions::new();
@@ -216,7 +315,7 @@ impl OptimizedScanner {
         let pipeline = device.new_compute_pipeline_state_with_function(&func)
             .map_err(|e| ScannerError::Gpu(format!("pipeline: {}", e)))?;
 
-        println!("[GPU] Pipeline: max_threads={}", pipeline.max_total_threads_per_threadgroup());
+        println!("[GPU] Pipeline: max_threads_per_threadgroup={}", pipeline.max_total_threads_per_threadgroup());
 
         // Build Bloom filter
         let mut bloom = BloomFilter::new(target_hashes.len().max(100));
@@ -224,22 +323,23 @@ impl OptimizedScanner {
             bloom.insert(h);
         }
 
-        // Compute StepTable
-        let step_table = compute_step_table(KEYS_PER_THREAD);
+        // Compute StepTable using config's keys_per_thread
+        let step_table = compute_step_table(config.keys_per_thread);
 
         // Allocate buffers
         let storage = MTLResourceOptions::StorageModeShared;
+        let match_buffer_size = config.match_buffer_size;
 
         // Double buffer sets for pipelined execution
         let buffer_sets = [
             BufferSet {
                 base_point_buf: device.new_buffer(64, storage),
-                match_data_buf: device.new_buffer((MATCH_BUFFER_SIZE * 52) as u64, storage),
+                match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
             BufferSet {
                 base_point_buf: device.new_buffer(64, storage),
-                match_data_buf: device.new_buffer((MATCH_BUFFER_SIZE * 52) as u64, storage),
+                match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
         ];
@@ -265,24 +365,20 @@ impl OptimizedScanner {
             storage,
         );
 
+        let keys_per_thread = config.keys_per_thread;
         let kpt_buf = device.new_buffer_with_data(
-            &KEYS_PER_THREAD as *const u32 as *const _,
+            &keys_per_thread as *const u32 as *const _,
             4,
             storage,
         );
 
-        let keys_per_batch = MAX_THREADS * KEYS_PER_THREAD as usize;
-        // Double buffer memory: 2x (base_point + match_data + match_count)
-        let double_buf_mem = 2 * (64 + MATCH_BUFFER_SIZE * 52 + 4);
+        // Memory stats
+        let double_buf_mem = 2 * (64 + match_buffer_size * 52 + 4);
         let shared_mem = 20 * 64 + bloom_data.len() * 8 + 4 + 4;
         let mem_mb = (double_buf_mem + shared_mem) as f64 / 1_000_000.0;
         
         println!("[GPU] Double buffering enabled for async pipelining");
-        println!("[GPU] Match buffer: {} entries × 2 ({:.1} MB)", MATCH_BUFFER_SIZE, (MATCH_BUFFER_SIZE * 52 * 2) as f64 / 1_000_000.0);
-
-        println!("[GPU] Keys/batch: {} M (threads={}, keys/thread={})", 
-            keys_per_batch / 1_000_000, MAX_THREADS, KEYS_PER_THREAD);
-        println!("[GPU] Memory: {:.2} MB", mem_mb);
+        println!("[GPU] Total buffer memory: {:.2} MB", mem_mb);
         
         // Calculate and log expected Bloom filter false positive rate
         // FP rate ≈ (1 - e^(-k*n/m))^k where k=7 hash functions, n=items, m=bits
@@ -290,6 +386,7 @@ impl OptimizedScanner {
         let m = (bloom.size_words() * 64) as f64;
         let k = 7.0f64;
         let fp_rate = (1.0 - (-k * n / m).exp()).powf(k);
+        let keys_per_batch = config.keys_per_batch();
         let expected_fp_per_batch = (keys_per_batch as f64) * fp_rate;
         
         println!("[GPU] Bloom filter: {} words ({} KB), FP rate: {:.4}%, ~{:.0} FP/batch", 
@@ -308,8 +405,7 @@ impl OptimizedScanner {
             bloom_buf,
             bloom_size_buf,
             kpt_buf,
-            max_threads: MAX_THREADS,
-            keys_per_thread: KEYS_PER_THREAD,
+            config,
             total_scanned: AtomicU64::new(0),
             total_matches: AtomicU64::new(0),
         })
@@ -346,12 +442,12 @@ impl OptimizedScanner {
         let cmd = self.queue.new_command_buffer();
 
         let grid = MTLSize {
-            width: self.max_threads as u64,
+            width: self.config.max_threads as u64,
             height: 1,
             depth: 1,
         };
         let group = MTLSize {
-            width: 256,
+            width: self.config.threadgroup_size as u64,
             height: 1,
             depth: 1,
         };
@@ -380,18 +476,19 @@ impl OptimizedScanner {
         };
         
         // CRITICAL: Buffer overflow means we lost matches - this is unacceptable
-        // Either increase MATCH_BUFFER_SIZE or reduce target set size
-        if raw_match_count as usize > MATCH_BUFFER_SIZE {
+        // Either upgrade to a higher-tier GPU or reduce target set size
+        let match_buffer_size = self.config.match_buffer_size;
+        if raw_match_count as usize > match_buffer_size {
             return Err(ScannerError::Gpu(format!(
                 "CRITICAL: Match buffer overflow! {} matches found, buffer size {}. \
-                 {} potential matches were lost. Increase MATCH_BUFFER_SIZE or reduce target set.",
-                raw_match_count, MATCH_BUFFER_SIZE, raw_match_count as usize - MATCH_BUFFER_SIZE
+                 {} potential matches were lost. GPU config may need adjustment.",
+                raw_match_count, match_buffer_size, raw_match_count as usize - match_buffer_size
             )));
         }
         
         let match_count = raw_match_count as usize;
 
-        let keys_scanned = (self.max_threads * self.keys_per_thread as usize) as u64;
+        let keys_scanned = self.config.keys_per_batch();
         self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);
 
         let mut matches = Vec::with_capacity(match_count);
@@ -429,7 +526,12 @@ impl OptimizedScanner {
     }
 
     pub fn keys_per_batch(&self) -> u64 {
-        (self.max_threads * self.keys_per_thread as usize) as u64
+        self.config.keys_per_batch()
+    }
+    
+    /// Get current GPU configuration
+    pub fn config(&self) -> &GpuConfig {
+        &self.config
     }
 
     pub fn total_scanned(&self) -> u64 {

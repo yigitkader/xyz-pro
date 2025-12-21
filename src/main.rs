@@ -325,9 +325,10 @@ fn run_pipelined(
     let verify_found = found.clone();
 
     // GPU thread: continuous scanning
+    let keys_per_batch = gpu.keys_per_batch();
     let gpu_handle = thread::spawn(move || {
         while !gpu_shutdown.load(Ordering::Relaxed) {
-            let base_key = generate_random_key();
+            let base_key = generate_random_key(keys_per_batch);
 
             match gpu.scan_batch(&base_key) {
                 Ok(matches) => {
@@ -452,11 +453,9 @@ fn run_pipelined(
 // KEY GENERATION
 // ============================================================================
 
-/// Maximum key_index that GPU can generate: MAX_THREADS × KEYS_PER_THREAD
-/// 131_072 × 64 = 8_388_608 (~8.4M keys/batch)
-const MAX_KEY_OFFSET: u64 = 131_072 * 64;
-
-fn generate_random_key() -> [u8; 32] {
+/// Generate a random valid private key that won't overflow when GPU adds key_index
+/// max_key_offset = keys_per_batch (from GPU config)
+fn generate_random_key(max_key_offset: u64) -> [u8; 32] {
     use rand::RngCore;
     use std::cell::RefCell;
     
@@ -483,10 +482,10 @@ fn generate_random_key() -> [u8; 32] {
             continue;
         }
         
-        // Check 2: Ensure key + MAX_KEY_OFFSET doesn't overflow curve order
+        // Check 2: Ensure key + max_key_offset doesn't overflow curve order
         // This prevents invalid keys when GPU adds key_index to base_key
         let mut temp = key;
-        let mut carry = MAX_KEY_OFFSET;
+        let mut carry = max_key_offset;
         for byte in temp.iter_mut().rev() {
             let sum = *byte as u64 + (carry & 0xFF);
             *byte = sum as u8;
@@ -499,7 +498,7 @@ fn generate_random_key() -> [u8; 32] {
             continue;
         }
         
-        // Check if key + MAX_KEY_OFFSET is still valid (< N)
+        // Check if key + max_key_offset is still valid (< N)
         if crypto::is_valid_private_key(&temp) {
             return key;
         }
