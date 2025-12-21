@@ -247,9 +247,9 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
         ),
         (
             "0000000000000000000000000000000000000000000000000000000000000002",
-            "06afd46bcdfd22ef94ac122aa11f241244a37ecc",  // compressed
-            "e6c9f7e1c586e47d7b4c7b6e7f7e2e7e7e7e7e7e",  // uncompressed (placeholder)
-            "3e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",  // p2sh (placeholder)
+            "06afd46bcdfd22ef94ac122aa11f241244a37ecc",  // compressed - verified
+            "d6c8e828c1eeaa6fce4e3a2119d38ec232e62f27",  // uncompressed - COMPUTED
+            "d8ed538f3bee0e8cf0672d1d1bc5c5f2a8e95f75",  // p2sh - COMPUTED
         ),
     ];
     
@@ -570,6 +570,22 @@ fn main() {
     println!("║     XYZ-PRO  •  Bitcoin Key Scanner  •  Metal GPU      ║");
     println!("║         P2PKH  •  P2SH  •  P2WPKH                       ║");
     println!("╚═══════════════════════════════════════════════════════╝\x1b[0m\n");
+
+    // OPTIMIZATION: Configure Rayon thread pool for P-cores only
+    // Apple Silicon has Performance cores (fast) and Efficiency cores (slow)
+    // Using only P-cores avoids E-core overhead and improves verification speed
+    // M1/M2/M3 Pro/Max: 8-10 P-cores, so 8 threads is optimal
+    use rayon::ThreadPoolBuilder;
+    if let Err(e) = ThreadPoolBuilder::new()
+        .num_threads(8)  // Performance cores only (exclude efficiency cores)
+        .thread_name(|i| format!("verify-{}", i))
+        .build_global()
+    {
+        eprintln!("[!] Failed to configure Rayon thread pool: {}", e);
+        // Continue with default pool
+    } else {
+        println!("[CPU] Rayon: 8 threads (P-cores only)");
+    }
 
     // CRITICAL: Run self-test before anything else
     // This ensures hash calculations are correct - a bug here means missed matches

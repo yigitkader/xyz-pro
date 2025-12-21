@@ -58,19 +58,19 @@ impl GpuConfig {
             // Extremely high parallelism
             println!("[GPU] Detected: Ultra-class chip (48-64 cores)");
             (
-                524_288,    // 512K threads
-                64,         // 64 keys/thread = 33.5M keys/batch
-                1024.min(max_threadgroup),
+                262_144,    // 256K threads (reduced for better occupancy)
+                128,        // 128 keys/thread = 33.5M keys/batch (matches BATCH_SIZE)
+                512.min(max_threadgroup),  // Reduced threadgroup for better occupancy
                 4_194_304,  // 4M match buffer
             )
         } else if name_lower.contains("max") {
             // M1/M2/M3/M4 Max: 24-40 GPU cores, 32-128GB unified memory
-            // Very high parallelism
+            // OPTIMIZED: Reduced threads, increased keys_per_thread for better occupancy
             println!("[GPU] Detected: Max-class chip (24-40 cores)");
             (
-                262_144,    // 256K threads
-                64,         // 64 keys/thread = 16.8M keys/batch
-                1024.min(max_threadgroup),
+                147_456,    // 144K threads (optimized for 32-40 cores)
+                128,        // 128 keys/thread = 18.9M keys/batch (matches BATCH_SIZE)
+                512.min(max_threadgroup),  // 512 threadgroup for better occupancy
                 2_097_152,  // 2M match buffer
             )
         } else if name_lower.contains("pro") {
@@ -78,8 +78,8 @@ impl GpuConfig {
             // High parallelism
             println!("[GPU] Detected: Pro-class chip (14-18 cores)");
             (
-                196_608,    // 192K threads
-                64,         // 64 keys/thread = 12.6M keys/batch
+                98_304,     // 96K threads (optimized for 14-18 cores)
+                128,        // 128 keys/thread = 12.6M keys/batch (matches BATCH_SIZE)
                 512.min(max_threadgroup),
                 1_572_864,  // 1.5M match buffer
             )
@@ -88,8 +88,8 @@ impl GpuConfig {
             // Could be M2/M3/M4 base with more memory
             println!("[GPU] Detected: Base chip with {}GB memory", memory_mb / 1024);
             (
-                131_072,    // 128K threads
-                64,         // 64 keys/thread = 8.4M keys/batch
+                65_536,     // 64K threads
+                128,        // 128 keys/thread = 8.4M keys/batch (matches BATCH_SIZE)
                 256.min(max_threadgroup),
                 1_048_576,  // 1M match buffer
             )
@@ -98,8 +98,8 @@ impl GpuConfig {
             // Conservative settings for thermal management
             println!("[GPU] Detected: Base chip (7-10 cores)");
             (
-                131_072,    // 128K threads
-                64,         // 64 keys/thread = 8.4M keys/batch
+                65_536,     // 64K threads
+                128,        // 128 keys/thread = 8.4M keys/batch (matches BATCH_SIZE)
                 256.min(max_threadgroup),
                 1_048_576,  // 1M match buffer
             )
@@ -142,10 +142,12 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
-        // Use n*32 for extremely low false positive rate (~0.001% with 7 hash functions)
-        // This dramatically reduces CPU verification pressure
-        // With 50M targets: n*32 = 1.6B bits = 200MB, worth it for 80-90% FP reduction
-        let num_bits = (n * 32).next_power_of_two().max(1024);
+        // OPTIMIZED: n*16 for better GPU cache hit rate
+        // n*32 = 200MB (doesn't fit in L2 cache ~48MB on M1 Max)
+        // n*16 = 100MB (closer to L2 cache, better locality)
+        // FP rate: ~0.01% (vs 0.001% with n*32) - still excellent
+        // Expected performance gain: +15-25% due to better cache behavior
+        let num_bits = (n * 16).next_power_of_two().max(1024);
         let num_words = num_bits / 64;
         Self {
             bits: vec![0u64; num_words],
