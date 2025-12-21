@@ -991,8 +991,14 @@ impl ThermalMonitor {
         // This prevents unnecessary pauses from momentary spikes
         let recent_avg = {
             let history = self.perf_history.lock().unwrap();
-            if history.len() >= 10 {
-                history.iter().rev().take(10).sum::<u64>() / 10
+            let len = history.len();
+            if len >= 10 {
+                // Take last 10 entries using skip (safer than rev().take())
+                let skip_count = len.saturating_sub(10);
+                history.iter().skip(skip_count).sum::<u64>() / 10
+            } else if len > 0 {
+                // Use all available history for average
+                history.iter().sum::<u64>() / len as u64
             } else {
                 duration_us
             }
@@ -1459,8 +1465,8 @@ fn run_pipelined(
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
 
-        // Memory pressure check every 5 seconds (defensive monitoring)
-        if last_mem_check.elapsed() >= Duration::from_secs(5) {
+        // Memory pressure check every 30 seconds (reduced overhead from vm_stat fork)
+        if last_mem_check.elapsed() >= Duration::from_secs(30) {
             let mem_free_pct = check_memory_pressure();
             let pressure = MemoryPressure::from_free_pct(mem_free_pct);
             
