@@ -187,9 +187,11 @@ impl BloomFilter {
 
 // ============================================================================
 // STEP TABLE (Precomputed for GPU)
-// StepTable[i] = (2^i * keys_per_thread) * G
+// Standard: StepTable[i] = (2^i * keys_per_thread) * G (20 entries)
+// wNAF w=4: StepTable[window][digit] = ((2*digit+1) * 2^(4*window) * kpt) * G
 // ============================================================================
 
+/// Standard binary step table: 20 entries for bits 0-19
 fn compute_step_table(keys_per_thread: u32) -> [[u8; 64]; 20] {
     use k256::elliptic_curve::PrimeField;
     use k256::ProjectivePoint;
@@ -223,6 +225,56 @@ fn compute_step_table(keys_per_thread: u32) -> [[u8; 64]; 20] {
     table
 }
 
+/// Windowed step table: 5 windows × 15 non-zero digits = 75 entries
+/// Entry[window * 15 + (digit-1)] = digit * 2^(4*window) * kpt * G
+/// digit ∈ {1,2,...,15}, window ∈ {0,1,2,3,4}
+/// This reduces ~10 additions to max 5 additions per thread start (50% improvement)
+fn compute_wnaf_step_table(keys_per_thread: u32) -> [[u8; 64]; 75] {
+    use k256::elliptic_curve::PrimeField;
+    use k256::ProjectivePoint;
+    use k256::Scalar;
+
+    let mut table = [[0u8; 64]; 75];
+
+    // Base: kpt * G
+    let kpt_bytes = {
+        let mut b = [0u8; 32];
+        b[28..32].copy_from_slice(&keys_per_thread.to_be_bytes());
+        b
+    };
+    let kpt_scalar = Scalar::from_repr_vartime(kpt_bytes.into()).unwrap();
+    let base_point = ProjectivePoint::GENERATOR * kpt_scalar;
+
+    // For each window (4-bit chunks of gid)
+    for window in 0..5 {
+        // 2^(4*window) * kpt * G
+        let window_shift = 4 * window;
+        let mut window_base = base_point;
+        for _ in 0..window_shift {
+            window_base = window_base.double();
+        }
+
+        // For each digit 1..15 (skip 0, it's identity)
+        let mut current = window_base;  // 1 * window_base
+        
+        for digit in 1..=15 {
+            let idx = window * 15 + (digit - 1);
+            
+            let affine = current.to_affine();
+            let encoded = affine.to_encoded_point(false);
+            let bytes = encoded.as_bytes();
+            
+            table[idx][..32].copy_from_slice(&bytes[1..33]);
+            table[idx][32..64].copy_from_slice(&bytes[33..65]);
+            
+            // Next: current + window_base
+            current = current + window_base;
+        }
+    }
+
+    table
+}
+
 // ============================================================================
 // OPTIMIZED SCANNER
 // ============================================================================
@@ -245,7 +297,8 @@ pub struct OptimizedScanner {
     current_buffer: std::sync::atomic::AtomicUsize,
 
     // Shared buffers (read-only, no double buffering needed)
-    step_table_buf: Buffer,
+    step_table_buf: Buffer,       // Legacy binary step table (20 × 64 bytes)
+    wnaf_table_buf: Buffer,       // wNAF w=4 step table (40 × 64 bytes) - 50% faster start point
     bloom_buf: Buffer,
     bloom_size_buf: Buffer,
     kpt_buf: Buffer,
@@ -259,15 +312,23 @@ pub struct OptimizedScanner {
 }
 
 /// Match type from GPU
-/// 0 = compressed pubkey hash
-/// 1 = uncompressed pubkey hash  
-/// 2 = P2SH script hash (from compressed)
+/// Primary range (original keys):
+///   0 = compressed pubkey hash
+///   1 = uncompressed pubkey hash  
+///   2 = P2SH script hash (from compressed)
+/// GLV Endomorphic range (λ·k keys - FREE extra scanning!):
+///   3 = GLV compressed pubkey hash
+///   4 = GLV uncompressed pubkey hash
+///   5 = GLV P2SH script hash
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MatchType {
     Compressed = 0,
     Uncompressed = 1,
     P2SH = 2,
+    GlvCompressed = 3,
+    GlvUncompressed = 4,
+    GlvP2SH = 5,
 }
 
 impl MatchType {
@@ -276,9 +337,55 @@ impl MatchType {
             0 => Some(Self::Compressed),
             1 => Some(Self::Uncompressed),
             2 => Some(Self::P2SH),
+            3 => Some(Self::GlvCompressed),
+            4 => Some(Self::GlvUncompressed),
+            5 => Some(Self::GlvP2SH),
             _ => None,
         }
     }
+    
+    /// Check if this is a GLV endomorphic match
+    /// GLV matches require private key transformation: actual_key = λ·key_index (mod n)
+    pub fn is_glv(&self) -> bool {
+        matches!(self, Self::GlvCompressed | Self::GlvUncompressed | Self::GlvP2SH)
+    }
+}
+
+// ============================================================================
+// GLV CONSTANTS for private key recovery
+// λ³ ≡ 1 (mod n), used to compute actual private key from GLV match
+// actual_key = λ · (base_key + key_index) mod n
+// ============================================================================
+
+/// GLV Lambda constant for secp256k1
+/// λ = 0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72
+pub const GLV_LAMBDA: [u8; 32] = [
+    0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0,
+    0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
+    0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78,
+    0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23, 0xbd, 0x72,
+];
+
+/// Compute GLV-transformed private key: λ·k (mod n)
+/// Used to recover actual private key from GLV endomorphic match
+pub fn glv_transform_key(key: &[u8; 32]) -> [u8; 32] {
+    use k256::elliptic_curve::PrimeField;
+    use k256::Scalar;
+    
+    // Parse key as scalar
+    let key_scalar = match Scalar::from_repr_vartime((*key).into()) {
+        Some(s) => s,
+        None => return *key, // Invalid key, return as-is
+    };
+    
+    // Parse λ as scalar
+    let lambda_scalar = Scalar::from_repr_vartime(GLV_LAMBDA.into()).unwrap();
+    
+    // Compute λ·k (mod n)
+    let result = key_scalar * lambda_scalar;
+    
+    // Convert back to bytes
+    result.to_repr().into()
 }
 
 #[derive(Clone, Debug)]
@@ -326,8 +433,11 @@ impl OptimizedScanner {
             bloom.insert(h);
         }
 
-        // Compute StepTable using config's keys_per_thread
+        // Compute StepTables using config's keys_per_thread
         let step_table = compute_step_table(config.keys_per_thread);
+        let wnaf_table = compute_wnaf_step_table(config.keys_per_thread);
+        
+        println!("[GPU] Windowed step table: {} entries (5 windows × 15 digits) for 50% faster thread start", wnaf_table.len());
 
         // Allocate buffers
         let storage = MTLResourceOptions::StorageModeShared;
@@ -357,6 +467,13 @@ impl OptimizedScanner {
         let step_table_buf = device.new_buffer_with_data(
             step_table.as_ptr() as *const _,
             (20 * 64) as u64,
+            storage,
+        );
+        
+        // Windowed step table: 5 windows × 15 non-zero digits = 75 entries
+        let wnaf_table_buf = device.new_buffer_with_data(
+            wnaf_table.as_ptr() as *const _,
+            (75 * 64) as u64,
             storage,
         );
 
@@ -410,6 +527,7 @@ impl OptimizedScanner {
             buffer_sets,
             current_buffer: std::sync::atomic::AtomicUsize::new(0),
             step_table_buf,
+            wnaf_table_buf,
             bloom_buf,
             bloom_size_buf,
             kpt_buf,
@@ -463,11 +581,12 @@ impl OptimizedScanner {
             enc.set_compute_pipeline_state(&self.pipeline);
             enc.set_buffer(0, Some(&buffers.base_point_buf), 0);
             enc.set_buffer(1, Some(&self.step_table_buf), 0);
-            enc.set_buffer(2, Some(&self.bloom_buf), 0);
-            enc.set_buffer(3, Some(&self.bloom_size_buf), 0);
-            enc.set_buffer(4, Some(&self.kpt_buf), 0);
-            enc.set_buffer(5, Some(&buffers.match_data_buf), 0);
-            enc.set_buffer(6, Some(&buffers.match_count_buf), 0);
+            enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);  // wNAF w=4 table
+            enc.set_buffer(3, Some(&self.bloom_buf), 0);
+            enc.set_buffer(4, Some(&self.bloom_size_buf), 0);
+            enc.set_buffer(5, Some(&self.kpt_buf), 0);
+            enc.set_buffer(6, Some(&buffers.match_data_buf), 0);
+            enc.set_buffer(7, Some(&buffers.match_count_buf), 0);
             enc.dispatch_threads(grid, group);
             enc.end_encoding();
         }

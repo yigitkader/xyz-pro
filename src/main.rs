@@ -302,17 +302,35 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
                 if let Ok(secret) = SecretKey::from_slice(&priv_key) {
                     let pubkey = secret.public_key();
                     
-                    let cpu_hash: [u8; 20] = match m.match_type {
-                        gpu::MatchType::Compressed => {
-                            let comp = pubkey.to_encoded_point(true);
+                    // For GLV matches, we need to use the GLV-transformed pubkey
+                    let (effective_pubkey, base_type) = if m.match_type.is_glv() {
+                        // GLV match: compute λ·k pubkey
+                        let glv_key = gpu::glv_transform_key(&priv_key);
+                        if let Ok(glv_secret) = SecretKey::from_slice(&glv_key) {
+                            (glv_secret.public_key(), match m.match_type {
+                                gpu::MatchType::GlvCompressed => gpu::MatchType::Compressed,
+                                gpu::MatchType::GlvUncompressed => gpu::MatchType::Uncompressed,
+                                gpu::MatchType::GlvP2SH => gpu::MatchType::P2SH,
+                                _ => m.match_type,
+                            })
+                        } else {
+                            continue; // Invalid GLV key
+                        }
+                    } else {
+                        (pubkey, m.match_type)
+                    };
+                    
+                    let cpu_hash: [u8; 20] = match base_type {
+                        gpu::MatchType::Compressed | gpu::MatchType::GlvCompressed => {
+                            let comp = effective_pubkey.to_encoded_point(true);
                             crypto::hash160(comp.as_bytes())
                         }
-                        gpu::MatchType::Uncompressed => {
-                            let uncomp = pubkey.to_encoded_point(false);
+                        gpu::MatchType::Uncompressed | gpu::MatchType::GlvUncompressed => {
+                            let uncomp = effective_pubkey.to_encoded_point(false);
                             crypto::hash160(uncomp.as_bytes())
                         }
-                        gpu::MatchType::P2SH => {
-                            let comp = pubkey.to_encoded_point(true);
+                        gpu::MatchType::P2SH | gpu::MatchType::GlvP2SH => {
+                            let comp = effective_pubkey.to_encoded_point(true);
                             let comp_hash = crypto::hash160(comp.as_bytes());
                             address::p2sh_script_hash(&comp_hash)
                         }
@@ -368,17 +386,34 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
             if let Ok(secret) = SecretKey::from_slice(&priv_key) {
                 let pubkey = secret.public_key();
                 
-                let cpu_hash = match pm.match_type {
-                    gpu::MatchType::Compressed => {
-                        let comp = pubkey.to_encoded_point(true);
+                // For GLV matches, use GLV-transformed pubkey
+                let (effective_pubkey, base_type) = if pm.match_type.is_glv() {
+                    let glv_key = gpu::glv_transform_key(&priv_key);
+                    if let Ok(glv_secret) = SecretKey::from_slice(&glv_key) {
+                        (glv_secret.public_key(), match pm.match_type {
+                            gpu::MatchType::GlvCompressed => gpu::MatchType::Compressed,
+                            gpu::MatchType::GlvUncompressed => gpu::MatchType::Uncompressed,
+                            gpu::MatchType::GlvP2SH => gpu::MatchType::P2SH,
+                            _ => pm.match_type,
+                        })
+                    } else {
+                        (pubkey, pm.match_type) // Fallback
+                    }
+                } else {
+                    (pubkey, pm.match_type)
+                };
+                
+                let cpu_hash = match base_type {
+                    gpu::MatchType::Compressed | gpu::MatchType::GlvCompressed => {
+                        let comp = effective_pubkey.to_encoded_point(true);
                         crypto::hash160(comp.as_bytes())
                     }
-                    gpu::MatchType::Uncompressed => {
-                        let uncomp = pubkey.to_encoded_point(false);
+                    gpu::MatchType::Uncompressed | gpu::MatchType::GlvUncompressed => {
+                        let uncomp = effective_pubkey.to_encoded_point(false);
                         crypto::hash160(uncomp.as_bytes())
                     }
-                    gpu::MatchType::P2SH => {
-                        let comp = pubkey.to_encoded_point(true);
+                    gpu::MatchType::P2SH | gpu::MatchType::GlvP2SH => {
+                        let comp = effective_pubkey.to_encoded_point(true);
                         let comp_hash = crypto::hash160(comp.as_bytes());
                         address::p2sh_script_hash(&comp_hash)
                     }
@@ -958,17 +993,25 @@ fn verify_match(
         return None;
     }
 
-    if !crypto::is_valid_private_key(&priv_key) {
+    // For GLV matches, the actual private key is λ·k (mod n)
+    // This is because GPU used φ(P) = (β·Px, Py) which corresponds to λ·P
+    let actual_key = if pm.match_type.is_glv() {
+        gpu::glv_transform_key(&priv_key)
+    } else {
+        priv_key
+    };
+
+    if !crypto::is_valid_private_key(&actual_key) {
         return None;
     }
 
-    // Generate public key
-    let secret = SecretKey::from_slice(&priv_key).ok()?;
+    // Generate public key from actual key
+    let secret = SecretKey::from_slice(&actual_key).ok()?;
     let pubkey = secret.public_key();
 
-    // Verify based on match_type from GPU
+    // Verify based on match_type from GPU (use base type for GLV matches)
     match pm.match_type {
-        MatchType::Compressed => {
+        MatchType::Compressed | MatchType::GlvCompressed => {
             // GPU found compressed pubkey hash match
             let comp = pubkey.to_encoded_point(true);
             let comp_hash = crypto::hash160(comp.as_bytes());
@@ -980,14 +1023,13 @@ fn verify_match(
             }
 
             // OPTIMIZATION: Use check_direct() instead of check()
-            // GPU already computes P2SH separately as MatchType::P2SH
+            // GPU already computes P2SH separately as MatchType::P2SH/GlvP2SH
             // So here we only need to check P2PKH and P2WPKH (direct hash match)
-            // This avoids redundant P2SH script hash computation
             if let Some((addr, atype)) = targets.check_direct(&comp_h160) {
-                return Some((addr, atype, priv_key));
+                return Some((addr, atype, actual_key));
             }
         }
-        MatchType::Uncompressed => {
+        MatchType::Uncompressed | MatchType::GlvUncompressed => {
             // GPU found uncompressed pubkey hash match
             let uncomp = pubkey.to_encoded_point(false);
             let uncomp_hash = crypto::hash160(uncomp.as_bytes());
@@ -1000,10 +1042,10 @@ fn verify_match(
 
             // Check in targets - direct lookup only (uncompressed only for P2PKH legacy)
             if let Some((addr, atype)) = targets.check_direct(&uncomp_h160) {
-                return Some((addr, atype, priv_key));
+                return Some((addr, atype, actual_key));
             }
         }
-        MatchType::P2SH => {
+        MatchType::P2SH | MatchType::GlvP2SH => {
             // GPU found P2SH script hash match
             let comp = pubkey.to_encoded_point(true);
             let comp_hash = crypto::hash160(comp.as_bytes());
@@ -1018,7 +1060,7 @@ fn verify_match(
             // Check in targets using the SCRIPT HASH directly (not pubkey hash!)
             // P2SH addresses store script_hash in targets, so direct lookup works
             if let Some((addr, atype)) = targets.check_direct(&p2sh_h160) {
-                return Some((addr, atype, priv_key));
+                return Some((addr, atype, actual_key));
             }
         }
     }
