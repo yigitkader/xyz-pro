@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use address::to_wif;
+use address::to_wif_compressed;
 use gpu::{MatchType, OptimizedScanner, PotentialMatch};
 use targets::TargetDatabase;
 
@@ -166,7 +166,12 @@ fn run_pipelined(
                             // CRITICAL: Deduplicate - same key can match multiple address types
                             if found_keys.insert(privkey) {
                                 verify_found.fetch_add(1, Ordering::Relaxed);
-                                report(&privkey, &addr, atype);
+                                
+                                // CRITICAL: WIF format depends on pubkey compression!
+                                // Uncompressed pubkeys (legacy P2PKH) need uncompressed WIF
+                                // Compressed and P2SH always use compressed WIF
+                                let compressed = pm.match_type != gpu::MatchType::Uncompressed;
+                                report(&privkey, &addr, atype, compressed);
                             }
                         } else {
                             // Bloom filter false positive (expected behavior)
@@ -367,12 +372,15 @@ fn verify_match(
 // REPORT
 // ============================================================================
 
-fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType) {
+fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType, compressed: bool) {
     use chrono::Local;
     use std::fs::OpenOptions;
 
     let hex = hex::encode(privkey);
-    let wif = to_wif(privkey);
+    // CRITICAL: Use correct WIF format based on pubkey compression
+    // Wrong format = user cannot access coins!
+    let wif = to_wif_compressed(privkey, compressed);
+    let key_type = if compressed { "compressed" } else { "uncompressed" };
     let time = Local::now().format("%Y-%m-%d %H:%M:%S");
 
     println!("\n\n\x1b[1;32m");
@@ -380,7 +388,7 @@ fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType) {
     println!("║                   🎉 KEY FOUND! 🎉                     ║");
     println!("╠═══════════════════════════════════════════════════════╣");
     println!("║ Address: {} ({})", addr, atype.as_str());
-    println!("║ Key: {}", hex);
+    println!("║ Key: {} ({})", hex, key_type);
     println!("║ WIF: {}", wif);
     println!("╚═══════════════════════════════════════════════════════╝");
     println!("\x1b[0m");
@@ -390,7 +398,7 @@ fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType) {
         .append(true)
         .open("found.txt")
     {
-        writeln!(f, "[{}] {} | {} | {} | {}", time, addr, atype.as_str(), hex, wif).ok();
+        writeln!(f, "[{}] {} | {} | {} | {} | {}", time, addr, atype.as_str(), key_type, hex, wif).ok();
     }
 }
 

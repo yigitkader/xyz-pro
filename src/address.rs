@@ -12,12 +12,28 @@ pub fn p2sh_script_hash(pubkey_hash: &[u8; 20]) -> [u8; 20] {
     hash160(&script)
 }
 
-/// Private key to WIF
+/// Private key to WIF (compressed format)
+/// Use `to_wif_compressed(key, true)` for compressed, `to_wif_compressed(key, false)` for uncompressed
 pub fn to_wif(key: &[u8; 32]) -> String {
-    let mut data = Vec::with_capacity(38);
-    data.push(0x80);
+    to_wif_compressed(key, true)
+}
+
+/// Private key to WIF with explicit compression flag
+/// - compressed=true: WIF starts with 'K' or 'L' (33 bytes + checksum)
+/// - compressed=false: WIF starts with '5' (32 bytes + checksum)
+/// 
+/// CRITICAL: Using wrong compression flag will derive DIFFERENT address!
+/// Uncompressed keys found by GPU must use compressed=false
+pub fn to_wif_compressed(key: &[u8; 32], compressed: bool) -> String {
+    let capacity = if compressed { 38 } else { 37 };
+    let mut data = Vec::with_capacity(capacity);
+    data.push(0x80); // Mainnet prefix
     data.extend_from_slice(key);
-    data.push(0x01); // compressed
+    
+    if compressed {
+        data.push(0x01); // Compression flag
+    }
+    // Uncompressed: no extra byte
     
     let checksum = Sha256::digest(&Sha256::digest(&data));
     data.extend_from_slice(&checksum[..4]);

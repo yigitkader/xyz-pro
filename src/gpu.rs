@@ -18,8 +18,13 @@ const MAX_THREADS: usize = 262_144;
 const KEYS_PER_THREAD: u32 = 512;
 
 /// Match buffer size (bloom false positives can be high with large target sets)
-/// For 60M targets with 0.1% FP rate: 134M keys × 0.001 = ~134K expected matches
-/// We use 1M for 4x safety margin to prevent any match loss
+/// For 60M targets with 0.05% FP rate: 134M keys × 0.0005 = ~67K expected matches
+/// We use 1M for ~15x safety margin to prevent any match loss
+/// 
+/// NOTE: For very large target sets (100M+), bloom filter FP rate increases.
+/// If you see "CRITICAL: Match buffer overflow!" errors:
+/// 1. Increase this value (e.g., 2_097_152 for 2M)
+/// 2. Or increase bloom filter size (change n*20 to n*25 or n*30 in BloomFilter::new)
 const MATCH_BUFFER_SIZE: usize = 1_048_576;
 
 // ============================================================================
