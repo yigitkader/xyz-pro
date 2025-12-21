@@ -118,11 +118,12 @@ impl GpuConfig {
             println!("[GPU] M1 Pro {}-core: {} threads, {} keys/thread, threadgroup {}", 
                 gpu_cores, max_threads, keys_per_thread, threadgroup_size);
             
-            // Dynamic match buffer sizing - MUST be large enough for worst case
-            // With 82K threads × 128 keys × 6 hash types × bloom FP rate
-            // Buffer must handle: 10.5M keys × 6 types × FP% = potentially millions
-            // Safe minimum: 4M for Pro chips
-            let match_buffer = 4_194_304; // 4M match buffer (safe for all FP rates)
+            // Match buffer sizing based on bloom filter FP rate
+            // With 12 bits/element: FP ~0.2%, effective ~1.2% for 6 hash types
+            // 10.5M keys × 1.2% = ~126K matches per batch
+            // 2× safety margin → 256K buffer (was 4M with 8 bits)
+            // Memory savings: 4M → 256K = 94% reduction in match buffer!
+            let match_buffer = 524_288; // 512K match buffer (sufficient for 12-bit bloom)
             
             (
                 max_threads,
@@ -138,7 +139,7 @@ impl GpuConfig {
                 65_536,     // 64K threads
                 128,        // 128 keys/thread = 8.4M keys/batch (matches BATCH_SIZE)
                 256.min(max_threadgroup),
-                2_097_152,  // 2M match buffer (increased for safety)
+                524_288,    // 512K match buffer (12-bit bloom = low FP)
             )
         } else {
             // M1 base or older: 7-8 GPU cores, 8-16GB unified memory
@@ -148,7 +149,7 @@ impl GpuConfig {
                 65_536,     // 64K threads
                 128,        // 128 keys/thread = 8.4M keys/batch (matches BATCH_SIZE)
                 256.min(max_threadgroup),
-                2_097_152,  // 2M match buffer (increased for safety)
+                524_288,    // 512K match buffer (12-bit bloom = low FP)
             )
         }
     }
@@ -219,28 +220,29 @@ impl BloomFilter {
         // ============================================================
         // Formula: FP = (1 - e^(-k*n/m))^k where k=7
         //
-        // CRITICAL: With 7 hashes, need adequate bits/element:
-        //   - 3 bits → FP ~49% (UNUSABLE!)
-        //   - 6 bits → FP ~7% (acceptable)
-        //   - 8 bits → FP ~3.5% (good)
-        //   - 10 bits → FP ~0.8% (excellent)
-        //   - 12 bits → FP ~0.2% (best)
+        // CRITICAL: With 7 hashes AND 6 hash types per key, FP compounds!
+        // Effective FP per key = 1 - (1 - FP_single)^6
         //
-        // Trade-off: Memory vs FP rate. Higher FP = more CPU verification.
-        // For 49M targets: 8 bits = 49MB filter, FP ~3.5%
+        //   Single FP    | Effective (6 types) | CPU load/batch (8.4M keys)
+        //   -------------|---------------------|---------------------------
+        //   3.5% (8 bit) | 19.2%               | 1.6M verifications 🔴
+        //   0.8% (10 bit)| 4.7%                | 395K verifications 🟡
+        //   0.2% (12 bit)| 1.2%                | 101K verifications 🟢
+        //
+        // OPTIMIZATION: Use 12 bits for large target sets
+        // Memory cost: 49M × 12 bits = 73.5MB (fits in RAM easily)
+        // Benefit: 16× less CPU verification work!
         // ============================================================
         let bits_per_element = if n <= 1_000_000 {
             16  // <1M: 2MB filter, FP ~0.01%
-        } else if n <= 3_000_000 {
-            12  // 1M-3M: 4.5MB, FP ~0.2%
-        } else if n <= 10_000_000 {
-            10  // 3M-10M: 12.5MB, FP ~0.8%
-        } else if n <= 30_000_000 {
-            8   // 10M-30M: 30MB, FP ~3.5%
+        } else if n <= 5_000_000 {
+            14  // 1M-5M: 8.75MB, FP ~0.05%
+        } else if n <= 20_000_000 {
+            12  // 5M-20M: 30MB, FP ~0.2%
         } else if n <= 100_000_000 {
-            8   // 30M-100M: 100MB, FP ~3.5%
+            12  // 20M-100M: 150MB max, FP ~0.2%
         } else {
-            6   // >100M: 75MB+, FP ~7%
+            10  // >100M: 125MB+, FP ~0.8%
         };
         
         // IMPORTANT: Don't use next_power_of_two for very large filters

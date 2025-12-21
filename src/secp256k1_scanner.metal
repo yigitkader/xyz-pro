@@ -565,9 +565,9 @@ inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
 // ============================================================================
 
 // Match buffer size - must match config.match_buffer_size in gpu.rs
-// INCREASED: 4M for Pro chips, 2M for base chips
-// This prevents buffer overflow with high bloom FP rates
-#define MAX_MATCHES 4194304
+// OPTIMIZED: 512K is sufficient with 12-bit bloom filter (FP ~0.2%)
+// Memory savings: 4M → 512K = 87.5% reduction
+#define MAX_MATCHES 524288
 
 kernel void scan_keys(
     constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
