@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use address::to_wif;
-use gpu::{OptimizedScanner, PotentialMatch};
+use gpu::{MatchType, OptimizedScanner, PotentialMatch};
 use targets::TargetDatabase;
 
 const TARGETS_FILE: &str = "targets.json";
@@ -149,42 +149,80 @@ fn verify_match(
     pm: &PotentialMatch,
     targets: &TargetDatabase,
 ) -> Option<(String, types::AddressType, [u8; 32])> {
-    // Reconstruct private key
+    // Reconstruct private key: base_key + key_index
     let mut priv_key = *base_key;
     let mut carry = pm.key_index as u64;
     for byte in priv_key.iter_mut().rev() {
         let sum = *byte as u64 + (carry & 0xFF);
         *byte = sum as u8;
         carry = (carry >> 8) + (sum >> 8);
-        if carry == 0 {
-            break;
-        }
+    }
+    
+    // Check for overflow - if carry is non-zero after processing all bytes,
+    // the result wrapped around and is invalid
+    if carry != 0 {
+        return None;
     }
 
     if !crypto::is_valid_private_key(&priv_key) {
         return None;
     }
 
-    // Generate public keys
+    // Generate public key
     let secret = SecretKey::from_slice(&priv_key).ok()?;
     let pubkey = secret.public_key();
-    let comp = pubkey.to_encoded_point(true);
-    let uncomp = pubkey.to_encoded_point(false);
 
-    // Hash160
-    let comp_hash = crypto::hash160(comp.as_bytes());
-    let uncomp_hash = crypto::hash160(uncomp.as_bytes());
-
-    // Check compressed
-    let comp_h160 = types::Hash160::from_slice(&comp_hash);
-    if let Some((addr, atype)) = targets.check(&comp_h160) {
-        return Some((addr.to_string(), atype, priv_key));
-    }
-
-    // Check uncompressed
-    let uncomp_h160 = types::Hash160::from_slice(&uncomp_hash);
-    if let Some((addr, atype)) = targets.check(&uncomp_h160) {
-        return Some((addr.to_string(), atype, priv_key));
+    // Verify based on match_type from GPU
+    match pm.match_type {
+        MatchType::Compressed => {
+            // GPU found compressed pubkey hash match
+            let comp = pubkey.to_encoded_point(true);
+            let comp_hash = crypto::hash160(comp.as_bytes());
+            let comp_h160 = types::Hash160::from_slice(&comp_hash);
+            
+            // Verify hash matches what GPU found
+            if comp_h160 != pm.hash {
+                return None; // Hash mismatch - bloom false positive
+            }
+            
+            // Check in targets (direct P2PKH/P2WPKH or P2SH)
+            if let Some((addr, atype)) = targets.check(&comp_h160) {
+                return Some((addr.to_string(), atype, priv_key));
+            }
+        }
+        MatchType::Uncompressed => {
+            // GPU found uncompressed pubkey hash match
+            let uncomp = pubkey.to_encoded_point(false);
+            let uncomp_hash = crypto::hash160(uncomp.as_bytes());
+            let uncomp_h160 = types::Hash160::from_slice(&uncomp_hash);
+            
+            // Verify hash matches what GPU found
+            if uncomp_h160 != pm.hash {
+                return None; // Hash mismatch - bloom false positive
+            }
+            
+            // Check in targets (only P2PKH for uncompressed)
+            if let Some((addr, atype)) = targets.check(&uncomp_h160) {
+                return Some((addr.to_string(), atype, priv_key));
+            }
+        }
+        MatchType::P2SH => {
+            // GPU found P2SH script hash match
+            let comp = pubkey.to_encoded_point(true);
+            let comp_hash = crypto::hash160(comp.as_bytes());
+            let p2sh_hash = address::p2sh_script_hash(&comp_hash);
+            let p2sh_h160 = types::Hash160::from_slice(&p2sh_hash);
+            
+            // Verify hash matches what GPU found
+            if p2sh_h160 != pm.hash {
+                return None; // Hash mismatch - bloom false positive
+            }
+            
+            // Check in targets - the P2SH script hash should be in targets
+            if let Some((addr, atype)) = targets.check(&types::Hash160::from_slice(&comp_hash)) {
+                return Some((addr.to_string(), atype, priv_key));
+            }
+        }
     }
 
     None

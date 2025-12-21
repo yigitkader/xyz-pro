@@ -462,7 +462,7 @@ inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
 // ============================================================================
 // MAIN KERNEL: scan_keys
 // - StepTable for O(20) thread start point
-// - Montgomery batch inversion (BATCH_SIZE = 4)
+// - Montgomery batch inversion (BATCH_SIZE = 8)
 // - Hash160 compressed + uncompressed + P2SH
 // - Bloom filter check
 // ============================================================================
@@ -501,8 +501,9 @@ kernel void scan_keys(
         #undef STEP_ADD
     }
 
-    // Montgomery batch inversion (BATCH_SIZE = 4)
-    #define BATCH_SIZE 4
+    // Montgomery batch inversion (BATCH_SIZE = 8)
+    // Larger batch = fewer mod_inv calls = better performance
+    #define BATCH_SIZE 8
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_Zinv[BATCH_SIZE];
 
     uint keys_done = 0;
@@ -539,19 +540,33 @@ kernel void scan_keys(
             hash160_uncomp(ax, ay, h_uncomp);
             compute_p2sh_script_hash(h_comp, h_p2sh);
 
-            bool match = bloom_check(h_comp, bloom, bloom_sz) ||
-                         bloom_check(h_uncomp, bloom, bloom_sz) ||
-                         bloom_check(h_p2sh, bloom, bloom_sz);
+            // Check each hash type separately and save the matching one
+            // match_type: 0=compressed, 1=uncompressed, 2=p2sh
+            uchar match_type = 255; // 255 = no match
+            thread uchar* matched_hash = nullptr;
 
-            if (match) {
+            if (bloom_check(h_comp, bloom, bloom_sz)) {
+                match_type = 0;
+                matched_hash = h_comp;
+            } else if (bloom_check(h_uncomp, bloom, bloom_sz)) {
+                match_type = 1;
+                matched_hash = h_uncomp;
+            } else if (bloom_check(h_p2sh, bloom, bloom_sz)) {
+                match_type = 2;
+                matched_hash = h_p2sh;
+            }
+
+            if (match_type != 255) {
                 uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
                 if (idx < 1024) {
                     uint off = idx * 52;
                     uint key = base_offset + keys_done + b;
+                    // Format: [4 byte key_index][1 byte match_type][27 byte padding][20 byte hash]
                     match_data[off+0] = key; match_data[off+1] = key>>8;
                     match_data[off+2] = key>>16; match_data[off+3] = key>>24;
-                    for (int p = 4; p < 32; p++) match_data[off+p] = 0;
-                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = h_comp[hh];
+                    match_data[off+4] = match_type;
+                    for (int p = 5; p < 32; p++) match_data[off+p] = 0;
+                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = matched_hash[hh];
                 }
             }
         }

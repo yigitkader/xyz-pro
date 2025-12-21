@@ -28,7 +28,8 @@ pub struct BloomFilter {
 
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
-        let num_bits = (n * 10).next_power_of_two().max(1024);
+        // Use n*15 for lower false positive rate (~0.1% with 7 hash functions)
+        let num_bits = (n * 15).next_power_of_two().max(1024);
         let num_words = num_bits / 64;
         Self {
             bits: vec![0u64; num_words],
@@ -130,9 +131,33 @@ pub struct OptimizedScanner {
     total_matches: AtomicU64,
 }
 
+/// Match type from GPU
+/// 0 = compressed pubkey hash
+/// 1 = uncompressed pubkey hash  
+/// 2 = P2SH script hash (from compressed)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MatchType {
+    Compressed = 0,
+    Uncompressed = 1,
+    P2SH = 2,
+}
+
+impl MatchType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Compressed),
+            1 => Some(Self::Uncompressed),
+            2 => Some(Self::P2SH),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PotentialMatch {
     pub key_index: u32,
+    pub match_type: MatchType,
     pub hash: Hash160,
 }
 
@@ -148,8 +173,12 @@ impl OptimizedScanner {
         let opts = CompileOptions::new();
 
         // Load shader
-        let src = fs::read_to_string("src/secp256k1_scanner.metal")
-            .map_err(|e| ScannerError::Gpu(format!("shader load: {}", e)))?;
+        let shader_path = "src/secp256k1_scanner.metal";
+        let src = fs::read_to_string(shader_path)
+            .map_err(|e| ScannerError::Gpu(format!(
+                "Failed to load shader '{}': {}. Make sure you're running from the project root directory.",
+                shader_path, e
+            )))?;
 
         let lib = device.new_library_with_source(&src, &opts)
             .map_err(|e| ScannerError::Gpu(format!("shader compile: {}", e)))?;
@@ -291,18 +320,30 @@ impl OptimizedScanner {
         self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);
 
         let mut matches = Vec::with_capacity(match_count);
-        if match_count > 0 {
+        if match_count > 0 && match_count <= 1024 {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
             unsafe {
                 let ptr = self.match_data_buf.contents() as *const u8;
                 for i in 0..match_count {
                     let off = i * 52;
+                    // Read key_index (4 bytes)
                     let mut key_bytes = [0u8; 4];
                     std::ptr::copy_nonoverlapping(ptr.add(off), key_bytes.as_mut_ptr(), 4);
+                    
+                    // Read match_type (1 byte at offset 4)
+                    let type_byte = *ptr.add(off + 4);
+                    let match_type = match MatchType::from_u8(type_byte) {
+                        Some(t) => t,
+                        None => continue, // Invalid match type, skip
+                    };
+                    
+                    // Read hash (20 bytes at offset 32)
                     let mut hash_bytes = [0u8; 20];
                     std::ptr::copy_nonoverlapping(ptr.add(off + 32), hash_bytes.as_mut_ptr(), 20);
+                    
                     matches.push(PotentialMatch {
                         key_index: u32::from_le_bytes(key_bytes),
+                        match_type,
                         hash: Hash160::from_slice(&hash_bytes),
                     });
                 }
