@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 
 /// Hash160 = RIPEMD160(SHA256(pubkey))
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C, align(4))]
 pub struct Hash160([u8; 20]);
 

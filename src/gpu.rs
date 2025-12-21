@@ -1,10 +1,9 @@
-use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
-};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::SecretKey;
+use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::fs;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::crypto::hash160;
 use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
 
@@ -12,167 +11,269 @@ use crate::types::Hash160;
 // CONFIG
 // ============================================================================
 
-const MAX_BATCH: usize = 65536;
-const NUM_BUFFERS: usize = 3;
-const THREADS: u64 = 256;
-const VERIFY_INTERVAL: usize = 1000;
+/// Maximum threads per dispatch (262144 × 512 = 134M keys/batch)
+const MAX_THREADS: usize = 262_144;
+
+/// Keys processed per thread
+const KEYS_PER_THREAD: u32 = 512;
 
 // ============================================================================
-// BUFFER
+// BLOOM FILTER
 // ============================================================================
 
-struct GpuBuffer {
-    // Compressed (33 bytes)
-    comp_in: Buffer,
-    comp_sha: Buffer,
-    comp_out: Buffer,
-    // Uncompressed (65 bytes)
-    uncomp_in: Buffer,
-    uncomp_sha: Buffer,
-    uncomp_out: Buffer,
+pub struct BloomFilter {
+    bits: Vec<u64>,
+    num_bits: usize,
 }
 
-impl GpuBuffer {
-    fn new(device: &Device, cap: usize) -> Self {
-        let opts = MTLResourceOptions::StorageModeShared;
+impl BloomFilter {
+    pub fn new(n: usize) -> Self {
+        let num_bits = (n * 10).next_power_of_two().max(1024);
+        let num_words = num_bits / 64;
         Self {
-            comp_in: device.new_buffer((cap * 33) as u64, opts),
-            comp_sha: device.new_buffer((cap * 32) as u64, opts),
-            comp_out: device.new_buffer((cap * 20) as u64, opts),
-            uncomp_in: device.new_buffer((cap * 65) as u64, opts),
-            uncomp_sha: device.new_buffer((cap * 32) as u64, opts),
-            uncomp_out: device.new_buffer((cap * 20) as u64, opts),
+            bits: vec![0u64; num_words],
+            num_bits,
         }
+    }
+
+    pub fn insert(&mut self, h: &[u8; 20]) {
+        for pos in self.positions(h) {
+            let (w, b) = (pos / 64, pos % 64);
+            if w < self.bits.len() {
+                self.bits[w] |= 1u64 << b;
+            }
+        }
+    }
+
+    fn positions(&self, h: &[u8; 20]) -> [usize; 7] {
+        let h1 = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+        let h2 = u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+        let h3 = u32::from_le_bytes([h[16], h[17], h[18], h[19]]) as u64;
+        let mut p = [0usize; 7];
+        for i in 0..7 {
+            let m = (i + 1) as u64;
+            p[i] = (h1.wrapping_add(h2.wrapping_mul(m)).wrapping_add(h3.wrapping_mul(m * m)) as usize) % self.num_bits;
+        }
+        p
+    }
+
+    pub fn as_slice(&self) -> &[u64] {
+        &self.bits
+    }
+
+    pub fn size_words(&self) -> usize {
+        self.bits.len()
     }
 }
 
 // ============================================================================
-// GPU HASHER
+// STEP TABLE (Precomputed for GPU)
+// StepTable[i] = (2^i * keys_per_thread) * G
 // ============================================================================
 
-pub struct GpuHasher {
-    queue: CommandQueue,
-    sha256_33: ComputePipelineState,
-    sha256_65: ComputePipelineState,
-    ripemd160: ComputePipelineState,
-    buffers: Vec<GpuBuffer>,
-    capacity: usize,
-    buf_idx: AtomicUsize,
-    batch_count: AtomicUsize,
-    total: AtomicU64,
+fn compute_step_table(keys_per_thread: u32) -> [[u8; 64]; 20] {
+    use k256::elliptic_curve::PrimeField;
+    use k256::ProjectivePoint;
+    use k256::Scalar;
+
+    let mut table = [[0u8; 64]; 20];
+
+    // Start with kpt * G
+    let kpt_bytes = {
+        let mut b = [0u8; 32];
+        b[28..32].copy_from_slice(&keys_per_thread.to_be_bytes());
+        b
+    };
+
+    let kpt_scalar = Scalar::from_repr_vartime(kpt_bytes.into()).unwrap();
+    let mut current = ProjectivePoint::GENERATOR * kpt_scalar;
+
+    for i in 0..20 {
+        let affine = current.to_affine();
+        let encoded = affine.to_encoded_point(false);
+        let bytes = encoded.as_bytes();
+
+        // Skip 0x04 prefix, copy x (32 bytes) and y (32 bytes)
+        table[i][..32].copy_from_slice(&bytes[1..33]);
+        table[i][32..64].copy_from_slice(&bytes[33..65]);
+
+        // Double for next entry
+        current = current.double();
+    }
+
+    table
 }
 
-impl GpuHasher {
-    pub fn new() -> Result<Self> {
-        let device = Device::system_default()
-            .ok_or_else(|| ScannerError::Gpu("No Metal GPU".into()))?;
+// ============================================================================
+// OPTIMIZED SCANNER
+// ============================================================================
 
-        println!("[i] GPU: {}", device.name());
+pub struct OptimizedScanner {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+
+    // Buffers
+    base_point_buf: Buffer,
+    step_table_buf: Buffer,
+    bloom_buf: Buffer,
+    bloom_size_buf: Buffer,
+    kpt_buf: Buffer,
+    match_data_buf: Buffer,
+    match_count_buf: Buffer,
+
+    // Config
+    max_threads: usize,
+    keys_per_thread: u32,
+
+    // Stats
+    total_scanned: AtomicU64,
+    total_matches: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PotentialMatch {
+    pub key_index: u32,
+    pub hash: Hash160,
+}
+
+impl OptimizedScanner {
+    pub fn new(target_hashes: &[[u8; 20]]) -> Result<Self> {
+        let device = Device::system_default()
+            .ok_or_else(|| ScannerError::Gpu("No Metal GPU found".into()))?;
+
+        println!("[GPU] Device: {}", device.name());
+        println!("[GPU] Max threads/threadgroup: {}", device.max_threads_per_threadgroup().width);
 
         let queue = device.new_command_queue();
         let opts = CompileOptions::new();
 
-        let sha256_33 = Self::load(&device, &opts, "sha256_33", "sha256_hash")?;
-        let sha256_65 = Self::load(&device, &opts, "sha256_65", "sha256_hash_65")?;
-        let ripemd160 = Self::load(&device, &opts, "ripemd160", "ripemd160_hash")?;
+        // Load shader
+        let src = fs::read_to_string("src/secp256k1_scanner.metal")
+            .map_err(|e| ScannerError::Gpu(format!("shader load: {}", e)))?;
 
-        let buffers: Vec<GpuBuffer> = (0..NUM_BUFFERS)
-            .map(|_| GpuBuffer::new(&device, MAX_BATCH))
-            .collect();
+        let lib = device.new_library_with_source(&src, &opts)
+            .map_err(|e| ScannerError::Gpu(format!("shader compile: {}", e)))?;
 
-        let mem = NUM_BUFFERS * MAX_BATCH * (33 + 32 + 20 + 65 + 32 + 20);
-        println!("[i] GPU Memory: {:.2} MB", mem as f64 / 1_000_000.0);
+        let func = lib.get_function("scan_keys", None)
+            .map_err(|e| ScannerError::Gpu(format!("kernel not found: {}", e)))?;
+
+        let pipeline = device.new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| ScannerError::Gpu(format!("pipeline: {}", e)))?;
+
+        println!("[GPU] Pipeline: max_threads={}", pipeline.max_total_threads_per_threadgroup());
+
+        // Build Bloom filter
+        let mut bloom = BloomFilter::new(target_hashes.len().max(100));
+        for h in target_hashes {
+            bloom.insert(h);
+        }
+
+        // Compute StepTable
+        let step_table = compute_step_table(KEYS_PER_THREAD);
+
+        // Allocate buffers
+        let storage = MTLResourceOptions::StorageModeShared;
+
+        let base_point_buf = device.new_buffer(64, storage);
+        let step_table_buf = device.new_buffer_with_data(
+            step_table.as_ptr() as *const _,
+            (20 * 64) as u64,
+            storage,
+        );
+
+        let bloom_data = bloom.as_slice();
+        let bloom_buf = device.new_buffer_with_data(
+            bloom_data.as_ptr() as *const _,
+            (bloom_data.len() * 8) as u64,
+            storage,
+        );
+
+        let bloom_size = bloom.size_words() as u32;
+        let bloom_size_buf = device.new_buffer_with_data(
+            &bloom_size as *const u32 as *const _,
+            4,
+            storage,
+        );
+
+        let kpt_buf = device.new_buffer_with_data(
+            &KEYS_PER_THREAD as *const u32 as *const _,
+            4,
+            storage,
+        );
+
+        let match_data_buf = device.new_buffer(1024 * 52, storage);
+        let match_count_buf = device.new_buffer(4, storage);
+
+        let keys_per_batch = MAX_THREADS * KEYS_PER_THREAD as usize;
+        let mem_mb = (64 + 20 * 64 + bloom_data.len() * 8 + 4 + 4 + 1024 * 52 + 4) as f64 / 1_000_000.0;
+
+        println!("[GPU] Keys/batch: {} M", keys_per_batch / 1_000_000);
+        println!("[GPU] Memory: {:.2} MB", mem_mb);
+        println!("[GPU] Bloom filter: {} words ({} KB)", bloom.size_words(), bloom.size_words() * 8 / 1024);
 
         Ok(Self {
             queue,
-            sha256_33,
-            sha256_65,
-            ripemd160,
-            buffers,
-            capacity: MAX_BATCH,
-            buf_idx: AtomicUsize::new(0),
-            batch_count: AtomicUsize::new(0),
-            total: AtomicU64::new(0),
+            pipeline,
+            base_point_buf,
+            step_table_buf,
+            bloom_buf,
+            bloom_size_buf,
+            kpt_buf,
+            match_data_buf,
+            match_count_buf,
+            max_threads: MAX_THREADS,
+            keys_per_thread: KEYS_PER_THREAD,
+            total_scanned: AtomicU64::new(0),
+            total_matches: AtomicU64::new(0),
         })
     }
 
-    fn load(device: &Device, opts: &CompileOptions, file: &str, func: &str) -> Result<ComputePipelineState> {
-        let src = fs::read_to_string(format!("src/{}.metal", file))
-            .map_err(|e| ScannerError::Gpu(format!("{}.metal: {}", file, e)))?;
+    /// Scan a range of keys starting from base_key
+    pub fn scan_batch(&self, base_key: &[u8; 32]) -> Result<Vec<PotentialMatch>> {
+        // Compute base point from base_key
+        let secret = SecretKey::from_slice(base_key)
+            .map_err(|e| ScannerError::Gpu(format!("invalid key: {}", e)))?;
+        let pubkey = secret.public_key();
+        let encoded = pubkey.to_encoded_point(false);
+        let pub_bytes = encoded.as_bytes();
 
-        let lib = device.new_library_with_source(&src, opts)
-            .map_err(|e| ScannerError::Gpu(format!("{}: {}", file, e)))?;
-
-        let function = lib.get_function(func, None)
-            .map_err(|e| ScannerError::Gpu(format!("{}: {}", func, e)))?;
-
-        device.new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| ScannerError::Gpu(format!("pipeline: {}", e)))
-    }
-
-    /// Compute Hash160 for both compressed and uncompressed pubkeys
-    pub fn compute(&self, comp: &[[u8; 33]], uncomp: &[[u8; 65]]) -> Result<(Vec<Hash160>, Vec<Hash160>)> {
-        let count = comp.len();
-        if count == 0 || count != uncomp.len() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        if count > self.capacity {
-            return Err(ScannerError::Gpu("Batch too large".into()));
-        }
-
-        let idx = self.buf_idx.fetch_add(1, Ordering::SeqCst) % NUM_BUFFERS;
-        let buf = &self.buffers[idx];
-
-        // Copy to GPU
+        // Copy base point (x || y)
         unsafe {
-            let ptr33 = buf.comp_in.contents() as *mut u8;
-            let ptr65 = buf.uncomp_in.contents() as *mut u8;
-            for i in 0..count {
-                std::ptr::copy_nonoverlapping(comp[i].as_ptr(), ptr33.add(i * 33), 33);
-                std::ptr::copy_nonoverlapping(uncomp[i].as_ptr(), ptr65.add(i * 65), 65);
-            }
+            let ptr = self.base_point_buf.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
+            std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
         }
 
+        // Reset match count
+        unsafe {
+            let ptr = self.match_count_buf.contents() as *mut u32;
+            *ptr = 0;
+        }
+
+        // Dispatch
         let cmd = self.queue.new_command_buffer();
-        let grid = MTLSize { width: count as u64, height: 1, depth: 1 };
-        let group = MTLSize { width: THREADS.min(count as u64), height: 1, depth: 1 };
 
-        // SHA256 compressed
+        let grid = MTLSize {
+            width: self.max_threads as u64,
+            height: 1,
+            depth: 1,
+        };
+        let group = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+
         {
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.sha256_33);
-            enc.set_buffer(0, Some(&buf.comp_in), 0);
-            enc.set_buffer(1, Some(&buf.comp_sha), 0);
-            enc.dispatch_threads(grid, group);
-            enc.end_encoding();
-        }
-
-        // SHA256 uncompressed
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.sha256_65);
-            enc.set_buffer(0, Some(&buf.uncomp_in), 0);
-            enc.set_buffer(1, Some(&buf.uncomp_sha), 0);
-            enc.dispatch_threads(grid, group);
-            enc.end_encoding();
-        }
-
-        // RIPEMD160 compressed
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.ripemd160);
-            enc.set_buffer(0, Some(&buf.comp_sha), 0);
-            enc.set_buffer(1, Some(&buf.comp_out), 0);
-            enc.dispatch_threads(grid, group);
-            enc.end_encoding();
-        }
-
-        // RIPEMD160 uncompressed
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.ripemd160);
-            enc.set_buffer(0, Some(&buf.uncomp_sha), 0);
-            enc.set_buffer(1, Some(&buf.uncomp_out), 0);
+            enc.set_compute_pipeline_state(&self.pipeline);
+            enc.set_buffer(0, Some(&self.base_point_buf), 0);
+            enc.set_buffer(1, Some(&self.step_table_buf), 0);
+            enc.set_buffer(2, Some(&self.bloom_buf), 0);
+            enc.set_buffer(3, Some(&self.bloom_size_buf), 0);
+            enc.set_buffer(4, Some(&self.kpt_buf), 0);
+            enc.set_buffer(5, Some(&self.match_data_buf), 0);
+            enc.set_buffer(6, Some(&self.match_count_buf), 0);
             enc.dispatch_threads(grid, group);
             enc.end_encoding();
         }
@@ -181,90 +282,48 @@ impl GpuHasher {
         cmd.wait_until_completed();
 
         // Read results
-        let mut comp_hashes = Vec::with_capacity(count);
-        let mut uncomp_hashes = Vec::with_capacity(count);
+        let match_count = unsafe {
+            let ptr = self.match_count_buf.contents() as *const u32;
+            (*ptr).min(1024) as usize
+        };
 
-        unsafe {
-            let p1 = buf.comp_out.contents() as *const u8;
-            let p2 = buf.uncomp_out.contents() as *const u8;
-            for i in 0..count {
-                let mut h1 = [0u8; 20];
-                let mut h2 = [0u8; 20];
-                std::ptr::copy_nonoverlapping(p1.add(i * 20), h1.as_mut_ptr(), 20);
-                std::ptr::copy_nonoverlapping(p2.add(i * 20), h2.as_mut_ptr(), 20);
-                comp_hashes.push(Hash160::from_slice(&h1));
-                uncomp_hashes.push(Hash160::from_slice(&h2));
+        let keys_scanned = (self.max_threads * self.keys_per_thread as usize) as u64;
+        self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);
+
+        let mut matches = Vec::with_capacity(match_count);
+        if match_count > 0 {
+            self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
+            unsafe {
+                let ptr = self.match_data_buf.contents() as *const u8;
+                for i in 0..match_count {
+                    let off = i * 52;
+                    let mut key_bytes = [0u8; 4];
+                    std::ptr::copy_nonoverlapping(ptr.add(off), key_bytes.as_mut_ptr(), 4);
+                    let mut hash_bytes = [0u8; 20];
+                    std::ptr::copy_nonoverlapping(ptr.add(off + 32), hash_bytes.as_mut_ptr(), 20);
+                    matches.push(PotentialMatch {
+                        key_index: u32::from_le_bytes(key_bytes),
+                        hash: Hash160::from_slice(&hash_bytes),
+                    });
+                }
             }
         }
 
-        self.total.fetch_add(count as u64, Ordering::Relaxed);
-        let batch = self.batch_count.fetch_add(1, Ordering::Relaxed);
+        Ok(matches)
+    }
 
-        // Verify periodically
-        if batch % VERIFY_INTERVAL == 0 && !comp.is_empty() {
-            let cpu = hash160(&comp[0]);
-            if cpu != *comp_hashes[0].as_bytes() {
-                return Err(ScannerError::Gpu("GPU/CPU hash mismatch".into()));
-            }
-        }
+    pub fn keys_per_batch(&self) -> u64 {
+        (self.max_threads * self.keys_per_thread as usize) as u64
+    }
 
-        Ok((comp_hashes, uncomp_hashes))
+    pub fn total_scanned(&self) -> u64 {
+        self.total_scanned.load(Ordering::Relaxed)
+    }
+
+    pub fn total_matches(&self) -> u64 {
+        self.total_matches.load(Ordering::Relaxed)
     }
 }
 
-unsafe impl Send for GpuHasher {}
-unsafe impl Sync for GpuHasher {}
-
-// ============================================================================
-// BLOOM FILTER
-// ============================================================================
-
-pub struct BloomFilter {
-    bits: Vec<u64>,
-    num_words: usize,
-}
-
-impl BloomFilter {
-    pub fn new(n: usize) -> Self {
-        let total_bits = n * 10; // ~1% false positive
-        let num_words = ((total_bits + 63) / 64).max(1);
-        Self {
-            bits: vec![0u64; num_words],
-            num_words,
-        }
-    }
-
-    pub fn add(&mut self, h: &[u8; 20]) {
-        for pos in self.positions(h) {
-            let (w, b) = ((pos / 64) as usize, pos % 64);
-            if w < self.num_words {
-                self.bits[w] |= 1u64 << b;
-            }
-        }
-    }
-
-    pub fn check(&self, h: &[u8; 20]) -> bool {
-        for pos in self.positions(h) {
-            let (w, b) = ((pos / 64) as usize, pos % 64);
-            if w >= self.num_words || (self.bits[w] & (1u64 << b)) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn positions(&self, h: &[u8; 20]) -> [u64; 7] {
-        let h1 = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
-        let h2 = u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
-        let h3 = u32::from_le_bytes([h[16], h[17], h[18], h[19]]) as u64;
-        let total = (self.num_words * 64) as u64;
-
-        let mut p = [0u64; 7];
-        for i in 0..7 {
-            let m = (i + 1) as u64;
-            p[i] = h1.wrapping_add(h2.wrapping_mul(m))
-                     .wrapping_add(h3.wrapping_mul(m * m)) % total;
-        }
-        p
-    }
-}
+unsafe impl Send for OptimizedScanner {}
+unsafe impl Sync for OptimizedScanner {}

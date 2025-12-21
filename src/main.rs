@@ -1,5 +1,6 @@
-// XYZ-Pro - Bitcoin Key Scanner with Metal GPU
-// Supports: P2PKH, P2SH, P2WPKH (compressed + uncompressed)
+// XYZ-PRO - Bitcoin Key Scanner with Metal GPU
+// Supports: P2PKH, P2SH, P2WPKH
+// Target: 100+ M/s on Apple M1
 
 mod address;
 mod crypto;
@@ -8,30 +9,18 @@ mod gpu;
 mod targets;
 mod types;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use address::to_wif;
-use gpu::{BloomFilter, GpuHasher};
+use gpu::{OptimizedScanner, PotentialMatch};
 use targets::TargetDatabase;
 
-// ============================================================================
-// CONFIG
-// ============================================================================
-
-const BATCH_SIZE: usize = 32768;
-const QUEUE_DEPTH: usize = 4;
 const TARGETS_FILE: &str = "targets.json";
-
-// ============================================================================
-// MAIN
-// ============================================================================
 
 fn main() {
     println!("\n\x1b[1;36m╔═══════════════════════════════════════════════════════╗");
@@ -51,16 +40,10 @@ fn main() {
         }
     };
 
-    // Build Bloom filter
     let hashes = targets.get_all_hashes();
-    let mut bloom = BloomFilter::new(hashes.len().max(100));
-    for h in &hashes {
-        bloom.add(h);
-    }
-    let bloom = Arc::new(bloom);
 
     // Init GPU
-    let gpu = match GpuHasher::new() {
+    let gpu = match OptimizedScanner::new(&hashes) {
         Ok(g) => Arc::new(g),
         Err(e) => {
             eprintln!("[✗] GPU: {}", e);
@@ -81,48 +64,6 @@ fn main() {
         shutdown_sig.store(true, Ordering::SeqCst);
     }).ok();
 
-    // Channel
-    let (tx, rx): (Sender<Batch>, Receiver<Batch>) = bounded(QUEUE_DEPTH);
-
-    // Worker
-    let gpu_c = gpu.clone();
-    let bloom_c = bloom.clone();
-    let targets_c = targets.clone();
-    let counter_c = counter.clone();
-    let found_c = found.clone();
-    let shutdown_c = shutdown.clone();
-
-    let worker = thread::spawn(move || {
-        while !shutdown_c.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(batch) => {
-                    if let Ok((comp_h, uncomp_h)) = gpu_c.compute(&batch.comp, &batch.uncomp) {
-                        counter_c.fetch_add(batch.count as u64, Ordering::Relaxed);
-
-                        for i in 0..batch.count {
-                            // Check compressed hash
-                            if bloom_c.check(comp_h[i].as_bytes()) {
-                                if let Some((addr, atype)) = targets_c.check(&comp_h[i]) {
-                                    found_c.fetch_add(1, Ordering::Relaxed);
-                                    report(&batch.privkeys[i], addr, atype);
-                                }
-                            }
-                            // Check uncompressed hash
-                            if bloom_c.check(uncomp_h[i].as_bytes()) {
-                                if let Some((addr, atype)) = targets_c.check(&uncomp_h[i]) {
-                                    found_c.fetch_add(1, Ordering::Relaxed);
-                                    report(&batch.privkeys[i], addr, atype);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            }
-        }
-    });
-
     println!("[▶] Scanning... (Ctrl+C to stop)\n");
 
     let mut last_stat = Instant::now();
@@ -130,16 +71,30 @@ fn main() {
 
     // Main loop
     while !shutdown.load(Ordering::Relaxed) {
-        let batch = generate_batch(BATCH_SIZE);
+        // Generate random base key
+        let base_key = generate_random_key();
 
-        match tx.try_send(batch) {
-            Ok(_) => {}
-            Err(crossbeam_channel::TrySendError::Full(b)) => {
-                if tx.send(b).is_err() { break; }
+        // Scan batch
+        match gpu.scan_batch(&base_key) {
+            Ok(matches) => {
+                let batch_size = gpu.keys_per_batch();
+                counter.fetch_add(batch_size, Ordering::Relaxed);
+
+                // Verify matches
+                for pm in matches {
+                    if let Some((addr, atype, privkey)) = verify_match(&base_key, &pm, &targets) {
+                        found.fetch_add(1, Ordering::Relaxed);
+                        report(&privkey, &addr, atype);
+                    }
+                }
             }
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("[!] GPU error: {}", e);
+                break;
+            }
         }
 
+        // Stats
         if last_stat.elapsed() >= Duration::from_millis(500) {
             let count = counter.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
@@ -160,9 +115,6 @@ fn main() {
         }
     }
 
-    drop(tx);
-    worker.join().ok();
-
     let total = counter.load(Ordering::Relaxed);
     let time = start.elapsed().as_secs_f64();
     println!("\n\n[Done] {} keys in {} @ {}",
@@ -173,50 +125,69 @@ fn main() {
 }
 
 // ============================================================================
-// BATCH
+// KEY GENERATION
 // ============================================================================
 
-struct Batch {
-    privkeys: Vec<[u8; 32]>,
-    comp: Vec<[u8; 33]>,
-    uncomp: Vec<[u8; 65]>,
-    count: usize,
-}
-
-fn generate_batch(size: usize) -> Batch {
+fn generate_random_key() -> [u8; 32] {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
-
-    let mut privkeys = Vec::with_capacity(size);
-    let mut comp = Vec::with_capacity(size);
-    let mut uncomp = Vec::with_capacity(size);
-
-    while privkeys.len() < size {
-        let mut pk = [0u8; 32];
-        rng.fill_bytes(&mut pk);
-
-        if !crypto::is_valid_private_key(&pk) {
-            continue;
+    let mut key = [0u8; 32];
+    loop {
+        rng.fill_bytes(&mut key);
+        if crypto::is_valid_private_key(&key) {
+            return key;
         }
+    }
+}
 
-        if let Ok(sk) = SecretKey::from_slice(&pk) {
-            let pubkey = sk.public_key();
+// ============================================================================
+// MATCH VERIFICATION
+// ============================================================================
 
-            let c = pubkey.to_encoded_point(true);
-            let u = pubkey.to_encoded_point(false);
-
-            let mut comp_arr = [0u8; 33];
-            let mut uncomp_arr = [0u8; 65];
-            comp_arr.copy_from_slice(c.as_bytes());
-            uncomp_arr.copy_from_slice(u.as_bytes());
-
-            privkeys.push(pk);
-            comp.push(comp_arr);
-            uncomp.push(uncomp_arr);
+fn verify_match(
+    base_key: &[u8; 32],
+    pm: &PotentialMatch,
+    targets: &TargetDatabase,
+) -> Option<(String, types::AddressType, [u8; 32])> {
+    // Reconstruct private key
+    let mut priv_key = *base_key;
+    let mut carry = pm.key_index as u64;
+    for byte in priv_key.iter_mut().rev() {
+        let sum = *byte as u64 + (carry & 0xFF);
+        *byte = sum as u8;
+        carry = (carry >> 8) + (sum >> 8);
+        if carry == 0 {
+            break;
         }
     }
 
-    Batch { privkeys, comp, uncomp, count: size }
+    if !crypto::is_valid_private_key(&priv_key) {
+        return None;
+    }
+
+    // Generate public keys
+    let secret = SecretKey::from_slice(&priv_key).ok()?;
+    let pubkey = secret.public_key();
+    let comp = pubkey.to_encoded_point(true);
+    let uncomp = pubkey.to_encoded_point(false);
+
+    // Hash160
+    let comp_hash = crypto::hash160(comp.as_bytes());
+    let uncomp_hash = crypto::hash160(uncomp.as_bytes());
+
+    // Check compressed
+    let comp_h160 = types::Hash160::from_slice(&comp_hash);
+    if let Some((addr, atype)) = targets.check(&comp_h160) {
+        return Some((addr.to_string(), atype, priv_key));
+    }
+
+    // Check uncompressed
+    let uncomp_h160 = types::Hash160::from_slice(&uncomp_hash);
+    if let Some((addr, atype)) = targets.check(&uncomp_h160) {
+        return Some((addr.to_string(), atype, priv_key));
+    }
+
+    None
 }
 
 // ============================================================================
