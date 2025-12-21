@@ -100,30 +100,71 @@ fn encode_base58_check(version: u8, hash: &[u8; 20]) -> String {
 fn encode_bech32(hash: &[u8; 20]) -> String {
     use bech32::{u5, Variant};
 
-    // Convert 8-bit bytes to 5-bit groups
-    let mut data = vec![u5::try_from_u8(0).unwrap()]; // witness version 0
-    for chunk in hash.chunks(5) {
-        let mut acc = 0u64;
-        let mut bits = 0;
-        for &byte in chunk {
-            acc = (acc << 8) | byte as u64;
-            bits += 8;
-        }
-        while bits >= 5 {
-            bits -= 5;
-            data.push(u5::try_from_u8(((acc >> bits) & 0x1F) as u8).unwrap());
-        }
-        if bits > 0 {
-            data.push(u5::try_from_u8(((acc << (5 - bits)) & 0x1F) as u8).unwrap());
-        }
-    }
-
-    // Proper 8-to-5 bit conversion for witness program
+    // 8-to-5 bit conversion for witness program
     let converted = bech32::convert_bits(hash, 8, 5, true).unwrap();
+    
+    // witness version 0 + converted data
     let mut witness_data = vec![u5::try_from_u8(0).unwrap()];
     for b in converted {
         witness_data.push(u5::try_from_u8(b).unwrap());
     }
 
     bech32::encode("bc", witness_data, Variant::Bech32).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_address_reconstruction_p2pkh() {
+        // Known test vector: hash160 -> address
+        let hash_hex = "89abcdefabbaabbaabbaabbaabbaabbaabbaabba";
+        let hash_bytes: [u8; 20] = hex::decode(hash_hex).unwrap().try_into().unwrap();
+        let hash = Hash160::from_slice(&hash_bytes);
+        
+        let addr = hash160_to_address(&hash, AddressType::P2PKH);
+        assert!(addr.starts_with('1'), "P2PKH should start with 1: {}", addr);
+        
+        // Verify roundtrip: decode address, compare hash
+        let decoded = bs58::decode(&addr).into_vec().unwrap();
+        assert_eq!(&decoded[1..21], &hash_bytes);
+    }
+
+    #[test]
+    fn test_address_reconstruction_p2sh() {
+        let hash_hex = "89abcdefabbaabbaabbaabbaabbaabbaabbaabba";
+        let hash_bytes: [u8; 20] = hex::decode(hash_hex).unwrap().try_into().unwrap();
+        let hash = Hash160::from_slice(&hash_bytes);
+        
+        let addr = hash160_to_address(&hash, AddressType::P2SH);
+        assert!(addr.starts_with('3'), "P2SH should start with 3: {}", addr);
+        
+        // Verify roundtrip
+        let decoded = bs58::decode(&addr).into_vec().unwrap();
+        assert_eq!(decoded[0], 0x05);
+        assert_eq!(&decoded[1..21], &hash_bytes);
+    }
+
+    #[test]
+    fn test_address_reconstruction_p2wpkh() {
+        let hash_hex = "89abcdefabbaabbaabbaabbaabbaabbaabbaabba";
+        let hash_bytes: [u8; 20] = hex::decode(hash_hex).unwrap().try_into().unwrap();
+        let hash = Hash160::from_slice(&hash_bytes);
+        
+        let addr = hash160_to_address(&hash, AddressType::P2WPKH);
+        assert!(addr.starts_with("bc1q"), "P2WPKH should start with bc1q: {}", addr);
+    }
+
+    #[test]
+    fn test_address_type_binary() {
+        assert_eq!(AddressType::P2PKH.to_u8(), 0);
+        assert_eq!(AddressType::P2SH.to_u8(), 1);
+        assert_eq!(AddressType::P2WPKH.to_u8(), 2);
+        
+        assert_eq!(AddressType::from_u8(0), Some(AddressType::P2PKH));
+        assert_eq!(AddressType::from_u8(1), Some(AddressType::P2SH));
+        assert_eq!(AddressType::from_u8(2), Some(AddressType::P2WPKH));
+        assert_eq!(AddressType::from_u8(3), None);
+    }
 }

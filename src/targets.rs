@@ -256,6 +256,88 @@ impl TargetDatabase {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_binary_roundtrip() {
+        // Create temp JSON file
+        let temp_dir = std::env::temp_dir();
+        let json_path = temp_dir.join("test_targets.json");
+        let bin_path = temp_dir.join("test_targets.bin");
+
+        // Clean up any existing files
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&bin_path);
+
+        // Create test JSON
+        let json_content = r#"{"addresses": [
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+        ]}"#;
+
+        std::fs::write(&json_path, json_content).unwrap();
+
+        // Load from JSON (should create binary)
+        let db1 = TargetDatabase::new(json_path.to_str().unwrap()).unwrap();
+        assert_eq!(db1.total(), 3);
+
+        // Verify binary was created
+        assert!(bin_path.exists(), "Binary file should be created");
+
+        // Load from binary
+        let db2 = TargetDatabase::load_binary(bin_path.to_str().unwrap()).unwrap();
+        assert_eq!(db2.total(), 3);
+
+        // Verify same data
+        let hashes1: std::collections::HashSet<_> = db1.get_all_hashes().into_iter().collect();
+        let hashes2: std::collections::HashSet<_> = db2.get_all_hashes().into_iter().collect();
+        assert_eq!(hashes1, hashes2);
+
+        // Clean up
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&bin_path);
+    }
+
+    #[test]
+    fn test_should_use_binary_logic() {
+        let temp_dir = std::env::temp_dir();
+        let json_path = temp_dir.join("test_logic.json");
+        let bin_path = temp_dir.join("test_logic.bin");
+
+        // Clean up
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&bin_path);
+
+        // Case 1: Neither exists - should return false
+        assert!(!should_use_binary(
+            json_path.to_str().unwrap(),
+            bin_path.to_str().unwrap()
+        ));
+
+        // Case 2: Only JSON exists - should return false
+        std::fs::write(&json_path, "{}").unwrap();
+        assert!(!should_use_binary(
+            json_path.to_str().unwrap(),
+            bin_path.to_str().unwrap()
+        ));
+
+        // Case 3: Both exist, bin newer - should return true
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&bin_path, "bin").unwrap();
+        assert!(should_use_binary(
+            json_path.to_str().unwrap(),
+            bin_path.to_str().unwrap()
+        ));
+
+        // Clean up
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&bin_path);
+    }
+}
+
 /// Binary dosya kullanılmalı mı?
 fn should_use_binary(json_path: &str, bin_path: &str) -> bool {
     let bin_path = Path::new(bin_path);
