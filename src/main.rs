@@ -901,6 +901,162 @@ impl MemoryPressure {
     }
 }
 
+// ============================================================================
+// THERMAL MONITORING
+// ============================================================================
+
+/// Thermal state based on performance monitoring
+/// Instead of requiring sudo for powermetrics, we detect throttling via performance degradation
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]  // Used for monitoring/debugging
+pub enum ThermalState {
+    Normal,      // Performance as expected
+    Throttling,  // Performance degraded (likely thermal)
+    Critical,    // Severe throttling detected
+}
+
+/// Thermal monitor using adaptive performance tracking
+/// Detects throttling without requiring sudo or special permissions
+pub struct ThermalMonitor {
+    /// Baseline batch duration (first few batches)
+    baseline_duration_us: std::sync::atomic::AtomicU64,
+    /// Number of samples for baseline
+    baseline_samples: std::sync::atomic::AtomicU32,
+    /// Current throttle state
+    throttle_count: std::sync::atomic::AtomicU32,
+    /// Consecutive normal batches (for recovery detection)
+    normal_count: std::sync::atomic::AtomicU32,
+}
+
+impl ThermalMonitor {
+    pub fn new() -> Self {
+        Self {
+            baseline_duration_us: std::sync::atomic::AtomicU64::new(0),
+            baseline_samples: std::sync::atomic::AtomicU32::new(0),
+            throttle_count: std::sync::atomic::AtomicU32::new(0),
+            normal_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+    
+    /// Record a batch duration and detect thermal throttling
+    /// Returns recommended action: None = continue, Some(ms) = sleep for cooling
+    pub fn record_batch(&self, duration_us: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        
+        let samples = self.baseline_samples.load(Ordering::Relaxed);
+        
+        // First 10 batches: establish baseline
+        if samples < 10 {
+            let current = self.baseline_duration_us.load(Ordering::Relaxed);
+            let new_avg = if samples == 0 {
+                duration_us
+            } else {
+                // Running average
+                (current * samples as u64 + duration_us) / (samples as u64 + 1)
+            };
+            self.baseline_duration_us.store(new_avg, Ordering::Relaxed);
+            self.baseline_samples.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        
+        let baseline = self.baseline_duration_us.load(Ordering::Relaxed);
+        if baseline == 0 {
+            return None;
+        }
+        
+        // Throttling detection: batch takes >50% longer than baseline
+        let throttle_threshold = baseline * 3 / 2; // 1.5x baseline
+        let severe_threshold = baseline * 2;       // 2x baseline
+        
+        if duration_us > severe_threshold {
+            // Severe throttling - recommend longer cooldown
+            self.throttle_count.fetch_add(1, Ordering::Relaxed);
+            self.normal_count.store(0, Ordering::Relaxed);
+            
+            let consecutive = self.throttle_count.load(Ordering::Relaxed);
+            if consecutive >= 3 {
+                // Multiple consecutive severe throttles - aggressive cooling
+                return Some(1000); // 1 second pause
+            }
+            return Some(500); // 500ms pause
+        } else if duration_us > throttle_threshold {
+            // Mild throttling
+            self.throttle_count.fetch_add(1, Ordering::Relaxed);
+            self.normal_count.store(0, Ordering::Relaxed);
+            
+            let consecutive = self.throttle_count.load(Ordering::Relaxed);
+            if consecutive >= 5 {
+                return Some(200); // Short pause after several throttled batches
+            }
+        } else {
+            // Normal performance
+            self.normal_count.fetch_add(1, Ordering::Relaxed);
+            
+            // Reset throttle counter after 5 normal batches
+            if self.normal_count.load(Ordering::Relaxed) >= 5 {
+                self.throttle_count.store(0, Ordering::Relaxed);
+            }
+        }
+        
+        None
+    }
+    
+    /// Get current thermal state for display
+    pub fn get_state(&self) -> ThermalState {
+        use std::sync::atomic::Ordering;
+        
+        let throttle = self.throttle_count.load(Ordering::Relaxed);
+        if throttle >= 5 {
+            ThermalState::Critical
+        } else if throttle >= 2 {
+            ThermalState::Throttling
+        } else {
+            ThermalState::Normal
+        }
+    }
+}
+
+/// Try to read GPU/SoC temperature via ioreg (no sudo required)
+/// Returns temperature in Celsius, or None if unavailable
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]  // Available for future thermal display features
+fn try_read_soc_temperature() -> Option<f32> {
+    use std::process::Command;
+    
+    // Try to read from AppleSiliconTemp or similar
+    // Note: This may not work on all Macs, hence it's optional
+    if let Ok(output) = Command::new("ioreg")
+        .args(["-r", "-c", "AppleARMPowerDaemon", "-d", "1"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                // Look for temperature entries
+                for line in text.lines() {
+                    if line.contains("Temperature") && line.contains("=") {
+                        // Parse: "Temperature" = 45.2
+                        if let Some(val_str) = line.split('=').nth(1) {
+                            let cleaned = val_str.trim().trim_matches('"');
+                            if let Ok(temp) = cleaned.parse::<f32>() {
+                                if temp > 0.0 && temp < 150.0 {
+                                    return Some(temp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_read_soc_temperature() -> Option<f32> {
+    None
+}
+
 /// Detect number of Performance cores on Apple Silicon
 /// Uses macOS sysctl to get accurate P-core count (excludes E-cores)
 /// Falls back to conservative estimate based on total CPU count
@@ -959,7 +1115,7 @@ fn main() {
     println!("║         P2PKH  •  P2SH  •  P2WPKH                       ║");
     println!("╚═══════════════════════════════════════════════════════╝\x1b[0m\n");
 
-    // OPTIMIZATION: Configure Rayon thread pool for P-cores only
+    // OPTIMIZATION: Configure Rayon thread pool for P-cores only with high priority
     // Apple Silicon has Performance cores (fast) and Efficiency cores (slow)
     // Using only P-cores avoids E-core overhead and improves verification speed
     // 
@@ -973,15 +1129,57 @@ fn main() {
     let p_core_count = get_performance_core_count();
     
     use rayon::ThreadPoolBuilder;
-    if let Err(e) = ThreadPoolBuilder::new()
+    
+    // Configure thread pool with high-priority QoS on macOS
+    // This ensures verification threads get CPU time promptly
+    let pool_result = ThreadPoolBuilder::new()
         .num_threads(p_core_count)  // P-cores only (exclude E-cores)
         .thread_name(|i| format!("verify-{}", i))
-        .build_global()
-    {
-        eprintln!("[!] Failed to configure Rayon thread pool: {}", e);
-        // Continue with default pool
-    } else {
-        println!("[CPU] Rayon: {} threads (P-cores only)", p_core_count);
+        .spawn_handler(|thread| {
+            // Create thread with custom spawn to set QoS
+            let mut builder = std::thread::Builder::new();
+            if let Some(name) = thread.name() {
+                builder = builder.name(name.to_owned());
+            }
+            // Stack size: 2MB per thread (sufficient for crypto operations)
+            builder = builder.stack_size(2 * 1024 * 1024);
+            
+            builder.spawn(|| {
+                // Set high priority QoS on macOS for faster verification
+                #[cfg(target_os = "macos")]
+                {
+                    // pthread_set_qos_class_self_np sets the QoS class for current thread
+                    // QOS_CLASS_USER_INTERACTIVE (0x21) = highest priority for responsive work
+                    extern "C" {
+                        fn pthread_set_qos_class_self_np(
+                            qos_class: u32,
+                            relative_priority: i32,
+                        ) -> i32;
+                    }
+                    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+                    unsafe {
+                        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                    }
+                }
+                
+                // Run the actual rayon thread work
+                thread.run();
+            })?;
+            Ok(())
+        })
+        .build_global();
+    
+    match pool_result {
+        Ok(()) => {
+            #[cfg(target_os = "macos")]
+            println!("[CPU] Rayon: {} threads (P-cores, QOS_USER_INTERACTIVE)", p_core_count);
+            #[cfg(not(target_os = "macos"))]
+            println!("[CPU] Rayon: {} threads (P-cores only)", p_core_count);
+        }
+        Err(e) => {
+            eprintln!("[!] Failed to configure Rayon thread pool: {}", e);
+            // Continue with default pool
+        }
     }
 
     // CRITICAL: Run self-test before anything else
@@ -1090,11 +1288,35 @@ fn run_pipelined(
     // GPU works on batch N while we process results from batch N-1
     let keys_per_batch = gpu.keys_per_batch();
     let gpu_handle = thread::spawn(move || {
+        // Thermal monitoring for throttling detection
+        let thermal_monitor = ThermalMonitor::new();
+        let mut last_batch_time = Instant::now();
+        let mut thermal_pauses: u32 = 0;
+        
         let result = gpu.scan_pipelined(
             // Key generator closure
             || generate_random_key(keys_per_batch),
             // Batch result handler closure
             |base_key, matches| {
+                // Measure batch duration for thermal monitoring
+                let batch_duration = last_batch_time.elapsed();
+                last_batch_time = Instant::now();
+                
+                // Check for thermal throttling (skip first batch as it includes warmup)
+                if thermal_monitor.baseline_samples.load(Ordering::Relaxed) > 0 {
+                    if let Some(cooldown_ms) = thermal_monitor.record_batch(batch_duration.as_micros() as u64) {
+                        thermal_pauses += 1;
+                        if thermal_pauses == 1 || thermal_pauses % 10 == 0 {
+                            eprintln!("\n[🌡️] Thermal throttling detected, cooling {}ms (pause #{})", 
+                                cooldown_ms, thermal_pauses);
+                        }
+                        thread::sleep(Duration::from_millis(cooldown_ms));
+                    }
+                } else {
+                    // Record baseline
+                    thermal_monitor.record_batch(batch_duration.as_micros() as u64);
+                }
+                
                 gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
                 
                 // Send to verification (blocking to never lose matches)
@@ -1107,6 +1329,11 @@ fn run_pipelined(
             },
             &gpu_shutdown,
         );
+        
+        // Report thermal stats on shutdown
+        if thermal_pauses > 0 {
+            eprintln!("[🌡️] Total thermal pauses: {}", thermal_pauses);
+        }
         
         if let Err(e) = result {
             eprintln!("[!] GPU error: {}", e);
