@@ -467,6 +467,9 @@ inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
 // - Bloom filter check
 // ============================================================================
 
+// Match buffer size - must match MATCH_BUFFER_SIZE in gpu.rs
+#define MAX_MATCHES 262144
+
 kernel void scan_keys(
     constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
     constant uchar* step_table [[buffer(1)]],      // 20 entries × 64 bytes
@@ -548,7 +551,7 @@ kernel void scan_keys(
             // Check compressed
             if (bloom_check(h_comp, bloom, bloom_sz)) {
                 uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-                if (idx < 1024) {
+                if (idx < MAX_MATCHES) {
                     uint off = idx * 52;
                     match_data[off+0] = key; match_data[off+1] = key>>8;
                     match_data[off+2] = key>>16; match_data[off+3] = key>>24;
@@ -561,7 +564,7 @@ kernel void scan_keys(
             // Check uncompressed
             if (bloom_check(h_uncomp, bloom, bloom_sz)) {
                 uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-                if (idx < 1024) {
+                if (idx < MAX_MATCHES) {
                     uint off = idx * 52;
                     match_data[off+0] = key; match_data[off+1] = key>>8;
                     match_data[off+2] = key>>16; match_data[off+3] = key>>24;
@@ -574,7 +577,7 @@ kernel void scan_keys(
             // Check P2SH
             if (bloom_check(h_p2sh, bloom, bloom_sz)) {
                 uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed);
-                if (idx < 1024) {
+                if (idx < MAX_MATCHES) {
                     uint off = idx * 52;
                     match_data[off+0] = key; match_data[off+1] = key>>8;
                     match_data[off+2] = key>>16; match_data[off+3] = key>>24;

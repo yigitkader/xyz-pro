@@ -17,6 +17,11 @@ const MAX_THREADS: usize = 262_144;
 /// Keys processed per thread
 const KEYS_PER_THREAD: u32 = 512;
 
+/// Match buffer size (bloom false positives can be high with large target sets)
+/// For 60M targets with 0.1% FP rate: 134M keys × 0.001 = ~134K expected matches
+/// We use 256K to be safe
+const MATCH_BUFFER_SIZE: usize = 262_144;
+
 // ============================================================================
 // BLOOM FILTER
 // ============================================================================
@@ -230,11 +235,13 @@ impl OptimizedScanner {
             storage,
         );
 
-        let match_data_buf = device.new_buffer(1024 * 52, storage);
+        let match_data_buf = device.new_buffer((MATCH_BUFFER_SIZE * 52) as u64, storage);
         let match_count_buf = device.new_buffer(4, storage);
 
         let keys_per_batch = MAX_THREADS * KEYS_PER_THREAD as usize;
-        let mem_mb = (64 + 20 * 64 + bloom_data.len() * 8 + 4 + 4 + 1024 * 52 + 4) as f64 / 1_000_000.0;
+        let mem_mb = (64 + 20 * 64 + bloom_data.len() * 8 + 4 + 4 + MATCH_BUFFER_SIZE * 52 + 4) as f64 / 1_000_000.0;
+        
+        println!("[GPU] Match buffer: {} entries ({:.1} MB)", MATCH_BUFFER_SIZE, (MATCH_BUFFER_SIZE * 52) as f64 / 1_000_000.0);
 
         println!("[GPU] Keys/batch: {} M", keys_per_batch / 1_000_000);
         println!("[GPU] Memory: {:.2} MB", mem_mb);
@@ -317,18 +324,18 @@ impl OptimizedScanner {
         };
         
         // Warn if buffer overflow
-        if raw_match_count > 1024 {
+        if raw_match_count as usize > MATCH_BUFFER_SIZE {
             eprintln!("[!] WARNING: Match buffer overflow! {} matches found, {} lost", 
-                      raw_match_count, raw_match_count - 1024);
+                      raw_match_count, raw_match_count as usize - MATCH_BUFFER_SIZE);
         }
         
-        let match_count = (raw_match_count as usize).min(1024);
+        let match_count = (raw_match_count as usize).min(MATCH_BUFFER_SIZE);
 
         let keys_scanned = (self.max_threads * self.keys_per_thread as usize) as u64;
         self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);
 
         let mut matches = Vec::with_capacity(match_count);
-        if match_count > 0 && match_count <= 1024 {
+        if match_count > 0 && match_count <= MATCH_BUFFER_SIZE {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
             unsafe {
                 let ptr = self.match_data_buf.contents() as *const u8;
