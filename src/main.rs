@@ -953,20 +953,22 @@ impl ThermalMonitor {
         
         let samples = self.baseline_samples.load(Ordering::Relaxed);
         
-        // Phase 1: Warm-up (first 30 batches for more stable baseline)
-        // During warm-up, establish baseline at operating temperature
-        if samples < 30 {
-            // First 8 batches: system is cold, ignore (shader compilation, cache warm-up)
-            // Samples 8-25: use for baseline calculation (17 samples)
-            if samples >= 8 && samples < 25 {
+        // Phase 1: Warm-up (first 100 batches for more stable baseline)
+        // CRITICAL FIX: Extended from 30 to 100 batches
+        // First batches include shader compilation + cache warm-up + bloom filter init
+        // More samples = more stable baseline = fewer false throttling pauses
+        if samples < 100 {
+            // First 50 batches: system is still warming up, ignore
+            // Samples 50-80: use for baseline calculation (30 samples, more stable)
+            if samples >= 50 && samples < 80 {
                 let current = self.baseline_duration_us.load(Ordering::Relaxed);
-                // IMPROVED: Trimmed mean - reject outliers (>50% deviation from current)
-                // This prevents abnormally fast/slow batches from skewing baseline
+                // IMPROVED: Trimmed mean with 2x outlier threshold (was 1.5x)
+                // More tolerant to prevent skewed baseline from single-batch spikes
                 let is_outlier = current > 0 && 
-                    (duration_us > current * 3 / 2 || duration_us < current / 2);
+                    (duration_us > current * 2 || duration_us < current / 2);
                 
                 if !is_outlier {
-                    let count = (samples - 8 + 1) as u64;
+                    let count = (samples - 50 + 1) as u64;
                     let new_baseline = if current == 0 {
                         duration_us
                     } else {
@@ -979,13 +981,13 @@ impl ThermalMonitor {
             
             self.baseline_samples.fetch_add(1, Ordering::Relaxed);
             
-            // At sample 30, baseline is established
-            if samples == 29 {
+            // At sample 100, baseline is established
+            if samples == 99 {
                 let baseline = self.baseline_duration_us.load(Ordering::Relaxed);
-                println!("[🌡️] Thermal baseline: {:.2}ms/batch (trimmed mean, 17 samples)", 
+                println!("[🌡️] Thermal baseline: {:.2}ms/batch (trimmed mean, 30 samples)", 
                     baseline as f64 / 1000.0);
             }
-            return None;
+            return None;  // No pauses during warm-up
         }
         
         let baseline = self.baseline_duration_us.load(Ordering::Relaxed);
@@ -1023,39 +1025,42 @@ impl ThermalMonitor {
         // Calculate performance ratio (lower = slower = hotter)
         let trend_ratio = baseline as f64 / recent_avg as f64;
         
-        // ADJUSTED: Less aggressive throttling thresholds
-        // Old: 0.70 / 0.85 / 0.95 (too sensitive, false positives)
-        // New: 0.65 / 0.80 / 0.90 (more tolerant, fewer pauses)
+        // OPTIMIZED: More tolerant throttling thresholds
+        // With GPU binary search, performance is much more stable
+        // Old: 0.65 / 0.80 / 0.90 (still too sensitive)
+        // New: 0.60 / 0.75 / 0.85 (properly tolerant, almost no false pauses)
         
-        if trend_ratio < 0.65 {
-            // Critical: >35% slower than baseline (was 30%)
+        if trend_ratio < 0.60 {
+            // Critical: >40% slower than baseline (real thermal issue)
             self.throttle_count.fetch_add(1, Ordering::Relaxed);
             self.normal_count.store(0, Ordering::Relaxed);
             
             let consecutive = self.throttle_count.load(Ordering::Relaxed);
-            if consecutive >= 3 {
+            if consecutive >= 5 {
+                return Some(3000); // 3 second pause for severe throttling
+            } else if consecutive >= 3 {
                 return Some(2000); // 2 second pause for critical
             }
             return Some(1000); // 1 second pause
-        } else if trend_ratio < 0.80 {
-            // Warm: 20-35% slower than baseline (was 15-30%)
+        } else if trend_ratio < 0.75 {
+            // Warm: 25-40% slower than baseline
             self.throttle_count.fetch_add(1, Ordering::Relaxed);
             self.normal_count.store(0, Ordering::Relaxed);
             
             let consecutive = self.throttle_count.load(Ordering::Relaxed);
-            if consecutive >= 5 && consecutive % 5 == 0 {
-                return Some(500); // 500ms pause every 5 throttled batches
+            if consecutive >= 8 && consecutive % 8 == 0 {
+                return Some(500); // 500ms pause every 8 throttled batches
             }
-        } else if trend_ratio < 0.90 {
-            // Slightly warm: 10-20% slower - no pause but track (was 5-15%)
-            // Reset normal count but don't increment throttle
+        } else if trend_ratio < 0.85 {
+            // Slightly warm: 15-25% slower - no pause but track
+            // This is normal variance, don't increment throttle
             self.normal_count.store(0, Ordering::Relaxed);
         } else {
-            // Normal performance (within 5% of baseline)
+            // Normal performance (within 15% of baseline)
             self.normal_count.fetch_add(1, Ordering::Relaxed);
             
-            // Reset throttle counter after 10 normal batches
-            if self.normal_count.load(Ordering::Relaxed) >= 10 {
+            // Reset throttle counter after 15 normal batches (more tolerant)
+            if self.normal_count.load(Ordering::Relaxed) >= 15 {
                 self.throttle_count.store(0, Ordering::Relaxed);
             }
         }
@@ -1063,10 +1068,10 @@ impl ThermalMonitor {
         None
     }
     
-    /// Check if baseline has been established (first 20 batches recorded)
+    /// Check if baseline has been established (first 100 batches recorded)
     pub fn has_baseline(&self) -> bool {
         use std::sync::atomic::Ordering;
-        self.baseline_samples.load(Ordering::Relaxed) >= 20
+        self.baseline_samples.load(Ordering::Relaxed) >= 100
     }
     
     /// Get current thermal state for display
