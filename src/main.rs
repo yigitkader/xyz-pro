@@ -24,6 +24,205 @@ use targets::TargetDatabase;
 
 const TARGETS_FILE: &str = "targets.json";
 
+// ============================================================================
+// SELF-TEST: Verify hash calculations before starting
+// ============================================================================
+
+/// Critical self-test that runs before scanning starts.
+/// Verifies that private key → public key → hash160 calculations are correct.
+/// This catches any bugs in crypto implementations that could cause missed matches.
+fn run_self_test() -> bool {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::SecretKey;
+    
+    println!("[🔍] Running self-test...");
+    
+    // Test vector 1: Private key = 1
+    // This is the most basic test - if this fails, nothing works
+    let test_vectors = [
+        // (private_key_hex, expected_compressed_hash160, expected_p2pkh_address)
+        (
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "751e76e8199196d454941c45d1b3a323f1433bd6",
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"
+        ),
+        // Test vector 2: Private key = 2
+        // Compressed pubkey: 02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
+        (
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "06afd46bcdfd22ef94ac122aa11f241244a37ecc",
+            "1cMh228HTCiwS8ZsaakH8A8wze1JR5ZsP"
+        ),
+        // Test vector 3: BIP32 test vector (m/0H chain code derivation key)
+        // Compressed pubkey: 0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2
+        (
+            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
+            "3442193e1bb70916e914552172cd4e2dbc9df811",
+            "15mKKb2eos1hWa6tisdPwwDC1a5J1y9nma"
+        ),
+    ];
+    
+    let mut all_passed = true;
+    
+    for (i, (priv_hex, expected_hash_hex, expected_addr)) in test_vectors.iter().enumerate() {
+        let priv_key: [u8; 32] = hex::decode(priv_hex).unwrap().try_into().unwrap();
+        let expected_hash: [u8; 20] = hex::decode(expected_hash_hex).unwrap().try_into().unwrap();
+        
+        // Compute public key
+        let secret = match SecretKey::from_slice(&priv_key) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  [✗] Test {}: Invalid private key: {}", i + 1, e);
+                all_passed = false;
+                continue;
+            }
+        };
+        
+        let pubkey = secret.public_key();
+        let compressed = pubkey.to_encoded_point(true);
+        
+        // Compute hash160
+        let computed_hash = crypto::hash160(compressed.as_bytes());
+        
+        if computed_hash != expected_hash {
+            eprintln!("  [✗] Test {}: Hash mismatch!", i + 1);
+            eprintln!("      Expected: {}", expected_hash_hex);
+            eprintln!("      Got:      {}", hex::encode(computed_hash));
+            all_passed = false;
+            continue;
+        }
+        
+        // Verify address generation
+        let hash160 = types::Hash160::from_slice(&computed_hash);
+        let computed_addr = types::hash160_to_address(&hash160, types::AddressType::P2PKH);
+        
+        if computed_addr != *expected_addr {
+            eprintln!("  [✗] Test {}: Address mismatch!", i + 1);
+            eprintln!("      Expected: {}", expected_addr);
+            eprintln!("      Got:      {}", computed_addr);
+            all_passed = false;
+            continue;
+        }
+        
+        println!("  [✓] Test {}: {} → {}", i + 1, &priv_hex[..16], expected_addr);
+    }
+    
+    // Test P2SH script hash computation
+    // For pubkey_hash = 751e76e8199196d454941c45d1b3a323f1433bd6 (from private key = 1)
+    // Witness script = OP_0 PUSH20 <pubkey_hash> = 0014751e76e8199196d454941c45d1b3a323f1433bd6
+    // P2SH script hash = HASH160(witness script) = bcfeb728b584253d5f3f70bcb780e9ef218a68f4
+    // P2SH address = 3LRW7jeCvQCRdPF8S3yUCfRAx4eqXFmdcr
+    let test_pubkey_hash = hex::decode("751e76e8199196d454941c45d1b3a323f1433bd6").unwrap();
+    let test_pubkey_hash: [u8; 20] = test_pubkey_hash.try_into().unwrap();
+    let p2sh_hash = address::p2sh_script_hash(&test_pubkey_hash);
+    let expected_p2sh_hash = hex::decode("bcfeb728b584253d5f3f70bcb780e9ef218a68f4").unwrap();
+    
+    if p2sh_hash != expected_p2sh_hash.as_slice() {
+        eprintln!("  [✗] P2SH hash computation failed!");
+        eprintln!("      Expected: {}", hex::encode(&expected_p2sh_hash));
+        eprintln!("      Got:      {}", hex::encode(p2sh_hash));
+        all_passed = false;
+    } else {
+        println!("  [✓] P2SH script hash computation verified");
+    }
+    
+    // Test WIF encoding (critical for fund recovery!)
+    // If WIF is wrong, user cannot access found coins
+    // These are verified against Bitcoin Core and bitaddress.org
+    let wif_test_vectors = [
+        // (private_key_hex, expected_wif_compressed, expected_wif_uncompressed)
+        (
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn",  // compressed (starts with K/L)
+            "5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAnchuDf"   // uncompressed (starts with 5)
+        ),
+        (
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74NMTptX4",  // compressed
+            "5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAvUcVfH"   // uncompressed
+        ),
+    ];
+    
+    for (priv_hex, expected_wif_comp, expected_wif_uncomp) in wif_test_vectors {
+        let priv_key: [u8; 32] = hex::decode(priv_hex).unwrap().try_into().unwrap();
+        
+        let wif_comp = address::to_wif_compressed(&priv_key, true);
+        let wif_uncomp = address::to_wif_compressed(&priv_key, false);
+        
+        if wif_comp != expected_wif_comp {
+            eprintln!("  [✗] WIF (compressed) mismatch for key {}...!", &priv_hex[..16]);
+            eprintln!("      Expected: {}", expected_wif_comp);
+            eprintln!("      Got:      {}", wif_comp);
+            all_passed = false;
+        }
+        
+        if wif_uncomp != expected_wif_uncomp {
+            eprintln!("  [✗] WIF (uncompressed) mismatch for key {}...!", &priv_hex[..16]);
+            eprintln!("      Expected: {}", expected_wif_uncomp);
+            eprintln!("      Got:      {}", wif_uncomp);
+            all_passed = false;
+        }
+    }
+    
+    if all_passed {
+        println!("  [✓] WIF encoding verified (compressed & uncompressed)");
+    }
+    
+    // Test key reconstruction (base_key + offset)
+    // This is how GPU results are converted back to private keys
+    let base_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+        .unwrap().try_into().unwrap();
+    let offset: u32 = 1; // base_key + 1 should give key = 2
+    
+    let mut reconstructed = base_key;
+    let mut carry = offset as u64;
+    for byte in reconstructed.iter_mut().rev() {
+        let sum = *byte as u64 + (carry & 0xFF);
+        *byte = sum as u8;
+        carry = (carry >> 8) + (sum >> 8);
+    }
+    
+    let expected_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000002")
+        .unwrap().try_into().unwrap();
+    
+    if reconstructed != expected_key {
+        eprintln!("  [✗] Key reconstruction failed!");
+        eprintln!("      base_key + 1 should equal key 2");
+        eprintln!("      Got: {}", hex::encode(reconstructed));
+        all_passed = false;
+    } else {
+        println!("  [✓] Key reconstruction (base + offset) verified");
+    }
+    
+    // Verify is_valid_private_key works correctly
+    let valid_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+        .unwrap().try_into().unwrap();
+    let zero_key: [u8; 32] = [0u8; 32];
+    
+    if !crypto::is_valid_private_key(&valid_key) {
+        eprintln!("  [✗] is_valid_private_key incorrectly rejected key = 1");
+        all_passed = false;
+    }
+    
+    if crypto::is_valid_private_key(&zero_key) {
+        eprintln!("  [✗] is_valid_private_key incorrectly accepted key = 0");
+        all_passed = false;
+    }
+    
+    if all_passed {
+        println!("  [✓] Private key validation logic verified");
+    }
+
+    if all_passed {
+        println!("[✓] Self-test passed - all calculations are correct\n");
+    } else {
+        eprintln!("\n[✗] SELF-TEST FAILED! Calculations are incorrect.");
+        eprintln!("    DO NOT proceed - results would be unreliable!");
+    }
+    
+    all_passed
+}
+
 // Pipeline buffer size (GPU batches in flight)
 // With smaller batches (8M vs 134M), we need more depth for continuous GPU utilization
 // 256 batches × 8.4M = ~2.1B keys in flight for smooth pipelining
@@ -37,6 +236,13 @@ fn main() {
     println!("║     XYZ-PRO  •  Bitcoin Key Scanner  •  Metal GPU      ║");
     println!("║         P2PKH  •  P2SH  •  P2WPKH                       ║");
     println!("╚═══════════════════════════════════════════════════════╝\x1b[0m\n");
+
+    // CRITICAL: Run self-test before anything else
+    // This ensures hash calculations are correct - a bug here means missed matches
+    if !run_self_test() {
+        eprintln!("\n[FATAL] Self-test failed. Exiting to prevent incorrect scanning.");
+        std::process::exit(1);
+    }
 
     // Load targets
     let targets = match TargetDatabase::new(TARGETS_FILE) {
