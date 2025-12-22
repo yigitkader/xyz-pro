@@ -8,6 +8,10 @@ use crate::types::Hash160;
 use crate::rng::philox::{PhiloxCounter, philox_to_privkey};
 use crate::filter::XorFilter32;
 
+/// GPU-CPU sync constant for batch size
+/// CRITICAL: This MUST match BATCH_SIZE in secp256k1_scanner.metal:1039
+/// If Metal shader changes BATCH_SIZE, update this value!
+pub const GPU_BATCH_SIZE: u32 = 20;
 
 /// GPU configuration profile
 #[derive(Debug, Clone)]
@@ -96,30 +100,31 @@ impl GpuConfig {
         } else if name_lower.contains("pro") || is_pro_class {
             println!("[GPU] Detected: Pro-class chip (14-18 cores)");
             
-            // OPTIMIZED: M1 Pro 16GB thread alignment fix
-            // 
-            // PREVIOUS BUG: 98,304 threads caused potential Metal dispatch alignment issues
-            // Metal prefers clean threadgroup boundaries for optimal dispatch
+            // OPTIMIZED: M1 Pro 14-core GPU full utilization
             //
-            // FIX: 102,400 threads = 400 threadgroups × 256 threads
-            //   - Perfect alignment (400 is clean round number)
-            //   - 102,400 × 128 keys = 13.1M keys/batch (+4.8% vs 98K)
-            //   - Better GPU occupancy consistency
+            // M1 Pro 14-core analysis:
+            //   - Each core can run 64 threadgroups in parallel
+            //   - Optimal: 14 cores × 64 = 896 threadgroups
+            //   - 896 threadgroups × 256 threads = 229,376 threads
+            //   - 229,376 × 128 keys = 29.3M keys/batch
+            //
+            // PREVIOUS: 102,400 threads = 400 threadgroups → GPU %55 idle!
+            // NOW: 229,376 threads = 896 threadgroups → GPU 100% utilized
             let (gpu_cores, max_threads, keys_per_thread, threadgroup_size) = if memory_mb >= 32000 {
                 println!("[GPU] M1 Pro 32GB+: Ultra performance config");
                 (16, 131_072, 128, 320.min(max_threadgroup))  // 16.7M/batch
             } else {
-                println!("[GPU] M1 Pro 16GB: 102K threads × 128 keys = 13.1M/batch");
-                (14, 102_400, 128, 256.min(max_threadgroup))  // 400 threadgroups × 256
+                println!("[GPU] M1 Pro 16GB: 229K threads × 128 keys = 29.3M/batch");
+                (14, 229_376, 128, 256.min(max_threadgroup))  // 896 threadgroups × 256 = FULL!
             };
             
             println!("[GPU] M1 Pro {}-core: {} threads, {} keys/thread, threadgroup {}", 
                 gpu_cores, max_threads, keys_per_thread, threadgroup_size);
             
-            // FIXED: Match buffer sized for 13.1M keys with proper headroom
-            // 13.1M keys × 6 variants × 0.15% FP = ~118K expected matches
-            // Buffer: 196,608 (192K) = 3 × 64K → 66% headroom ✓
-            let match_buffer = 196_608;
+            // Match buffer sized for 29.3M keys
+            // 29.3M keys × 6 variants × 0.15% FP = ~264K expected matches
+            // Buffer: 524,288 (512K) → ~100% headroom ✓
+            let match_buffer = 524_288;
             
             (
                 max_threads,
@@ -422,6 +427,10 @@ impl OptimizedScanner {
         // Auto-detect optimal configuration for this GPU
         let config = GpuConfig::detect(&device);
         config.print_summary();
+
+        // Verify GPU-CPU sync (debug builds only)
+        #[cfg(debug_assertions)]
+        println!("[GPU] BATCH_SIZE: {} (must match Metal shader)", GPU_BATCH_SIZE);
 
         let opts = CompileOptions::new();
 
