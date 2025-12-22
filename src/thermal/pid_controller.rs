@@ -1,52 +1,25 @@
-// src/thermal/pid_controller.rs
-// PID (Proportional-Integral-Derivative) Controller for thermal management
-// Maintains GPU at optimal temperature without stop-start throttling
-
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// PID Controller for maintaining target temperature
-/// 
-/// The PID algorithm: output = Kp*e + Ki*∫e + Kd*de/dt
-/// where e = target_temp - current_temp (error)
-/// 
-/// This creates smooth, adaptive thermal management:
-/// - Proportional: immediate response to temperature error
-/// - Integral: corrects sustained offset (long-term accuracy)
-/// - Derivative: predicts temperature trend (prevents overshoot)
 pub struct PIDController {
-    /// Target temperature in Celsius (e.g., 87.0 for M1 Pro)
     target_temp: f32,
-    
-    /// PID coefficients (tuned for M1/M4 Pro thermal characteristics)
-    kp: f32,  // Proportional gain
-    ki: f32,  // Integral gain
-    kd: f32,  // Derivative gain
-    
-    /// Internal state
-    integral: f32,           // Accumulated error
-    last_error: f32,         // Previous error for derivative
-    last_temp: f32,          // For derivative calculation
-    last_update: Instant,    // Timing
-    last_speed: f32,         // Last computed speed (for dt skip)
-    
-    /// Limits
-    min_speed: f32,          // Minimum speed multiplier (safety: 0.5 = 50%)
-    max_speed: f32,          // Maximum speed multiplier (turbo: 1.2 = 120%)
-    integral_max: f32,       // Anti-windup limit
-    
-    /// Statistics
+    kp: f32,
+    ki: f32,
+    kd: f32,
+    integral: f32,
+    last_error: f32,
+    last_temp: f32,
+    last_update: Instant,
+    last_speed: f32,
+    min_speed: f32,
+    max_speed: f32,
+    integral_max: f32,
     updates: AtomicU64,
     adjustments: AtomicU64,
-    time_at_target: AtomicU64,  // Milliseconds within ±1°C of target
+    time_at_target: AtomicU64,
 }
 
 impl PIDController {
-    /// Create new PID controller
-    /// 
-    /// # Parameters
-    /// - target_temp: Desired temperature (e.g., 87.0°C for M1 Pro)
-    /// - tuning: PID coefficients (None = auto-detect from hardware)
     pub fn new(target_temp: f32, tuning: Option<PIDTuning>) -> Self {
         let tuning = tuning.unwrap_or_else(PIDTuning::auto_detect);
         
@@ -64,76 +37,55 @@ impl PIDController {
             last_temp: target_temp,
             last_update: Instant::now(),
             last_speed: 1.0,
-            min_speed: 0.5,   // Never go below 50% speed
-            max_speed: 1.2,   // Never exceed 120% speed
-            integral_max: 10.0,  // Prevent integral windup
+            min_speed: 0.5,
+            max_speed: 1.2,
+            integral_max: 10.0,
             updates: AtomicU64::new(0),
             adjustments: AtomicU64::new(0),
             time_at_target: AtomicU64::new(0),
         }
     }
     
-    /// Update controller with current temperature
-    /// Returns speed multiplier (1.0 = normal, 0.5 = slow, 1.2 = fast)
     pub fn update(&mut self, current_temp: f32) -> f32 {
         let now = Instant::now();
         let dt = (now - self.last_update).as_secs_f32();
         self.last_update = now;
         
-        // Skip if dt too small (avoid numerical instability)
         if dt < 0.01 {
             return 1.0;
         }
         
         self.updates.fetch_add(1, Ordering::Relaxed);
         
-        // Calculate error (positive = too hot, negative = too cold)
         let error = current_temp - self.target_temp;
         
-        // Track time at target (±1°C tolerance)
         if error.abs() <= 1.0 {
             let ms = (dt * 1000.0) as u64;
             self.time_at_target.fetch_add(ms, Ordering::Relaxed);
         }
         
-        // Proportional term (immediate response)
         let p_term = self.kp * error;
         
-        // Integral term (eliminate steady-state error)
         self.integral += error * dt;
-        
-        // Anti-windup: clamp integral to prevent runaway
         self.integral = self.integral.clamp(-self.integral_max, self.integral_max);
-        
         let i_term = self.ki * self.integral;
         
-        // Derivative term (predict error trend)
-        // Use error derivative for proper PID behavior
-        // If error is increasing (getting hotter), we need more slowdown
-        let error_derivative = if self.updates.load(Ordering::Relaxed) > 1 {
-            (error - self.last_error) / dt
+        let temp_derivative = if self.updates.load(Ordering::Relaxed) > 1 {
+            (current_temp - self.last_temp) / dt
         } else {
-            0.0  // First update: no derivative yet
+            0.0
         };
-        let d_term = self.kd * error_derivative;  // Positive if error increasing → more slowdown
+        let d_term = self.kd * temp_derivative;
         
         self.last_temp = current_temp;
         self.last_error = error;
         
-        // Compute control output (speed adjustment)
-        // Positive error (too hot) → reduce speed
-        // Negative error (too cold) → increase speed
-        // PID output: subtract correction from 1.0
         let adjustment = p_term + i_term + d_term;
         let raw_output = 1.0 - adjustment;
-        
-        // Clamp to safe limits
         let speed = raw_output.clamp(self.min_speed, self.max_speed);
         
-        // Store for next update (if dt too small)
         self.last_speed = speed;
         
-        // Track significant adjustments (>5% change)
         if (speed - 1.0).abs() > 0.05 {
             self.adjustments.fetch_add(1, Ordering::Relaxed);
         }

@@ -1,25 +1,13 @@
-// src/filter/xor_filter.rs
-// Xor Filter: Space-efficient probabilistic data structure
-// O(1) lookup, ~14 bits/element, <0.4% false positive rate
-
 use std::hash::Hasher;
 use fxhash::FxHasher;
 
-/// Xor16 filter optimized for GPU
-/// Uses 16-bit fingerprints for balance between size and FP rate
 pub struct XorFilter16 {
-    /// Fingerprint table (3x larger than input set)
     fingerprints: Vec<u16>,
-    /// Seeds for 3 hash functions
     seeds: [u64; 3],
-    /// Block size for construction
     block_length: usize,
 }
 
 impl XorFilter16 {
-    /// Construct Xor filter from hash set
-    /// targets: 20-byte hash160 values
-    /// Retries with different seeds and larger capacity if construction fails
     pub fn new(targets: &[[u8; 20]]) -> Self {
         let size = targets.len();
         let mut capacity = Self::calculate_capacity(size);
@@ -27,7 +15,6 @@ impl XorFilter16 {
         
         println!("[Xor] Building filter for {} targets...", size);
         
-        // Try multiple seed sets if construction fails
         let seed_sets = vec![
             [0x0123456789ABCDEF, 0xFEDCBA9876543210, 0xAAAAAAAA55555555],
             [0x123456789ABCDEF0, 0xF0EDCBA987654321, 0xBBBBBBBB66666666],
@@ -40,10 +27,9 @@ impl XorFilter16 {
         let mut seeds = seed_sets[0];
         let mut success = false;
         
-        // Try construction with increasing capacity if needed
         for attempt in 0..10 {
             for &try_seeds in &seed_sets {
-                fingerprints.fill(0);  // Reset
+                fingerprints.fill(0);
                 
                 if attempt == 0 {
                     println!("[Xor] Capacity: {} (3 × {} blocks)", capacity, block_length);
@@ -61,7 +47,6 @@ impl XorFilter16 {
                 break;
             }
             
-            // Increase capacity and retry
             capacity = ((capacity as f64) * 1.1) as usize;
             capacity = ((capacity + 2) / 3) * 3;  // Round to multiple of 3
             block_length = capacity / 3;
@@ -87,16 +72,11 @@ impl XorFilter16 {
         }
     }
     
-    /// Calculate optimal capacity (must be divisible by 3)
     fn calculate_capacity(size: usize) -> usize {
-        // Xor filter needs 1.23x space overhead minimum
-        let min_capacity = ((size as f64) * 1.23) as usize;
-        // Round up to multiple of 3
+        let min_capacity = ((size as f64) * 1.27) as usize;
         ((min_capacity + 2) / 3) * 3
     }
     
-    /// Construct filter using Dietzfelbinger algorithm
-    /// Returns true if construction succeeded, false if graph couldn't be peeled
     fn construct_filter(
         targets: &[[u8; 20]],
         fingerprints: &mut [u16],

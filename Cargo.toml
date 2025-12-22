@@ -38,9 +38,7 @@ thiserror = "1.0"
 chrono = "0.4"
 ctrlc = "3.4"
 fxhash = "0.2"
-
-# Xor Filter (Phase 2)
-xorf = "0.11"
+lazy_static = "1.4"
 
 [features]
 default = ["philox-rng", "xor-filter", "pid-thermal", "zero-copy"]  # Ultimate system enabled by default

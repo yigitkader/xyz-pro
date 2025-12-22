@@ -1,6 +1,3 @@
-// XYZ-PRO - Bitcoin Key Scanner with Metal GPU
-// Supports: P2PKH, P2SH, P2WPKH
-// Target: 100+ M/s on Apple M1
 
 mod address;
 mod crypto;
@@ -39,37 +36,23 @@ use targets::TargetDatabase;
 
 const TARGETS_FILE: &str = "targets.json";
 
-// ============================================================================
-// SELF-TEST: Verify hash calculations before starting
-// ============================================================================
-
-/// Critical self-test that runs before scanning starts.
-/// Verifies that private key → public key → hash160 calculations are correct.
-/// This catches any bugs in crypto implementations that could cause missed matches.
 fn run_self_test() -> bool {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use k256::SecretKey;
     
     println!("[🔍] Running self-test...");
     
-    // Test vector 1: Private key = 1
-    // This is the most basic test - if this fails, nothing works
     let test_vectors = [
-        // (private_key_hex, expected_compressed_hash160, expected_p2pkh_address)
         (
             "0000000000000000000000000000000000000000000000000000000000000001",
             "751e76e8199196d454941c45d1b3a323f1433bd6",
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"
         ),
-        // Test vector 2: Private key = 2
-        // Compressed pubkey: 02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
         (
             "0000000000000000000000000000000000000000000000000000000000000002",
             "06afd46bcdfd22ef94ac122aa11f241244a37ecc",
             "1cMh228HTCiwS8ZsaakH8A8wze1JR5ZsP"
         ),
-        // Test vector 3: BIP32 test vector (m/0H chain code derivation key)
-        // Compressed pubkey: 0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2
         (
             "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
             "3442193e1bb70916e914552172cd4e2dbc9df811",
@@ -83,7 +66,6 @@ fn run_self_test() -> bool {
         let priv_key: [u8; 32] = hex::decode(priv_hex).unwrap().try_into().unwrap();
         let expected_hash: [u8; 20] = hex::decode(expected_hash_hex).unwrap().try_into().unwrap();
         
-        // Compute public key
         let secret = match SecretKey::from_slice(&priv_key) {
             Ok(s) => s,
             Err(e) => {
@@ -95,8 +77,6 @@ fn run_self_test() -> bool {
         
         let pubkey = secret.public_key();
         let compressed = pubkey.to_encoded_point(true);
-        
-        // Compute hash160
         let computed_hash = crypto::hash160(compressed.as_bytes());
         
         if computed_hash != expected_hash {
@@ -107,7 +87,6 @@ fn run_self_test() -> bool {
             continue;
         }
         
-        // Verify address generation
         let hash160 = types::Hash160::from_slice(&computed_hash);
         let computed_addr = types::hash160_to_address(&hash160, types::AddressType::P2PKH);
         
@@ -122,11 +101,6 @@ fn run_self_test() -> bool {
         println!("  [✓] Test {}: {} → {}", i + 1, &priv_hex[..16], expected_addr);
     }
     
-    // Test P2SH script hash computation
-    // For pubkey_hash = 751e76e8199196d454941c45d1b3a323f1433bd6 (from private key = 1)
-    // Witness script = OP_0 PUSH20 <pubkey_hash> = 0014751e76e8199196d454941c45d1b3a323f1433bd6
-    // P2SH script hash = HASH160(witness script) = bcfeb728b584253d5f3f70bcb780e9ef218a68f4
-    // P2SH address = 3LRW7jeCvQCRdPF8S3yUCfRAx4eqXFmdcr
     let test_pubkey_hash = hex::decode("751e76e8199196d454941c45d1b3a323f1433bd6").unwrap();
     let test_pubkey_hash: [u8; 20] = test_pubkey_hash.try_into().unwrap();
     let p2sh_hash = address::p2sh_script_hash(&test_pubkey_hash);
@@ -817,28 +791,14 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
     all_passed
 }
 
-// Pipeline buffer size (GPU batches in flight)
-// CRITICAL: Increased pipeline depth to prevent GPU stalls
-// Old: PIPELINE_DEPTH = 4 → GPU blocks after 340ms
-// New: PIPELINE_DEPTH = 16 → GPU never blocks!
-//
-// Memory cost: 16 × 7.86M × 52 bytes = 6.5MB (negligible)
-const PIPELINE_DEPTH: usize = 16;
+const PIPELINE_DEPTH: usize = 8;
 
-// Batch for verification: (base_key, matches)
 type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
 
-// ============================================================================
-// SYSTEM MONITORING (Memory & Thermal)
-// ============================================================================
-
-/// Check system memory pressure on macOS
-/// Returns memory free percentage (0-100), or 100.0 if detection fails
 #[cfg(target_os = "macos")]
 fn check_memory_pressure() -> f32 {
     use std::process::Command;
     
-    // Use vm_stat for memory info (more reliable than memory_pressure command)
     if let Ok(output) = Command::new("vm_stat").output() {
         if output.status.success() {
             if let Ok(text) = String::from_utf8(output.stdout) {
@@ -1301,7 +1261,7 @@ fn run_pipelined(
         // - 3,500 × 60µs = 210ms verification time
         // - vs GPU 64ms × 2 = 128ms → still slower but acceptable
         //
-        // With PIPELINE_DEPTH=16, GPU never starves!
+        // With PIPELINE_DEPTH=8, GPU has sufficient buffering (512ms)!
         const MAX_BATCH_ACCUMULATION: usize = 2;
         
         while !verify_shutdown.load(Ordering::Relaxed) {
