@@ -1,4 +1,5 @@
 use k256::elliptic_curve::sec1::ToEncodedPoint;
+#[cfg(not(feature = "philox-rng"))]
 use k256::SecretKey;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::fs;
@@ -453,7 +454,12 @@ fn compute_wnaf_step_table(keys_per_thread: u32) -> [[u8; 64]; 75] {
 
 struct BufferSet {
     queue: CommandQueue,
+    #[cfg(not(feature = "philox-rng"))]
     base_point_buf: Buffer,
+    #[cfg(feature = "philox-rng")]
+    philox_key_buf: Buffer,
+    #[cfg(feature = "philox-rng")]
+    philox_counter_buf: Buffer,
     match_data_buf: Buffer,
     match_count_buf: Buffer,
 }
@@ -720,13 +726,23 @@ impl OptimizedScanner {
         let buffer_sets = [
             BufferSet {
                 queue: device.new_command_queue(),  // Queue 0 for buffer 0
+                #[cfg(not(feature = "philox-rng"))]
                 base_point_buf: device.new_buffer(64, storage),
+                #[cfg(feature = "philox-rng")]
+                philox_key_buf: device.new_buffer(8, storage),  // uint2 = 8 bytes
+                #[cfg(feature = "philox-rng")]
+                philox_counter_buf: device.new_buffer(16, storage),  // uint4 = 16 bytes
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
             BufferSet {
                 queue: device.new_command_queue(),  // Queue 1 for buffer 1
+                #[cfg(not(feature = "philox-rng"))]
                 base_point_buf: device.new_buffer(64, storage),
+                #[cfg(feature = "philox-rng")]
+                philox_key_buf: device.new_buffer(8, storage),
+                #[cfg(feature = "philox-rng")]
+                philox_counter_buf: device.new_buffer(16, storage),
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
@@ -937,21 +953,29 @@ impl OptimizedScanner {
 
         #[cfg(feature = "philox-rng")]
         {
-            let secret = SecretKey::from_slice(base_key)
-                .map_err(|e| ScannerError::Gpu(format!("invalid Philox key: {}", e)))?;
-            let pubkey = secret.public_key();
-            let encoded = pubkey.to_encoded_point(false);
-            let pub_bytes = encoded.as_bytes();
+            // PHILOX RNG MODE: Send only seed + counter to GPU (96 bytes vs 64KB base_point)
+            // GPU will generate private keys and compute public keys internally
+            // base_key parameter is unused in this mode
+            let _ = base_key;
+            let batch_size = self.config.keys_per_batch();
+            let state = self.philox_counter.next_batch(batch_size);
             
             unsafe {
-                let ptr = buffers.base_point_buf.contents() as *mut u8;
-                std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
-                std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
+                // Send Philox key (uint2 = 8 bytes)
+                let key_ptr = buffers.philox_key_buf.contents() as *mut u32;
+                std::ptr::copy_nonoverlapping(state.key.as_ptr(), key_ptr, 2);
+                
+                // Send Philox counter (uint4 = 16 bytes)
+                let ctr_ptr = buffers.philox_counter_buf.contents() as *mut u32;
+                std::ptr::copy_nonoverlapping(state.counter.as_ptr(), ctr_ptr, 4);
             }
+            
+            // base_point_buf is unused in Philox mode (GPU computes it from private key)
         }
         
         #[cfg(not(feature = "philox-rng"))]
         {
+            // LEGACY MODE: Send base_point to GPU
             let secret = SecretKey::from_slice(base_key)
                 .map_err(|e| ScannerError::Gpu(format!("invalid key: {}", e)))?;
             let pubkey = secret.public_key();
@@ -986,32 +1010,74 @@ impl OptimizedScanner {
         {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.pipeline);
-            enc.set_buffer(0, Some(&buffers.base_point_buf), 0);
-            enc.set_buffer(1, Some(&self.step_table_buf), 0);
-            enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);
             
-            #[cfg(feature = "xor-filter")]
+            #[cfg(feature = "philox-rng")]
             {
-                enc.set_buffer(3, Some(&self.xor_fingerprints_buf), 0);
-                enc.set_buffer(4, Some(&self.xor_seeds_buf), 0);
-                enc.set_buffer(5, Some(&self.xor_block_length_buf), 0);
-                enc.set_buffer(6, Some(&self.kpt_buf), 0);
-                enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
-                enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
-                enc.set_buffer(9, Some(&self.hash_count_buf), 0);
+                // PHILOX RNG MODE: Buffer layout
+                // buffer(0) = philox_key (uint2)
+                // buffer(1) = philox_counter (uint4)
+                // buffer(2) = step_table (legacy, kept for compatibility)
+                // buffer(3) = wnaf_table
+                enc.set_buffer(0, Some(&buffers.philox_key_buf), 0);
+                enc.set_buffer(1, Some(&buffers.philox_counter_buf), 0);
+                enc.set_buffer(2, Some(&self.step_table_buf), 0);
+                enc.set_buffer(3, Some(&self.wnaf_table_buf), 0);
+                
+                #[cfg(feature = "xor-filter")]
+                {
+                    enc.set_buffer(4, Some(&self.xor_fingerprints_buf), 0);
+                    enc.set_buffer(5, Some(&self.xor_seeds_buf), 0);
+                    enc.set_buffer(6, Some(&self.xor_block_length_buf), 0);
+                    enc.set_buffer(7, Some(&self.kpt_buf), 0);
+                    enc.set_buffer(8, Some(&buffers.match_data_buf), 0);
+                    enc.set_buffer(9, Some(&buffers.match_count_buf), 0);
+                    enc.set_buffer(10, Some(&self.hash_count_buf), 0);
+                }
+                
+                #[cfg(not(feature = "xor-filter"))]
+                {
+                    enc.set_buffer(4, Some(&self.l1_bloom_buf), 0);
+                    enc.set_buffer(5, Some(&self.l1_bloom_size_buf), 0);
+                    enc.set_buffer(6, Some(&self.l2_bloom_buf), 0);
+                    enc.set_buffer(7, Some(&self.l2_bloom_size_buf), 0);
+                    enc.set_buffer(8, Some(&self.kpt_buf), 0);
+                    enc.set_buffer(9, Some(&buffers.match_data_buf), 0);
+                    enc.set_buffer(10, Some(&buffers.match_count_buf), 0);
+                    enc.set_buffer(11, Some(&self.sorted_hashes_buf), 0);
+                    enc.set_buffer(12, Some(&self.hash_count_buf), 0);
+                }
             }
             
-            #[cfg(not(feature = "xor-filter"))]
+            #[cfg(not(feature = "philox-rng"))]
             {
-                enc.set_buffer(3, Some(&self.l1_bloom_buf), 0);
-                enc.set_buffer(4, Some(&self.l1_bloom_size_buf), 0);
-                enc.set_buffer(5, Some(&self.l2_bloom_buf), 0);
-                enc.set_buffer(6, Some(&self.l2_bloom_size_buf), 0);
-                enc.set_buffer(7, Some(&self.kpt_buf), 0);
-                enc.set_buffer(8, Some(&buffers.match_data_buf), 0);
-                enc.set_buffer(9, Some(&buffers.match_count_buf), 0);
-                enc.set_buffer(10, Some(&self.sorted_hashes_buf), 0);
-                enc.set_buffer(11, Some(&self.hash_count_buf), 0);
+                // LEGACY MODE: Buffer layout (unchanged)
+                enc.set_buffer(0, Some(&buffers.base_point_buf), 0);
+                enc.set_buffer(1, Some(&self.step_table_buf), 0);
+                enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);
+                
+                #[cfg(feature = "xor-filter")]
+                {
+                    enc.set_buffer(3, Some(&self.xor_fingerprints_buf), 0);
+                    enc.set_buffer(4, Some(&self.xor_seeds_buf), 0);
+                    enc.set_buffer(5, Some(&self.xor_block_length_buf), 0);
+                    enc.set_buffer(6, Some(&self.kpt_buf), 0);
+                    enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
+                    enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
+                    enc.set_buffer(9, Some(&self.hash_count_buf), 0);
+                }
+                
+                #[cfg(not(feature = "xor-filter"))]
+                {
+                    enc.set_buffer(3, Some(&self.l1_bloom_buf), 0);
+                    enc.set_buffer(4, Some(&self.l1_bloom_size_buf), 0);
+                    enc.set_buffer(5, Some(&self.l2_bloom_buf), 0);
+                    enc.set_buffer(6, Some(&self.l2_bloom_size_buf), 0);
+                    enc.set_buffer(7, Some(&self.kpt_buf), 0);
+                    enc.set_buffer(8, Some(&buffers.match_data_buf), 0);
+                    enc.set_buffer(9, Some(&buffers.match_count_buf), 0);
+                    enc.set_buffer(10, Some(&self.sorted_hashes_buf), 0);
+                    enc.set_buffer(11, Some(&self.hash_count_buf), 0);
+                }
             }
             
             enc.dispatch_threads(grid, group);
@@ -1066,27 +1132,67 @@ impl OptimizedScanner {
         let mut matches = Vec::with_capacity(match_count);
         if match_count > 0 {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
-            unsafe {
-                let ptr = buffers.match_data_buf.contents() as *const u8;
-                for i in 0..match_count {
-                    let off = i * 52;
-                    let mut key_bytes = [0u8; 4];
-                    std::ptr::copy_nonoverlapping(ptr.add(off), key_bytes.as_mut_ptr(), 4);
-                    
-                    let type_byte = *ptr.add(off + 4);
-                    let match_type = match MatchType::from_u8(type_byte) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    
-                    let mut hash_bytes = [0u8; 20];
-                    std::ptr::copy_nonoverlapping(ptr.add(off + 32), hash_bytes.as_mut_ptr(), 20);
-                    
-                    matches.push(PotentialMatch {
-                        key_index: u32::from_le_bytes(key_bytes),
-                        match_type,
-                        hash: Hash160::from_slice(&hash_bytes),
-                    });
+            #[cfg(feature = "zero-copy")]
+            {
+                // ZERO-COPY: Direct read from unified memory (no explicit copy)
+                // GPU writes directly to shared memory, CPU reads from same location
+                unsafe {
+                    let data_ptr = buffers.match_data_buf.contents() as *const u8;
+                    for i in 0..match_count {
+                        let offset = i * 52;
+                        let entry_ptr = data_ptr.add(offset);
+                        
+                        // Direct read (no copy) - unified memory handles synchronization
+                        let key_index = u32::from_le_bytes([
+                            *entry_ptr,
+                            *entry_ptr.add(1),
+                            *entry_ptr.add(2),
+                            *entry_ptr.add(3),
+                        ]);
+                        
+                        let type_byte = *entry_ptr.add(4);
+                        let match_type = match MatchType::from_u8(type_byte) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        
+                        // Direct read of hash (20 bytes)
+                        let hash_bytes = std::slice::from_raw_parts(entry_ptr.add(32), 20);
+                        let hash_array: [u8; 20] = hash_bytes.try_into().unwrap_or([0; 20]);
+                        
+                        matches.push(PotentialMatch {
+                            key_index,
+                            match_type,
+                            hash: Hash160::from_slice(&hash_array),
+                        });
+                    }
+                }
+            }
+            #[cfg(not(feature = "zero-copy"))]
+            {
+                // Fallback: explicit copy for non-zero-copy mode
+                unsafe {
+                    let ptr = buffers.match_data_buf.contents() as *const u8;
+                    for i in 0..match_count {
+                        let off = i * 52;
+                        let mut key_bytes = [0u8; 4];
+                        std::ptr::copy_nonoverlapping(ptr.add(off), key_bytes.as_mut_ptr(), 4);
+                        
+                        let type_byte = *ptr.add(off + 4);
+                        let match_type = match MatchType::from_u8(type_byte) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        
+                        let mut hash_bytes = [0u8; 20];
+                        std::ptr::copy_nonoverlapping(ptr.add(off + 32), hash_bytes.as_mut_ptr(), 20);
+                        
+                        matches.push(PotentialMatch {
+                            key_index: u32::from_le_bytes(key_bytes),
+                            match_type,
+                            hash: Hash160::from_slice(&hash_bytes),
+                        });
+                    }
                 }
             }
         }

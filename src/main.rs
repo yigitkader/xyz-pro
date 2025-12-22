@@ -390,6 +390,38 @@ fn run_self_test() -> bool {
         }
     }
     
+    // Test 6: GLV Y coordinate preservation test
+    // CRITICAL: Verifies that GLV endomorphism preserves Y coordinate
+    // GLV: φ(x, y) = (β·x mod p, y) - Y should remain unchanged
+    {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::SecretKey;
+        
+        let test_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000005")
+            .unwrap().try_into().unwrap();
+        
+        let glv_key = gpu::glv_transform_key(&test_key);
+        
+        let orig_secret = SecretKey::from_slice(&test_key).unwrap();
+        let orig_pubkey = orig_secret.public_key();
+        let orig_point = orig_pubkey.to_encoded_point(false);
+        let orig_y = &orig_point.as_bytes()[33..65];
+        
+        let glv_secret = SecretKey::from_slice(&glv_key).unwrap();
+        let glv_pubkey = glv_secret.public_key();
+        let glv_point = glv_pubkey.to_encoded_point(false);
+        let glv_y = &glv_point.as_bytes()[33..65];
+        
+        if orig_y == glv_y {
+            println!("  [✓] GLV preserves Y coordinate (φ(P).y = P.y)");
+        } else {
+            eprintln!("  [✗] GLV Y coordinate mismatch!");
+            eprintln!("      Original Y: {}", hex::encode(orig_y));
+            eprintln!("      GLV Y:      {}", hex::encode(glv_y));
+            all_passed = false;
+        }
+    }
+    
     // ========================================================================
     // WINDOWED STEP TABLE TEST
     // Verify the 5-window × 15-digit precomputation is correct
@@ -462,7 +494,7 @@ fn run_self_test() -> bool {
 /// CRITICAL GPU CORRECTNESS TEST
 /// Verifies that GPU computes EXACTLY the same hashes as CPU
 /// A single bit error here means missed matches!
-fn run_gpu_correctness_test(scanner: &OptimizedScanner, _targets: &TargetDatabase) -> bool {
+fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase) -> bool {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use k256::SecretKey;
     
@@ -507,6 +539,48 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, _targets: &TargetDatabas
         }
     }
     println!("  [✓] CPU reference calculations verified");
+    
+    // Xor Filter false positive rate test (if enabled)
+    #[cfg(feature = "xor-filter")]
+    {
+        use crate::filter::XorFilter16;
+        use rand::Rng;
+        
+        println!("  [🔍] Testing Xor Filter false positive rate...");
+        
+        // Get all target hashes (already returns Vec<[u8; 20]>)
+        let target_vec = targets.get_all_hashes();
+        
+        // Create Xor filter from targets
+        let xor_filter = XorFilter16::new(&target_vec);
+        
+        // Test 100k random non-member keys
+        let mut fp_count = 0;
+        let mut rng = rand::thread_rng();
+        let test_count = 100_000;
+        
+        for _ in 0..test_count {
+            let mut random_hash = [0u8; 20];
+            rng.fill(&mut random_hash);
+            
+            // Check if it's NOT in targets but filter says it is (false positive)
+            let in_targets = target_vec.iter().any(|&h| h == random_hash);
+            if !in_targets && xor_filter.contains(&random_hash) {
+                fp_count += 1;
+            }
+        }
+        
+        let fp_rate = fp_count as f64 / test_count as f64;
+        println!("  [Xor] False positive rate: {:.4}% ({}/{} FP)", 
+            fp_rate * 100.0, fp_count, test_count);
+        
+        if fp_rate < 0.004 {
+            println!("  [✓] Xor Filter FP rate acceptable (<0.4%)");
+        } else {
+            eprintln!("  [✗] Xor Filter FP rate too high: {:.4}% (expected <0.4%)", fp_rate * 100.0);
+            all_passed = false;
+        }
+    }
     
     // Now test GPU: scan a batch and verify GPU hashes match CPU
     println!("  [🔍] Testing GPU hash calculations...");
@@ -1248,7 +1322,7 @@ fn run_pipelined(
                         });
                         
                         // PID controller adjusts speed based on actual temperature
-                        if let Some(new_batch) = pid_controller.update(current_temp) {
+                        if let Some(_new_batch) = pid_controller.update(current_temp) {
                             let speed = pid_controller.current_speed();
                             if (speed - 1.0).abs() > 0.05 {
                                 eprintln!("[PID] Speed: {:.1}% (temp: {:.1}°C)", 

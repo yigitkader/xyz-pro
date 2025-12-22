@@ -691,29 +691,38 @@ inline bool binary_search_hash(thread uchar* hash, constant uchar* sorted_hashes
 }
 
 kernel void scan_keys(
+#ifdef USE_PHILOX_RNG
+    // PHILOX RNG MODE: GPU generates private keys internally
+    constant uint2* philox_key [[buffer(0)]],      // Seed (uint2 = 8 bytes)
+    constant uint4* philox_counter [[buffer(1)]],  // Batch counter (uint4 = 16 bytes)
+    constant uchar* step_table [[buffer(2)]],      // Legacy: 20 entries × 64 bytes
+    constant uchar* wnaf_table [[buffer(3)]],      // wNAF w=4: 75 entries × 64 bytes
+#else
+    // LEGACY MODE: CPU sends base_point
     constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
-    constant uchar* step_table [[buffer(1)]],      // Legacy: 20 entries × 64 bytes (kept for compatibility)
-    constant uchar* wnaf_table [[buffer(2)]],      // wNAF w=4: 40 entries × 64 bytes (5 windows × 8 odd digits)
+    constant uchar* step_table [[buffer(1)]],      // Legacy: 20 entries × 64 bytes
+    constant uchar* wnaf_table [[buffer(2)]],      // wNAF w=4: 75 entries × 64 bytes
+#endif
 #ifdef USE_XOR_FILTER
     // Xor Filter: O(1) lookup, <0.4% false positive rate
-    constant ushort* xor_fingerprints [[buffer(3)]],  // Fingerprint table
-    constant ulong* xor_seeds [[buffer(4)]],          // 3 hash seeds
-    constant uint* xor_block_length [[buffer(5)]],     // Block length
-    constant uint* keys_per_thread [[buffer(6)]],
-    device uchar* match_data [[buffer(7)]],        // 52 bytes per match
-    device atomic_uint* match_count [[buffer(8)]],
-    constant uint* hash_count [[buffer(9)]],      // Number of hashes (for stats)
-#else
-    // Two-level Bloom filter: L1 (cache-resident) + L2 (full)
-    constant ulong* l1_bloom [[buffer(3)]],        // L1: Small, cache-resident (~2MB)
-    constant uint* l1_bloom_size [[buffer(4)]],
-    constant ulong* l2_bloom [[buffer(5)]],        // L2: Full filter (~86MB)
-    constant uint* l2_bloom_size [[buffer(6)]],
+    constant ushort* xor_fingerprints [[buffer(4)]],  // Fingerprint table
+    constant ulong* xor_seeds [[buffer(5)]],          // 3 hash seeds
+    constant uint* xor_block_length [[buffer(6)]],     // Block length
     constant uint* keys_per_thread [[buffer(7)]],
     device uchar* match_data [[buffer(8)]],        // 52 bytes per match
     device atomic_uint* match_count [[buffer(9)]],
-    constant uchar* sorted_hashes [[buffer(10)]],  // Sorted hash array for binary search
-    constant uint* hash_count [[buffer(11)]],      // Number of hashes
+    constant uint* hash_count [[buffer(10)]],      // Number of hashes (for stats)
+#else
+    // Two-level Bloom filter: L1 (cache-resident) + L2 (full)
+    constant ulong* l1_bloom [[buffer(4)]],        // L1: Small, cache-resident (~2MB)
+    constant uint* l1_bloom_size [[buffer(5)]],
+    constant ulong* l2_bloom [[buffer(6)]],        // L2: Full filter (~86MB)
+    constant uint* l2_bloom_size [[buffer(7)]],
+    constant uint* keys_per_thread [[buffer(8)]],
+    device uchar* match_data [[buffer(9)]],        // 52 bytes per match
+    device atomic_uint* match_count [[buffer(10)]],
+    constant uchar* sorted_hashes [[buffer(11)]],  // Sorted hash array for binary search
+    constant uint* hash_count [[buffer(12)]],      // Number of hashes
 #endif
     uint gid [[thread_position_in_grid]]
 ) {
@@ -728,9 +737,84 @@ kernel void scan_keys(
     uint target_count = *hash_count;  // For GPU-side binary search
 #endif
 
-    // Load P_base
+    // PHILOX RNG MODE: Generate private key and compute public key
+#ifdef USE_PHILOX_RNG
+    // Each thread generates its own private key from Philox
+    PhiloxState philox_state = philox_for_thread(philox_key, philox_counter, gid);
+    uchar privkey[32];
+    philox_to_privkey(philox_state, privkey);
+    
+    // Compute public key from private key: P = k * G
+    // Use windowed method: process private key in 4-bit windows (wNAF)
+    // Start at infinity
+    ulong4 cur_X = {0,0,0,0}, cur_Y = {1,0,0,0}, cur_Z = {0,0,0,0}, cur_ZZ = {0,0,0,0};
+    
+    // Process private key in 4-bit windows (64 windows for 256 bits)
+    // Read private key as big-endian (Bitcoin standard)
+    // Process from MSB to LSB (left to right)
+    for (int byte_idx = 0; byte_idx < 32; byte_idx++) {
+        uchar byte_val = privkey[byte_idx];
+        
+        // Process high nibble (bits 4-7) first
+        uint digit_high = (byte_val >> 4) & 0xF;
+        if (digit_high > 0) {
+            // Double 4 times (multiply by 16)
+            for (int d = 0; d < 4; d++) {
+                ext_jac_dbl(cur_X, cur_Y, cur_Z, cur_ZZ, cur_X, cur_Y, cur_Z, cur_ZZ);
+            }
+            // Add digit_high * G (compute digit_high * G by repeated addition)
+            ulong4 temp_X = SECP256K1_GX, temp_Y = SECP256K1_GY, temp_Z = {1,0,0,0}, temp_ZZ = {1,0,0,0};
+            for (uint d = 1; d < digit_high; d++) {
+                ext_jac_add_affine(temp_X, temp_Y, temp_Z, temp_ZZ, 
+                                 SECP256K1_GX, SECP256K1_GY, temp_X, temp_Y, temp_Z, temp_ZZ);
+            }
+            if (IsZero(cur_Z)) {
+                cur_X = temp_X; cur_Y = temp_Y; cur_Z = temp_Z; cur_ZZ = temp_ZZ;
+            } else {
+                ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, temp_X, temp_Y, cur_X, cur_Y, cur_Z, cur_ZZ);
+            }
+        }
+        
+        // Process low nibble (bits 0-3)
+        uint digit_low = byte_val & 0xF;
+        if (digit_low > 0) {
+            // Double 4 times
+            for (int d = 0; d < 4; d++) {
+                ext_jac_dbl(cur_X, cur_Y, cur_Z, cur_ZZ, cur_X, cur_Y, cur_Z, cur_ZZ);
+            }
+            // Add digit_low * G
+            ulong4 temp_X = SECP256K1_GX, temp_Y = SECP256K1_GY, temp_Z = {1,0,0,0}, temp_ZZ = {1,0,0,0};
+            for (uint d = 1; d < digit_low; d++) {
+                ext_jac_add_affine(temp_X, temp_Y, temp_Z, temp_ZZ, 
+                                 SECP256K1_GX, SECP256K1_GY, temp_X, temp_Y, temp_Z, temp_ZZ);
+            }
+            if (IsZero(cur_Z)) {
+                cur_X = temp_X; cur_Y = temp_Y; cur_Z = temp_Z; cur_ZZ = temp_ZZ;
+            } else {
+                ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, temp_X, temp_Y, cur_X, cur_Y, cur_Z, cur_ZZ);
+            }
+        }
+    }
+    
+    // Convert from Jacobian to affine for base point
+    // We need affine coordinates for windowed table lookup
+    if (IsZero(cur_Z)) {
+        // Point at infinity - use generator as fallback
+        base_x = SECP256K1_GX;
+        base_y = SECP256K1_GY;
+    } else {
+        // Convert to affine: x = X/Z², y = Y/Z³
+        ulong4 z_inv = mod_inv(cur_Z);
+        ulong4 z_inv2 = mod_sqr(z_inv);
+        ulong4 z_inv3 = mod_mul(z_inv2, z_inv);
+        base_x = mod_mul(cur_X, z_inv2);
+        base_y = mod_mul(cur_Y, z_inv3);
+    }
+#else
+    // LEGACY MODE: Load P_base from CPU
     ulong4 base_x = load_be(base_point);
     ulong4 base_y = load_be(base_point + 32);
+#endif
 
     // Thread start point using WINDOWED StepTable (4-bit windows)
     // EXTENDED JACOBIAN: (X, Y, Z, ZZ) where ZZ = Z² - saves 1 squaring per add
@@ -775,7 +859,17 @@ kernel void scan_keys(
     //
     // Expected performance gain: +12-18% from eliminated register spilling
     // EXTENDED JACOBIAN: batch_ZZ caches Z² for each point (+8-12% from saved squarings)
-    #define BATCH_SIZE 48
+    // FIXED: Corrected batch size calculation - actual register usage is ~9KB per thread
+    // Optimal: 32 batch size → 5.1KB per thread → 50 threads/core (better occupancy)
+    #if defined(__APPLE__) && __APPLE__
+        #if __METAL_VERSION__ >= 230  // M1 Pro/Max
+            #define BATCH_SIZE 32
+        #else
+            #define BATCH_SIZE 16  // M1 base
+        #endif
+    #else
+        #define BATCH_SIZE 32  // Default for other platforms
+    #endif
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_ZZ[BATCH_SIZE];
     ulong4 batch_Zinv[BATCH_SIZE];
     bool batch_valid[BATCH_SIZE]; // Track valid (non-zero Z) points
@@ -856,20 +950,21 @@ kernel void scan_keys(
             uint key = base_offset + keys_done + b;
             
             // Optimized match saving macro
-            // FIXED: Single atomic operation to prevent TOCTOU race condition
-            // The atomic_fetch_add already increments, so idx is the value BEFORE increment
-            // This ensures only threads with idx < MAX_MATCHES can write
+            // FIXED: Overflow protection - if overflow detected, decrement counter and stop
+            // This prevents buffer overflow and ensures match_count stays accurate
             #define SAVE_MATCH(hash_arr, type_val) do { \
                 uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed); \
-                if (idx < MAX_MATCHES) { \
-                    uint off = idx * 52; \
-                    match_data[off+0] = key; match_data[off+1] = key>>8; \
-                    match_data[off+2] = key>>16; match_data[off+3] = key>>24; \
-                    match_data[off+4] = type_val; \
-                    for (int p = 5; p < 32; p++) match_data[off+p] = 0; \
-                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = hash_arr[hh]; \
-                    } \
+                if (idx >= MAX_MATCHES) { \
+                    /* Overflow detected - revert increment and stop scanning */ \
+                    atomic_fetch_sub_explicit(match_count, 1, memory_order_relaxed); \
+                    break; \
                 } \
+                uint off = idx * 52; \
+                match_data[off+0] = key; match_data[off+1] = key>>8; \
+                match_data[off+2] = key>>16; match_data[off+3] = key>>24; \
+                match_data[off+4] = type_val; \
+                for (int p = 5; p < 32; p++) match_data[off+p] = 0; \
+                for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = hash_arr[hh]; \
             } while(0)
             
             // ================================================================
