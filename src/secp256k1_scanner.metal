@@ -616,21 +616,16 @@ void ripemd160_32(thread const uchar* data, thread uchar* hash) {
     uint t = h1+cl+dr; h1 = h2+dl+er; h2 = h3+el+ar; h3 = h4+al+br; h4 = h0+bl+cr; h0 = t;
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // CRITICAL FIX: RIPEMD160 output must be BIG-ENDIAN (Bitcoin standard)
+    // LITTLE-ENDIAN output (matches Rust ripemd crate)
     // ═══════════════════════════════════════════════════════════════════════════
-    // PREVIOUS BUG: Little-Endian output caused "0 FP" (zero false positives)
-    //   hash[0]=h0; hash[1]=h0>>8; ...  ← WRONG! MSB at end
-    //
-    // Bitcoin RIPEMD160 spec: Most Significant Byte (MSB) first
-    // Example for key=1: h0=0x751e76e8 → hash[0..4] = [0x75, 0x1e, 0x76, 0xe8]
-    //
-    // This fix enables proper prefix matching with XorFilter and CPU verification
+    // Rust's ripemd crate outputs in little-endian format.
+    // GPU must match CPU for hash verification to work.
     // ═══════════════════════════════════════════════════════════════════════════
-    hash[0]=h0>>24; hash[1]=h0>>16; hash[2]=h0>>8; hash[3]=h0;
-    hash[4]=h1>>24; hash[5]=h1>>16; hash[6]=h1>>8; hash[7]=h1;
-    hash[8]=h2>>24; hash[9]=h2>>16; hash[10]=h2>>8; hash[11]=h2;
-    hash[12]=h3>>24; hash[13]=h3>>16; hash[14]=h3>>8; hash[15]=h3;
-    hash[16]=h4>>24; hash[17]=h4>>16; hash[18]=h4>>8; hash[19]=h4;
+    hash[0]=h0; hash[1]=h0>>8; hash[2]=h0>>16; hash[3]=h0>>24;
+    hash[4]=h1; hash[5]=h1>>8; hash[6]=h1>>16; hash[7]=h1>>24;
+    hash[8]=h2; hash[9]=h2>>8; hash[10]=h2>>16; hash[11]=h2>>24;
+    hash[12]=h3; hash[13]=h3>>8; hash[14]=h3>>16; hash[15]=h3>>24;
+    hash[16]=h4; hash[17]=h4>>8; hash[18]=h4>>16; hash[19]=h4>>24;
 }
 
 void hash160_comp(ulong4 px, ulong4 py, thread uchar* out) {
