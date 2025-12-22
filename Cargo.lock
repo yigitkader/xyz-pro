@@ -1085,6 +1085,7 @@ dependencies = [
  "hex",
  "k256",
  "lazy_static",
+ "libc",
  "memmap2",
  "metal",
  "rand",

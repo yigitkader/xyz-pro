@@ -40,6 +40,10 @@ ctrlc = "3.4"
 fxhash = "0.2"
 lazy_static = "1.4"
 
+# System (macOS native calls - no fork overhead)
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["philox-rng", "xor-filter", "pid-thermal", "zero-copy"]  # Ultimate system enabled by default
 
