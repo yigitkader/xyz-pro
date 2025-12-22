@@ -150,10 +150,12 @@ impl GpuConfig {
             )
         } else {
             println!("[GPU] Detected: Base chip (7-10 cores)");
+            // Smaller threadgroup (64) for register-heavy secp256k1 kernel
+            // Even on base M1, 64 improves occupancy vs 256
             (
                 65_536,
                 128,
-                256.min(max_threadgroup),
+                64.min(max_threadgroup),  // 64 for better occupancy
                 524_288,
             )
         }
