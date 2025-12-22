@@ -641,10 +641,23 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
             
             if failed_count == 0 && verified_count > 0 {
                 println!("  [✓] Verified {}/{} GPU hashes match CPU exactly", verified_count, check_limit);
-            } else if verified_count == 0 {
-                // No matches is OK - test hashes might not be in target database
-                // This doesn't mean GPU calculations are wrong!
-                println!("  [⚠] No Xor Filter matches in test batch (test hashes not in targets.bin - this is OK)");
+            } else if matches.is_empty() {
+                // CRITICAL CHECK: With 8.4M keys and 0.15% Xor filter FP rate,
+                // we SHOULD get ~12,600 false positives per batch!
+                // 0 matches means Xor filter or FxHash is broken.
+                //
+                // Expected: keys_per_batch × 0.0015 × 6 (hash variants) = ~75,000 matches
+                // Minimum reasonable: at least 1,000 matches
+                //
+                // If we get 0, the GPU FxHash doesn't match CPU FxHasher!
+                let keys_per_batch = scanner.keys_per_batch();
+                let expected_fp = (keys_per_batch as f64 * 0.0015 * 6.0) as u64;
+                
+                eprintln!("  [✗] CRITICAL: Got 0 Xor Filter matches!");
+                eprintln!("      Expected ~{} false positives with {} keys/batch", expected_fp, keys_per_batch);
+                eprintln!("      This indicates GPU FxHash doesn't match CPU FxHasher!");
+                eprintln!("      Check: src/filter/xor_lookup.metal must match src/filter/xor_filter.rs");
+                all_passed = false;
             }
         }
         Err(e) => {
@@ -728,8 +741,13 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
                 }
             }
         } else {
+            // This shouldn't happen if the first scan returned matches
+            // If both scans return 0 matches, something is seriously wrong
             println!("done ({:.2}s)", verify_start.elapsed().as_secs_f64());
-            println!("  [⚠] No matches to verify (Xor Filter32 may not contain test hashes)");
+            eprintln!("  [✗] CRITICAL: No matches for verification!");
+            eprintln!("      Both GPU scans returned 0 matches.");
+            eprintln!("      GPU Xor Filter or FxHash implementation is broken!");
+            all_passed = false;
         }
     }
     
@@ -852,41 +870,45 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
         }
     }
     
-    // Test 2: Verify double-buffering doesn't cause data corruption
-    // Run two batches with known keys and verify results are consistent
-    print!("  [🔍] Testing double-buffer consistency... ");
+    // Test 2: Verify triple-buffering doesn't cause data corruption
+    // Run multiple batches and verify no GPU errors occur
+    // NOTE: Same base_key produces DIFFERENT matches each call because
+    // Philox counter advances, generating different key offsets each batch!
+    print!("  [🔍] Testing triple-buffer stability... ");
     stdout().flush().ok();
-    let double_buf_start = Instant::now();
+    let triple_buf_start = Instant::now();
     
-    let test_key_a: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
-        .unwrap().try_into().unwrap();
-    let test_key_b: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000100000000000000000001")
+    let test_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
         .unwrap().try_into().unwrap();
     
-    // Run same keys twice and verify consistent results
-    let result_a1 = scanner.scan_batch(&test_key_a);
-    let result_b1 = scanner.scan_batch(&test_key_b);
-    let result_a2 = scanner.scan_batch(&test_key_a);
-    let result_b2 = scanner.scan_batch(&test_key_b);
+    // Run 6 consecutive batches to cycle through all 3 buffers twice
+    // This tests buffer rotation and ensures no corruption between cycles
+    let mut total_matches = 0usize;
+    let mut all_scans_ok = true;
     
-    match (result_a1, result_b1, result_a2, result_b2) {
-        (Ok(a1), Ok(b1), Ok(a2), Ok(b2)) => {
-            // Same keys should produce same match counts (Xor Filter32 is deterministic)
-            if a1.len() == a2.len() && b1.len() == b2.len() {
-                println!("done ({:.2}s)", double_buf_start.elapsed().as_secs_f64());
-            } else {
-                println!("FAILED ({:.2}s)", double_buf_start.elapsed().as_secs_f64());
-                eprintln!("  [✗] Double-buffer inconsistency detected!");
-                eprintln!("      Key A: {} vs {} matches", a1.len(), a2.len());
-                eprintln!("      Key B: {} vs {} matches", b1.len(), b2.len());
-                all_passed = false;
+    for i in 0..6 {
+        match scanner.scan_batch(&test_key) {
+            Ok(matches) => {
+                total_matches += matches.len();
+                // Basic sanity check: match count should be reasonable
+                // With 8.4M keys and ~0.15% FP rate × 6 hash types = ~75K max expected
+                if matches.len() > 100_000 {
+                    eprintln!("  [⚠] Batch {} returned unusually high match count: {}", i, matches.len());
+                }
+            }
+            Err(e) => {
+                eprintln!("  [✗] Batch {} failed: {}", i, e);
+                all_scans_ok = false;
             }
         }
-        _ => {
-            println!("FAILED ({:.2}s)", double_buf_start.elapsed().as_secs_f64());
-            eprintln!("  [✗] Double-buffer test failed with errors");
-            all_passed = false;
-        }
+    }
+    
+    if all_scans_ok {
+        println!("done ({:.2}s)", triple_buf_start.elapsed().as_secs_f64());
+        println!("      6 batches completed, {} total FP matches", total_matches);
+    } else {
+        println!("FAILED ({:.2}s)", triple_buf_start.elapsed().as_secs_f64());
+        all_passed = false;
     }
     
     if all_passed {

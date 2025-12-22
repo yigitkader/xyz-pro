@@ -815,19 +815,18 @@ impl OptimizedScanner {
         }
 
         cmd.commit();
+        
         Ok(())
     }
     
     fn wait_and_collect(&self, buf_idx: usize) -> Result<Vec<PotentialMatch>> {
         let buffers = &self.buffer_sets[buf_idx];
         
-        // ZERO-COPY OPTIMIZATION: Unified Memory with atomic operations
-        // M1 Pro's Unified Memory architecture handles synchronization automatically
-        // No explicit blit.synchronize_resource needed - atomic pointers are sufficient
-        // This eliminates ~5-10% overhead from unnecessary synchronization
-        
-        // Wait for GPU command to complete (but don't synchronize memory explicitly)
-        // Unified Memory ensures CPU sees GPU writes after command completion
+        // GPU SYNCHRONIZATION:
+        // Metal command buffers on the same queue execute in FIFO order.
+        // By committing an empty command buffer and waiting for it,
+        // we guarantee all previously committed commands are complete.
+        // This is the standard Metal pattern for CPU-GPU synchronization.
         let sync_cmd = buffers.queue.new_command_buffer();
         sync_cmd.commit();
         sync_cmd.wait_until_completed();
