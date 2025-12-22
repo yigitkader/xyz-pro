@@ -972,14 +972,10 @@ impl OptimizedScanner {
         }
 
         // BUFFER POOL: Get a buffer from pool, copy matches into it, return
-        // When caller drops it, we don't recover (simpler than Arc tracking)
-        // But pool provides initial buffers, reducing early allocation churn
-        let mut result = {
-            let mut pool = self.buffer_pool.lock().unwrap();
-            pool.pop().unwrap_or_else(|| Vec::with_capacity(self.config.match_buffer_size))
-        };
-        result.clear();
-        result.extend(matches.iter().cloned());
+        // FIXED: Don't use pool - it causes memory leak because Vec is never returned!
+        // Each batch creates ~26MB (512K * 52 bytes) that accumulates.
+        // Simple solution: just clone the data and let Rust handle deallocation.
+        let result: Vec<PotentialMatch> = matches.iter().cloned().collect();
         
         // Clear the internal buffer (keeps capacity for next batch)
         matches.clear();

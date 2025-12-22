@@ -616,16 +616,20 @@ void ripemd160_32(thread const uchar* data, thread uchar* hash) {
     uint t = h1+cl+dr; h1 = h2+dl+er; h2 = h3+el+ar; h3 = h4+al+br; h4 = h0+bl+cr; h0 = t;
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // LITTLE-ENDIAN output (matches Rust ripemd crate)
+    // BIG-ENDIAN output (Bitcoin standard)
     // ═══════════════════════════════════════════════════════════════════════════
-    // Rust's ripemd crate outputs in little-endian format.
-    // GPU must match CPU for hash verification to work.
+    // Bitcoin uses big-endian for hash160 (RIPEMD160 result).
+    // Example: key=1 → hash160 = 751e76e8199196d454941c45d1b3a323f1433bd6
+    // This means h0=0x751e76e8 → bytes [0x75, 0x1e, 0x76, 0xe8]
+    // 
+    // CRITICAL: targets.bin contains hashes from Bitcoin addresses (big-endian)
+    // GPU must output big-endian to match XorFilter lookups!
     // ═══════════════════════════════════════════════════════════════════════════
-    hash[0]=h0; hash[1]=h0>>8; hash[2]=h0>>16; hash[3]=h0>>24;
-    hash[4]=h1; hash[5]=h1>>8; hash[6]=h1>>16; hash[7]=h1>>24;
-    hash[8]=h2; hash[9]=h2>>8; hash[10]=h2>>16; hash[11]=h2>>24;
-    hash[12]=h3; hash[13]=h3>>8; hash[14]=h3>>16; hash[15]=h3>>24;
-    hash[16]=h4; hash[17]=h4>>8; hash[18]=h4>>16; hash[19]=h4>>24;
+    hash[0]=h0>>24; hash[1]=h0>>16; hash[2]=h0>>8; hash[3]=h0;
+    hash[4]=h1>>24; hash[5]=h1>>16; hash[6]=h1>>8; hash[7]=h1;
+    hash[8]=h2>>24; hash[9]=h2>>16; hash[10]=h2>>8; hash[11]=h2;
+    hash[12]=h3>>24; hash[13]=h3>>16; hash[14]=h3>>8; hash[15]=h3;
+    hash[16]=h4>>24; hash[17]=h4>>16; hash[18]=h4>>8; hash[19]=h4;
 }
 
 void hash160_comp(ulong4 px, ulong4 py, thread uchar* out) {
@@ -712,19 +716,28 @@ inline bool prefix_exists(thread uchar* hash,
 
 // Combined filter check with prefix verification
 // Returns true only if BOTH Xor filter AND prefix check pass
+//
+// DEBUG: Set to 1 to bypass prefix check and isolate XorFilter issues
+#define BYPASS_PREFIX_CHECK 1
+
 inline bool filter_check_with_prefix(thread uchar* h,
                                      constant uint* xor_fingerprints,
                                      constant ulong* xor_seeds,
                                      uint xor_block_length,
                                      constant uint* prefix_table,
                                      uint prefix_count) {
-    // First: fast Xor filter check (O(1))
+#if BYPASS_PREFIX_CHECK
+    // DEBUG MODE: Only check Xor filter, skip prefix check
+    // If FP starts appearing, problem is in prefix_exists()
+    // If still 0 FP, problem is in xor_filter_contains() or FxHash
+    return xor_filter_contains(h, xor_fingerprints, xor_seeds, xor_block_length);
+#else
+    // PRODUCTION: Full check (Xor filter + prefix)
     if (!xor_filter_contains(h, xor_fingerprints, xor_seeds, xor_block_length)) {
         return false;
     }
-    
-    // Second: prefix table check (O(log n)) - only if Xor filter passed
     return prefix_exists(h, prefix_table, prefix_count);
+#endif
 }
 
 // ============================================================================
