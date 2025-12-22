@@ -614,11 +614,23 @@ void ripemd160_32(thread const uchar* data, thread uchar* hash) {
         ar=er; er=dr; dr=rotl32(cr,10); cr=br; br=tr;
     }
     uint t = h1+cl+dr; h1 = h2+dl+er; h2 = h3+el+ar; h3 = h4+al+br; h4 = h0+bl+cr; h0 = t;
-    hash[0]=h0; hash[1]=h0>>8; hash[2]=h0>>16; hash[3]=h0>>24;
-    hash[4]=h1; hash[5]=h1>>8; hash[6]=h1>>16; hash[7]=h1>>24;
-    hash[8]=h2; hash[9]=h2>>8; hash[10]=h2>>16; hash[11]=h2>>24;
-    hash[12]=h3; hash[13]=h3>>8; hash[14]=h3>>16; hash[15]=h3>>24;
-    hash[16]=h4; hash[17]=h4>>8; hash[18]=h4>>16; hash[19]=h4>>24;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL FIX: RIPEMD160 output must be BIG-ENDIAN (Bitcoin standard)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PREVIOUS BUG: Little-Endian output caused "0 FP" (zero false positives)
+    //   hash[0]=h0; hash[1]=h0>>8; ...  ← WRONG! MSB at end
+    //
+    // Bitcoin RIPEMD160 spec: Most Significant Byte (MSB) first
+    // Example for key=1: h0=0x751e76e8 → hash[0..4] = [0x75, 0x1e, 0x76, 0xe8]
+    //
+    // This fix enables proper prefix matching with XorFilter and CPU verification
+    // ═══════════════════════════════════════════════════════════════════════════
+    hash[0]=h0>>24; hash[1]=h0>>16; hash[2]=h0>>8; hash[3]=h0;
+    hash[4]=h1>>24; hash[5]=h1>>16; hash[6]=h1>>8; hash[7]=h1;
+    hash[8]=h2>>24; hash[9]=h2>>16; hash[10]=h2>>8; hash[11]=h2;
+    hash[12]=h3>>24; hash[13]=h3>>16; hash[14]=h3>>8; hash[15]=h3;
+    hash[16]=h4>>24; hash[17]=h4>>16; hash[18]=h4>>8; hash[19]=h4;
 }
 
 void hash160_comp(ulong4 px, ulong4 py, thread uchar* out) {
@@ -855,24 +867,34 @@ kernel void scan_keys(
     //   - No data sharing needed - each thread processes different keys
     //   - Montgomery batch inversion is per-thread operation
     //
-    // REGISTER PRESSURE ANALYSIS (M1 Pro) - CORRECTED:
-    //   Previous: 24 batch → 4.6KB/thread → 55 threads/core (REGISTER SPILLING!)
-    //   
-    //   Full calculation for BATCH_SIZE = 24:
-    //     - batch_X/Y/Z/ZZ/Zinv: 24 × 32 × 5 = 3840 bytes
-    //     - batch_valid: 24 × 1 = 24 bytes
-    //     - products: 24 × 32 = 768 bytes
-    //     - product_map: 24 × 4 = 96 bytes
-    //     - TOTAL: 4728 bytes = 4.6KB → REGISTER SPILLING!
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REGISTER PRESSURE ANALYSIS - M1 SERIES OPTIMIZATION
+    // ═══════════════════════════════════════════════════════════════════════════
     //
-    //   FIXED: BATCH_SIZE = 20 → 3.9KB/thread → 65 threads/core ✓
-    //     - 20 × 32 × 5 = 3200 bytes
-    //     - 20 + 640 + 80 = 740 bytes overhead
-    //     - TOTAL: 3940 bytes = 3.9KB → NO SPILLING!
+    // Per-batch-entry memory usage:
+    //   - batch_X/Y/Z/ZZ/Zinv: 5 × 32 bytes = 160 bytes
+    //   - batch_valid: 1 byte
+    //   - products: 32 bytes
+    //   - product_map: 4 bytes
+    //   - TOTAL: ~197 bytes per batch entry
     //
-    // PERFORMANCE: +10-15% from better occupancy (65 vs 55 threads/core)
-    // ============================================================================
-    #define BATCH_SIZE 20  // Optimal for M1 Pro: no register spilling
+    // M1 Base (7-8 GPU cores, shared memory bandwidth):
+    //   BATCH_SIZE = 16 → 16 × 197 = 3.2KB/thread → 80 threads/core ✓
+    //   - Conservative to prevent register spilling
+    //   - Leaves headroom for system processes
+    //
+    // M1 Pro (14-16 GPU cores):
+    //   BATCH_SIZE = 20 → 20 × 197 = 3.9KB/thread → 65 threads/core ✓
+    //   - Balanced for performance without spilling
+    //
+    // M1 Max/Ultra (24-64 GPU cores):
+    //   BATCH_SIZE = 24 → 24 × 197 = 4.7KB/thread → 54 threads/core
+    //   - Can afford more due to higher core count
+    //
+    // CURRENT: BATCH_SIZE = 16 (M1 Base optimized - most conservative)
+    // For M1 Pro/Max, change to 20/24 respectively for +10-20% throughput
+    // ═══════════════════════════════════════════════════════════════════════════
+    #define BATCH_SIZE 16  // Optimized for M1 Base: no register spilling
     
     // Thread-local arrays (each thread has its own copy in registers)
     ulong4 batch_X[BATCH_SIZE];

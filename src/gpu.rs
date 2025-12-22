@@ -9,9 +9,13 @@ use crate::rng::philox::{PhiloxCounter, philox_to_privkey};
 use crate::filter::XorFilter32;
 
 /// GPU-CPU sync constant for batch size
-/// CRITICAL: This MUST match BATCH_SIZE in secp256k1_scanner.metal:1039
+/// CRITICAL: This MUST match BATCH_SIZE in secp256k1_scanner.metal
 /// If Metal shader changes BATCH_SIZE, update this value!
-pub const GPU_BATCH_SIZE: u32 = 20;
+/// 
+/// M1 Base optimized: 16 (prevents register spilling on 7-8 core GPUs)
+/// M1 Pro alternative: 20 (for 14-16 core GPUs, change in .metal too!)
+/// M1 Max alternative: 24 (for 24+ core GPUs, change in .metal too!)
+pub const GPU_BATCH_SIZE: u32 = 16;
 
 /// GPU configuration profile
 #[derive(Debug, Clone)]
@@ -154,38 +158,49 @@ impl GpuConfig {
         //   M3:     10 GPU cores,  8-24GB, 4P+4E CPU
         //   M4:     10 GPU cores, 16-32GB, 6P+4E CPU
         //
-        // Conservative thread formula: cores × 2048 (16K-20K threads)
-        // ─────────────────────────────────────────────────────────────────
+        // ═══════════════════════════════════════════════════════════════
+        // M1 BASE OPTIMIZATION (from analiz.md)
+        // ═══════════════════════════════════════════════════════════════
+        // - threadgroup_size: 32 (M1 SIMD-width) for better occupancy
+        // - Fewer threads to prevent register spilling
+        // - BATCH_SIZE=16 in Metal shader (vs 20 for Pro)
+        // - Expected: 40-80 M/s on M1 Base 8GB
+        // ═══════════════════════════════════════════════════════════════
         else {
             let cores = detected_cores.unwrap_or(8);
             
+            // M1 Base specific: Use threadgroup_size=32 for SIMD efficiency
+            // 32 threads = 1 SIMD group = optimal for M1 Base GPU
+            let tg_size = 32.min(max_threadgroup);
+            
             let (threads, match_buffer) = if memory_mb >= 24000 {
-                // M2/M3/M4 with 24-32GB: slightly more aggressive
+                // M2/M3/M4 with 24-32GB: moderate settings
                 println!("[GPU] Detected: BASE chip with {}GB ({} GPU cores)", memory_mb / 1024, cores);
                 (
-                    (cores * 3072).min(32_768),  // ~24K-30K threads
-                    262_144,
+                    (cores * 2048).min(24_576),  // ~16K-20K threads (reduced from 32K)
+                    196_608,                      // Reduced match buffer
                 )
             } else if memory_mb >= 16000 {
                 // M1/M2/M3 with 16GB: conservative to prevent freeze
                 println!("[GPU] Detected: BASE chip with 16GB ({} GPU cores)", cores);
                 (
-                    (cores * 2048).min(20_480),  // ~16K-20K threads
-                    196_608,
+                    (cores * 1536).min(16_384),  // ~12K-16K threads (reduced)
+                    131_072,                      // Smaller match buffer
                 )
             } else {
-                // 8GB systems: minimal
+                // 8GB systems: minimal - leave room for system
                 println!("[GPU] Detected: BASE chip with {}GB ({} GPU cores)", memory_mb / 1024, cores);
                 (
-                    (cores * 1024).min(12_288),  // ~8K-12K threads
-                    131_072,
+                    (cores * 1024).min(10_240),  // ~8K-10K threads
+                    65_536,                       // Minimal match buffer
                 )
             };
             
             println!("[GPU] BASE config: {} threads × 128 = {:.1}M keys/batch", 
                 threads, (threads * 128) as f64 / 1_000_000.0);
-            println!("[GPU] (Conservative to prevent system freeze)");
-            (threads, 128, 64.min(max_threadgroup), match_buffer)
+            println!("[GPU] threadgroup_size: {} (M1 SIMD-width optimized)", tg_size);
+            println!("[GPU] (Conservative to prevent system freeze & register spilling)");
+            (threads, 128, tg_size, match_buffer)
         }
     }
     
