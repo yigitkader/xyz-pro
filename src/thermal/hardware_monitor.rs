@@ -122,60 +122,30 @@ fn try_sysctl_temperature() -> Option<f32> {
 /// Estimate temperature from performance metrics
 /// Used as fallback when hardware reading is unavailable
 /// 
-/// IMPORTANT: This function uses a static moving average to handle
-/// the timing variations caused by triple buffering. Without smoothing,
-/// batch durations oscillate wildly (fast/slow/fast) causing impossible
-/// temperature readings like 30°C→110°C→30°C.
-pub fn estimate_temperature_from_performance(batch_duration_ms: u64, baseline_ms: u64) -> f32 {
-    use std::sync::atomic::{AtomicU64, Ordering};
+/// CRITICAL FIX: Performance-based estimation was causing a CIRCULAR DEPENDENCY:
+/// PID throttles → batch slows → estimator thinks "hot" → more throttling → slower → "hotter"
+/// 
+/// NEW APPROACH: 
+/// - Return a FIXED CONSERVATIVE temperature (75°C) when hardware reading unavailable
+/// - This keeps PID at 100% speed (no throttling)
+/// - Apple Silicon has excellent built-in thermal management - it will throttle itself
+/// - The PID controller should only be used with REAL temperature sensors
+/// 
+/// The batch_duration/baseline parameters are IGNORED because they cause feedback loops.
+#[allow(unused_variables)]
+pub fn estimate_temperature_from_performance(_batch_duration_ms: u64, _baseline_ms: u64) -> f32 {
+    use std::sync::atomic::{AtomicBool, Ordering};
     
-    // Static moving average state (thread-safe)
-    static SMOOTHED_DURATION_MS: AtomicU64 = AtomicU64::new(0);
-    static SMOOTHED_TEMP_X10: AtomicU64 = AtomicU64::new(700); // 70.0°C * 10 as starting point
-    
-    if baseline_ms == 0 {
-        return 70.0; // Safe neutral estimate
+    // Only warn once about fallback mode
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("[PID] Hardware temperature unavailable - using safe fixed estimate (75°C)");
+        eprintln!("[PID] Apple Silicon thermal management will handle throttling if needed");
     }
     
-    // EMA (Exponential Moving Average) for batch duration
-    // α = 0.1 (slow adaptation to avoid oscillation)
-    let prev_smoothed = SMOOTHED_DURATION_MS.load(Ordering::Relaxed);
-    let new_smoothed = if prev_smoothed == 0 {
-        batch_duration_ms
-    } else {
-        // EMA: new = α * current + (1-α) * previous
-        // Using integer math: new = (current + 9 * previous) / 10
-        (batch_duration_ms + 9 * prev_smoothed) / 10
-    };
-    SMOOTHED_DURATION_MS.store(new_smoothed, Ordering::Relaxed);
-    
-    // Calculate ratio from smoothed duration
-    let ratio = new_smoothed as f32 / baseline_ms as f32;
-    
-    // Temperature model:
-    // - ratio < 0.8: GPU is cool (faster than baseline) → 50-60°C
-    // - ratio ~ 1.0: GPU is at normal operating temp → 65-75°C
-    // - ratio > 1.2: GPU is throttling → 80-90°C
-    // - ratio > 1.5: GPU is heavily throttled → 90-100°C
-    let raw_temp = if ratio < 0.8 {
-        55.0 // Cool - running faster than baseline
-    } else if ratio < 1.05 {
-        // Normal range: 60-75°C
-        60.0 + (ratio - 0.8) * 60.0 // 60 + 0.25*60 = 75 at ratio=1.05
-    } else if ratio < 1.3 {
-        // Warm: 75-85°C  
-        75.0 + (ratio - 1.05) * 40.0 // 75 + 0.25*40 = 85 at ratio=1.3
-    } else {
-        // Hot/throttling: 85-100°C
-        85.0 + (ratio - 1.3) * 30.0
-    };
-    
-    // Apply EMA to temperature as well (even smoother output)
-    let prev_temp = SMOOTHED_TEMP_X10.load(Ordering::Relaxed) as f32 / 10.0;
-    let smoothed_temp = prev_temp * 0.8 + raw_temp * 0.2;
-    SMOOTHED_TEMP_X10.store((smoothed_temp * 10.0) as u64, Ordering::Relaxed);
-    
-    // Clamp to reasonable range
-    smoothed_temp.clamp(45.0, 100.0)
+    // Return fixed temperature that keeps PID at ~100% speed
+    // 75°C is well below the 87°C target, so PID won't throttle
+    // This effectively disables PID when hardware sensors aren't available
+    75.0
 }
 
