@@ -98,9 +98,10 @@ inline void philox_to_privkey(PhiloxState state, thread uchar* privkey) {
     privkey[14] = random1.w >> 8;
     privkey[15] = random1.w;
     
-    // Second 128 bits: increment counter for proper domain separation
-    // This ensures full 256-bit security (counter increment is more secure than XOR)
-    state.counter.x += 1;  // Overflow is handled naturally by uint32
+    // Second 128 bits: XOR domain separation (MUST MATCH Rust philox.rs!)
+    // CRITICAL: Using XOR 0xDEADBEEF for CPU/GPU synchronization
+    // Previous bug: GPU used += 1, CPU used ^= 0xDEADBEEF → different keys!
+    state.counter.x ^= 0xDEADBEEF;  // Domain separation - synced with Rust
     uint4 random2 = philox4x32_10(state);
     
     privkey[16] = random2.x >> 24;

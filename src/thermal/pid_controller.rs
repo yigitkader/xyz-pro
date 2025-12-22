@@ -5,9 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const INTEGRAL_WINDUP_LIMIT: f32 = 10.0;
 
 // Maximum temperature derivative to prevent spikes on cold start
-// Limits derivative term to ±3°C/s (realistic limit, prevents cold start spikes)
-// Previous: 10.0 was too high - 40°C→85°C cold start could produce 45°C/s derivative
-const MAX_DERIVATIVE_C_PER_S: f32 = 3.0;
+// FIXED: 3.0°C/s was too aggressive - normal cold start is 40°C→85°C in 10s = 4.5°C/s
+// This caused derivative term to be killed → PID only worked as P+I controller
+// 
+// 8.0°C/s allows:
+//   - Normal cold start transitions (4-5°C/s) ✓
+//   - Rapid workload changes (6-7°C/s) ✓
+//   - Prevents unrealistic spikes (>8°C/s) ✓
+// 
+// Combined with adaptive ramp-up (lines 91-102), this provides smooth control
+const MAX_DERIVATIVE_C_PER_S: f32 = 8.0;
 
 pub struct PIDController {
     target_temp: f32,

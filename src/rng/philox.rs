@@ -27,22 +27,45 @@ impl PhiloxState {
     }
     
     /// Increment counter (for next batch)
-    pub fn increment(&mut self, amount: u64) {
-        let low = self.counter[0] as u64 + amount;
+    /// Returns true if increment succeeded, false if 128-bit overflow occurred
+    /// 
+    /// CRITICAL: Proper carry propagation prevents key space collision
+    /// Without this, after ~2^32 batches the counter would wrap silently
+    /// causing the same keys to be generated again!
+    pub fn increment(&mut self, amount: u64) -> bool {
+        // Use wrapping_add to handle overflow explicitly
+        let low = (self.counter[0] as u64).wrapping_add(amount);
         self.counter[0] = low as u32;
-        let carry = low >> 32;
         
-        if carry > 0 {
-            let mid = self.counter[1] as u64 + carry;
-            self.counter[1] = mid as u32;
-            let carry2 = mid >> 32;
-            
-            if carry2 > 0 {
-                let high = self.counter[2] as u64 + carry2;
-                self.counter[2] = high as u32;
-                self.counter[3] = self.counter[3].wrapping_add((high >> 32) as u32);
-            }
+        // Propagate carry through all 128 bits
+        if low > u32::MAX as u64 {
+            let carry = low >> 32;
+            return self.increment_with_carry(1, carry);
         }
+        true
+    }
+    
+    /// Internal helper: propagate carry through counter[start_idx..4]
+    /// Returns false if 128-bit overflow occurred (counter wrapped around)
+    fn increment_with_carry(&mut self, start_idx: usize, mut carry: u64) -> bool {
+        for i in start_idx..4 {
+            if carry == 0 {
+                return true; // No more carry, done
+            }
+            
+            let sum = (self.counter[i] as u64).wrapping_add(carry);
+            self.counter[i] = sum as u32;
+            carry = sum >> 32;
+        }
+        
+        // If carry is still non-zero after processing all words,
+        // we've overflowed the full 128-bit counter
+        if carry > 0 {
+            eprintln!("[CRITICAL] Philox counter 128-bit overflow detected!");
+            eprintln!("           This means we've exhausted 2^128 keys - astronomically unlikely!");
+            return false;
+        }
+        true
     }
     
     /// Generate thread-specific state (for GPU)
