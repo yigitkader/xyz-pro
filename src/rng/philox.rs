@@ -148,10 +148,15 @@ impl PhiloxCounter {
     }
     
     /// Get state for next GPU batch
+    /// 
+    /// SAFETY: Panics if 128-bit counter overflows (after scanning 2^128 keys)
+    /// This is astronomically unlikely but ensures no silent key space wrap-around
     pub fn next_batch(&self, batch_size: u64) -> PhiloxState {
         let counter_val = self.counter.fetch_add(batch_size, Ordering::Relaxed);
         let mut state = PhiloxState::new(self.base_seed);
-        state.increment(counter_val);
+        if !state.increment(counter_val) {
+            panic!("[FATAL] Philox 128-bit counter overflow! Scanned 2^128 keys - this should never happen.");
+        }
         state
     }
     
