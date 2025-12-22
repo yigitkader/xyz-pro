@@ -21,6 +21,9 @@ mod thermal;
 #[cfg(feature = "zero-copy")]
 mod scanner;
 
+#[cfg(feature = "philox-rng")]
+mod tests;
+
 use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
@@ -1212,6 +1215,27 @@ fn main() {
     if !run_gpu_pipeline_test(&gpu) {
         eprintln!("\n[FATAL] GPU pipeline test failed. Exiting to prevent data corruption.");
         std::process::exit(1);
+    }
+    
+    // CRITICAL: Run comprehensive edge case tests
+    // These catch bugs in edge cases that normal tests might miss
+    #[cfg(feature = "philox-rng")]
+    {
+        use crate::tests::edge_cases;
+        if !edge_cases::run_all_edge_case_tests() {
+            eprintln!("\n[FATAL] Edge case tests failed. Exiting to prevent bugs.");
+            std::process::exit(1);
+        }
+    }
+    
+    // CRITICAL: Run CPU/GPU/Metal/Xor Filter integration tests
+    // Verifies all components work correctly together
+    {
+        use crate::tests::cpu_gpu_xor_integration;
+        if !cpu_gpu_xor_integration::run_cpu_gpu_xor_integration_tests(&gpu, &targets) {
+            eprintln!("\n[FATAL] CPU/GPU/Metal/Xor Filter integration tests failed. Exiting to prevent incorrect results.");
+            std::process::exit(1);
+        }
     }
 
     // State
