@@ -43,6 +43,7 @@ fn run_self_test() -> bool {
     use k256::SecretKey;
     
     println!("[🔍] Running self-test...");
+    let self_test_start = Instant::now();
     
     let test_vectors = [
         (
@@ -484,9 +485,9 @@ fn run_self_test() -> bool {
     }
 
     if all_passed {
-        println!("[✓] Self-test passed - all calculations are correct\n");
+        println!("[✓] Self-test passed (total: {:.2}s)\n", self_test_start.elapsed().as_secs_f64());
     } else {
-        eprintln!("\n[✗] SELF-TEST FAILED! Calculations are incorrect.");
+        eprintln!("\n[✗] SELF-TEST FAILED! (total: {:.2}s)", self_test_start.elapsed().as_secs_f64());
         eprintln!("    DO NOT proceed - results would be unreliable!");
     }
     
@@ -524,7 +525,9 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     ];
     
     // First verify CPU calculations are correct
-    println!("  [🔍] Verifying CPU reference calculations...");
+    print!("  [🔍] Verifying CPU reference calculations... ");
+    stdout().flush().ok();
+    let cpu_start = Instant::now();
     for (priv_hex, expected_comp, _, _) in &test_vectors[..1] {  // Just test first vector for CPU
         let priv_key: [u8; 32] = hex::decode(priv_hex).unwrap().try_into().unwrap();
         let secret = SecretKey::from_slice(&priv_key).unwrap();
@@ -534,13 +537,14 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
         let expected: [u8; 20] = hex::decode(expected_comp).unwrap().try_into().unwrap();
         
         if cpu_hash != expected {
+            println!("FAILED ({:.2}s)", cpu_start.elapsed().as_secs_f64());
             eprintln!("  [✗] CPU hash mismatch! This should never happen.");
             eprintln!("      Expected: {}", expected_comp);
             eprintln!("      Got:      {}", hex::encode(cpu_hash));
             return false;
         }
     }
-    println!("  [✓] CPU reference calculations verified");
+    println!("done ({:.2}s)", cpu_start.elapsed().as_secs_f64());
     
     // Xor Filter false positive rate test (if enabled)
     #[cfg(feature = "xor-filter")]
@@ -552,22 +556,42 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
         println!("  [🔍] Testing Xor Filter false positive rate...");
         
         // Get all target hashes (already returns Vec<[u8; 20]>)
+        print!("      → Loading targets... ");
+        stdout().flush().ok();
+        let load_start = Instant::now();
         let target_vec = targets.get_all_hashes();
+        println!("done ({:.2}s)", load_start.elapsed().as_secs_f64());
         
         // Create Xor filter from targets
+        print!("      → Building Xor Filter ({} targets)... ", target_vec.len());
+        stdout().flush().ok();
+        let xor_start = Instant::now();
         let xor_filter = XorFilter32::new(&target_vec);
+        println!("done ({:.2}s)", xor_start.elapsed().as_secs_f64());
         
         // Build HashSet for O(1) membership check (instead of O(n) linear search)
         // This is critical for large target sets (49M+ targets)
+        print!("      → Building HashSet for O(1) lookup... ");
+        stdout().flush().ok();
+        let hash_start = Instant::now();
         let target_set: HashSet<[u8; 20]> = target_vec.iter().copied().collect();
-        println!("  [Xor] Built HashSet for {} targets", target_set.len());
+        println!("done ({:.2}s, {} entries)", hash_start.elapsed().as_secs_f64(), target_set.len());
         
         // Test 100k random non-member keys
+        print!("      → Testing 100K random hashes... ");
+        stdout().flush().ok();
+        let test_start = Instant::now();
         let mut fp_count = 0;
         let mut rng = rand::thread_rng();
         let test_count = 100_000;
         
-        for _ in 0..test_count {
+        for i in 0..test_count {
+            // Progress every 10K
+            if i > 0 && i % 10_000 == 0 {
+                print!("{}%... ", i * 100 / test_count);
+                stdout().flush().ok();
+            }
+            
             let mut random_hash = [0u8; 20];
             rng.fill(&mut random_hash);
             
@@ -577,6 +601,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
                 fp_count += 1;
             }
         }
+        println!("done ({:.2}s)", test_start.elapsed().as_secs_f64());
         
         let fp_rate = fp_count as f64 / test_count as f64;
         println!("  [Xor] False positive rate: {:.4}% ({}/{} FP)", 
@@ -591,13 +616,16 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     }
     
     // Now test GPU: scan a batch and verify GPU hashes match CPU
-    println!("  [🔍] Testing GPU hash calculations...");
+    print!("  [🔍] Testing GPU hash calculations... ");
+    stdout().flush().ok();
+    let gpu_test_start = Instant::now();
     
     let base_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
         .unwrap().try_into().unwrap();
     
     match scanner.scan_batch(&base_key) {
         Ok(matches) => {
+            println!("done ({:.2}s)", gpu_test_start.elapsed().as_secs_f64());
             println!("      Xor Filter32 matches in batch: {}", matches.len());
             
             // CRITICAL TEST: Verify EVERY match from GPU against CPU calculation
@@ -677,6 +705,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
             }
         }
         Err(e) => {
+            println!("FAILED ({:.2}s)", gpu_test_start.elapsed().as_secs_f64());
             eprintln!("  [✗] GPU scan failed: {}", e);
             all_passed = false;
         }
@@ -684,7 +713,9 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     
     // Critical test: Full verification path
     // Take a match from GPU and verify it through the full CPU verification path
-    println!("  [🔍] Testing full GPU→CPU verification path...");
+    print!("  [🔍] Testing full GPU→CPU verification path... ");
+    stdout().flush().ok();
+    let verify_start = Instant::now();
     
     let result = scanner.scan_batch(&base_key);
     if let Ok(matches) = result {
@@ -740,10 +771,12 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
                 let gpu_hash = pm.hash.as_bytes();
                 
                 if cpu_hash == *gpu_hash {
+                    println!("done ({:.2}s)", verify_start.elapsed().as_secs_f64());
                     println!("  [✓] GPU→CPU hash verification PASSED");
                     println!("      key_index={}, type={:?}, hash={}", 
                         pm.key_index, pm.match_type, hex::encode(gpu_hash));
                 } else {
+                    println!("FAILED ({:.2}s)", verify_start.elapsed().as_secs_f64());
                     eprintln!("  [✗] GPU→CPU hash MISMATCH!");
                     eprintln!("      key_index: {}", pm.key_index);
                     eprintln!("      GPU hash:  {}", hex::encode(gpu_hash));
@@ -752,12 +785,15 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
                 }
             }
         } else {
+            println!("done ({:.2}s)", verify_start.elapsed().as_secs_f64());
             println!("  [⚠] No matches to verify (Xor Filter32 may not contain test hashes)");
         }
     }
     
     // Final verification: Check multiple key offsets
-    println!("  [🔍] Testing key offset reconstruction...");
+    print!("  [🔍] Testing key offset reconstruction... ");
+    stdout().flush().ok();
+    let offset_start = Instant::now();
     for offset in [0u32, 1, 10, 63, 64, 100, 1000] {
         let mut reconstructed = base_key;
         let mut carry = offset as u64;
@@ -772,6 +808,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
         let reconstructed_val = u64::from_be_bytes(reconstructed[24..32].try_into().unwrap());
         
         if reconstructed_val != expected_val {
+            println!("FAILED ({:.2}s)", offset_start.elapsed().as_secs_f64());
             eprintln!("  [✗] Key reconstruction failed for offset {}!", offset);
             eprintln!("      Expected: {}", expected_val);
             eprintln!("      Got:      {}", reconstructed_val);
@@ -780,7 +817,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     }
     
     if all_passed {
-        println!("  [✓] Key offset reconstruction verified");
+        println!("done ({:.2}s)", offset_start.elapsed().as_secs_f64());
         println!("[✓] GPU correctness test PASSED\n");
     } else {
         eprintln!("[✗] GPU CORRECTNESS TEST FAILED!\n");
@@ -797,6 +834,8 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
     use std::time::Instant;
     
     println!("[🔍] Running GPU pipeline test...");
+    print!("  [🔍] Testing pipelined batch processing... ");
+    stdout().flush().ok();
     
     let mut all_passed = true;
     let shutdown = AtomicBool::new(false);
@@ -843,10 +882,10 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
             if batch_count >= 5 {
                 let keys_scanned = batch_count as u64 * scanner.keys_per_batch();
                 let speed = keys_scanned as f64 / elapsed.as_secs_f64();
-                println!("  [✓] GPU pipeline: {} batches, {:.1}M keys in {:.2}s ({:.1}M/s)", 
+                println!("done ({:.2}s)", elapsed.as_secs_f64());
+                println!("      {} batches, {:.1}M keys, {:.1}M/s", 
                     batch_count, 
                     keys_scanned as f64 / 1_000_000.0,
-                    elapsed.as_secs_f64(),
                     speed / 1_000_000.0
                 );
                 
@@ -858,11 +897,13 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
                     all_passed = false;
                 }
             } else {
+                println!("FAILED ({:.2}s)", elapsed.as_secs_f64());
                 eprintln!("  [✗] GPU pipeline incomplete: only {} batches processed", batch_count);
                 all_passed = false;
             }
         }
         Err(e) => {
+            println!("FAILED ({:.2}s)", elapsed.as_secs_f64());
             eprintln!("  [✗] GPU pipeline error: {}", e);
             all_passed = false;
         }
@@ -870,7 +911,9 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
     
     // Test 2: Verify double-buffering doesn't cause data corruption
     // Run two batches with known keys and verify results are consistent
-    println!("  [🔍] Testing double-buffer consistency...");
+    print!("  [🔍] Testing double-buffer consistency... ");
+    stdout().flush().ok();
+    let double_buf_start = Instant::now();
     
     let test_key_a: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
         .unwrap().try_into().unwrap();
@@ -887,8 +930,9 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
         (Ok(a1), Ok(b1), Ok(a2), Ok(b2)) => {
             // Same keys should produce same match counts (Xor Filter32 is deterministic)
             if a1.len() == a2.len() && b1.len() == b2.len() {
-                println!("  [✓] Double-buffer consistency verified");
+                println!("done ({:.2}s)", double_buf_start.elapsed().as_secs_f64());
             } else {
+                println!("FAILED ({:.2}s)", double_buf_start.elapsed().as_secs_f64());
                 eprintln!("  [✗] Double-buffer inconsistency detected!");
                 eprintln!("      Key A: {} vs {} matches", a1.len(), a2.len());
                 eprintln!("      Key B: {} vs {} matches", b1.len(), b2.len());
@@ -896,6 +940,7 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
             }
         }
         _ => {
+            println!("FAILED ({:.2}s)", double_buf_start.elapsed().as_secs_f64());
             eprintln!("  [✗] Double-buffer test failed with errors");
             all_passed = false;
         }
@@ -917,52 +962,68 @@ fn run_startup_verification(scanner: &OptimizedScanner) -> bool {
     use crate::rng::{PhiloxCounter, PhiloxState, philox4x32_10};
     
     println!("[🔍] Running startup verification...");
+    let startup_start = Instant::now();
     
     let mut all_passed = true;
     
     // Test 1: Philox RNG produces non-zero output
+    print!("  [1/5] Philox RNG... ");
+    stdout().flush().ok();
+    let t1 = Instant::now();
     {
         let state = PhiloxState::new(12345);
         let output = philox4x32_10(&state);
         if output[0] == 0 && output[1] == 0 && output[2] == 0 && output[3] == 0 {
-            eprintln!("  [✗] Philox RNG produced all-zero output!");
+            println!("FAILED ({:.2}s)", t1.elapsed().as_secs_f64());
+            eprintln!("        Philox RNG produced all-zero output!");
             all_passed = false;
         } else {
-            println!("  [✓] Philox RNG: OK");
+            println!("OK ({:.2}s)", t1.elapsed().as_secs_f64());
         }
     }
     
     // Test 2: Counter increment works
+    print!("  [2/5] Philox counter... ");
+    stdout().flush().ok();
+    let t2 = Instant::now();
     {
         let counter = PhiloxCounter::new(42);
         let state1 = counter.next_batch(128);
         let state2 = counter.next_batch(128);
         // States should be different
         if state1.counter == state2.counter {
-            eprintln!("  [✗] Philox counter increment failed!");
+            println!("FAILED ({:.2}s)", t2.elapsed().as_secs_f64());
+            eprintln!("        Philox counter increment failed!");
             all_passed = false;
         } else {
-            println!("  [✓] Philox counter: OK");
+            println!("OK ({:.2}s)", t2.elapsed().as_secs_f64());
         }
     }
     
     // Test 3: GPU can scan a batch
+    print!("  [3/5] GPU scan... ");
+    stdout().flush().ok();
+    let t3 = Instant::now();
     {
         let test_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
             .unwrap().try_into().unwrap();
         
         match scanner.scan_batch(&test_key) {
             Ok(_) => {
-                println!("  [✓] GPU scan: OK");
+                println!("OK ({:.2}s)", t3.elapsed().as_secs_f64());
             }
             Err(e) => {
-                eprintln!("  [✗] GPU scan failed: {}", e);
+                println!("FAILED ({:.2}s)", t3.elapsed().as_secs_f64());
+                eprintln!("        GPU scan failed: {}", e);
                 all_passed = false;
             }
         }
     }
     
     // Test 4: Known Bitcoin test vector
+    print!("  [4/5] CPU hash calculation... ");
+    stdout().flush().ok();
+    let t4 = Instant::now();
     {
         use crypto::hash160;
         
@@ -977,14 +1038,18 @@ fn run_startup_verification(scanner: &OptimizedScanner) -> bool {
             .unwrap().try_into().unwrap();
         
         if hash == expected {
-            println!("  [✓] CPU hash calculation: OK");
+            println!("OK ({:.2}s)", t4.elapsed().as_secs_f64());
         } else {
-            eprintln!("  [✗] CPU hash calculation mismatch!");
+            println!("FAILED ({:.2}s)", t4.elapsed().as_secs_f64());
+            eprintln!("        CPU hash calculation mismatch!");
             all_passed = false;
         }
     }
     
     // Test 5: GLV transform works
+    print!("  [5/5] GLV endomorphism... ");
+    stdout().flush().ok();
+    let t5 = Instant::now();
     {
         let key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000005")
             .unwrap().try_into().unwrap();
@@ -994,17 +1059,18 @@ fn run_startup_verification(scanner: &OptimizedScanner) -> bool {
         let glv3 = gpu::glv_transform_key(&glv2);
         
         if glv3 == key {
-            println!("  [✓] GLV endomorphism: OK (λ³ = 1)");
+            println!("OK ({:.2}s) - λ³ = 1", t5.elapsed().as_secs_f64());
         } else {
-            eprintln!("  [✗] GLV endomorphism failed: λ³ ≠ 1");
+            println!("FAILED ({:.2}s)", t5.elapsed().as_secs_f64());
+            eprintln!("        GLV endomorphism failed: λ³ ≠ 1");
             all_passed = false;
         }
     }
     
     if all_passed {
-        println!("[✓] Startup verification passed\n");
+        println!("[✓] Startup verification passed (total: {:.2}s)\n", startup_start.elapsed().as_secs_f64());
     } else {
-        eprintln!("[✗] STARTUP VERIFICATION FAILED!\n");
+        eprintln!("[✗] STARTUP VERIFICATION FAILED! (total: {:.2}s)\n", startup_start.elapsed().as_secs_f64());
         eprintln!("    Run 'cargo test --test integration' for detailed diagnostics.\n");
     }
     
