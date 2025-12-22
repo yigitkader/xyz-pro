@@ -194,7 +194,7 @@ pub fn test_gpu_metal_hash_calculations(scanner: &OptimizedScanner) -> bool {
 /// Test Xor Filter correctness (true positives and false positive rate)
 #[cfg(feature = "xor-filter")]
 pub fn test_xor_filter_correctness(targets: &TargetDatabase) -> bool {
-    use crate::filter::XorFilter16;
+    use crate::filter::XorFilter32;
     
     println!("  [🔍] Testing Xor Filter correctness...");
     let mut all_passed = true;
@@ -208,7 +208,7 @@ pub fn test_xor_filter_correctness(targets: &TargetDatabase) -> bool {
     }
     
     // Create Xor filter
-    let xor_filter = XorFilter16::new(&target_vec);
+    let xor_filter = XorFilter32::new(&target_vec);
     
     // Test 1: True positives - all targets should be in filter
     println!("    [🔍] Testing true positives (all targets should be in filter)...");

@@ -65,7 +65,7 @@ fn test_philox_key_validity() {
 #[cfg(feature = "xor-filter")]
 #[test]
 fn test_xor_filter_no_false_negatives() {
-    use xyz_pro::filter::XorFilter16;
+    use xyz_pro::filter::XorFilter32;
     
     println!("Testing Xor Filter for false negatives...");
     
@@ -77,7 +77,7 @@ fn test_xor_filter_no_false_negatives() {
         targets.push(h);
     }
     
-    let filter = XorFilter16::new(&targets);
+    let filter = XorFilter32::new(&targets);
     
     // Verify EVERY target is found
     let mut missing = 0;
@@ -100,7 +100,7 @@ fn test_xor_filter_no_false_negatives() {
 #[cfg(feature = "xor-filter")]
 #[test]
 fn test_xor_filter_fp_rate() {
-    use xyz_pro::filter::XorFilter16;
+    use xyz_pro::filter::XorFilter32;
     use rand::Rng;
     
     println!("Testing Xor Filter false positive rate...");
@@ -113,7 +113,7 @@ fn test_xor_filter_fp_rate() {
         targets.push(h);
     }
     
-    let filter = XorFilter16::new(&targets);
+    let filter = XorFilter32::new(&targets);
     
     // Test 100K random non-member keys
     let mut rng = rand::thread_rng();

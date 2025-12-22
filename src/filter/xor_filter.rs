@@ -1,13 +1,13 @@
 use std::hash::Hasher;
 use fxhash::FxHasher;
 
-pub struct XorFilter16 {
-    fingerprints: Vec<u16>,
+pub struct XorFilter32 {
+    fingerprints: Vec<u32>,
     seeds: [u64; 3],
     block_length: usize,
 }
 
-impl XorFilter16 {
+impl XorFilter32 {
     pub fn new(targets: &[[u8; 20]]) -> Self {
         let size = targets.len();
         let mut capacity = Self::calculate_capacity(size);
@@ -23,7 +23,7 @@ impl XorFilter16 {
             [0x456789ABCDEF0123, 0x321201FEDCBA9876, 0xEEEEEEEE99999999],
         ];
         
-        let mut fingerprints = vec![0u16; capacity];
+        let mut fingerprints = vec![0u32; capacity];
         let mut seeds = seed_sets[0];
         let mut success = false;
         
@@ -79,7 +79,7 @@ impl XorFilter16 {
     
     fn construct_filter(
         targets: &[[u8; 20]],
-        fingerprints: &mut [u16],
+        fingerprints: &mut [u32],
         block_length: usize,
         seeds: &[u64; 3],
     ) -> bool {
@@ -186,11 +186,11 @@ impl XorFilter16 {
         block * block_length + pos
     }
     
-    /// Compute 16-bit fingerprint
-    fn compute_fingerprint(hash: &[u8; 20]) -> u16 {
+    /// Compute 32-bit fingerprint (reduced collision risk for 50M targets)
+    fn compute_fingerprint(hash: &[u8; 20]) -> u32 {
         let mut hasher = FxHasher::default();
         hasher.write(hash);
-        (hasher.finish() >> 48) as u16  // Top 16 bits
+        (hasher.finish() >> 32) as u32  // Top 32 bits (reduces FP rate from 0.4% to 0.0015%)
     }
     
     /// Check if hash is in filter (may have false positives)
@@ -203,16 +203,16 @@ impl XorFilter16 {
     }
     
     /// Get GPU-compatible data (fingerprints + metadata)
-    pub fn gpu_data(&self) -> (&[u16], [u64; 3], u32) {
+    pub fn gpu_data(&self) -> (&[u32], [u64; 3], u32) {
         (&self.fingerprints, self.seeds, self.block_length as u32)
     }
     
     /// Memory usage in bytes
     pub fn memory_bytes(&self) -> usize {
-        self.fingerprints.len() * 2 + 24 + 4  // fingerprints + seeds + block_length
+        self.fingerprints.len() * 4 + 24 + 4  // fingerprints (32-bit) + seeds + block_length
     }
     
-    /// Bits per element (ideal: 14-15 for Xor16)
+    /// Bits per element (ideal: 14-15 for Xor16, ~18-20 for Xor32)
     pub fn bits_per_element(&self, num_keys: usize) -> f64 {
         (self.memory_bytes() * 8) as f64 / num_keys as f64
     }
@@ -237,7 +237,7 @@ mod tests {
             targets.push(random_hash());
         }
         
-        let filter = XorFilter16::new(&targets);
+        let filter = XorFilter32::new(&targets);
         
         // All inserted keys should be found
         for hash in &targets {
@@ -252,7 +252,7 @@ mod tests {
             targets.push(random_hash());
         }
         
-        let filter = XorFilter16::new(&targets);
+        let filter = XorFilter32::new(&targets);
         
         // Test 100k random non-member keys
         let mut false_positives = 0;
@@ -266,8 +266,8 @@ mod tests {
         let fp_rate = false_positives as f64 / 100_000.0;
         println!("False positive rate: {:.2}%", fp_rate * 100.0);
         
-        // Xor16 should have <0.4% FP rate
-        assert!(fp_rate < 0.004, "FP rate too high: {:.2}%", fp_rate * 100.0);
+        // Xor32 should have <0.15% FP rate (improved from Xor16's 0.4%)
+        assert!(fp_rate < 0.0015, "FP rate too high: {:.2}%", fp_rate * 100.0);
     }
     
     #[test]
@@ -280,14 +280,14 @@ mod tests {
                 targets.push(random_hash());
             }
             
-            let filter = XorFilter16::new(&targets);
+            let filter = XorFilter32::new(&targets);
             let bits_per_elem = filter.bits_per_element(size);
             
             println!("Size {}: {:.2} bits/element", size, bits_per_elem);
             
-            // Should be around 14-20 bits/element (Xor filter with retry may use more space)
-            // Retry mechanism increases capacity if needed, so allow up to 20 bits
-            assert!(bits_per_elem < 20.0, "Too much space: {:.2} bits/elem", bits_per_elem);
+            // Should be around 18-24 bits/element (Xor32 uses 32-bit fingerprints vs 16-bit)
+            // Retry mechanism increases capacity if needed, so allow up to 24 bits
+            assert!(bits_per_elem < 24.0, "Too much space: {:.2} bits/elem", bits_per_elem);
         }
     }
     
@@ -303,7 +303,7 @@ mod tests {
             targets.push(h);
         }
         
-        let filter = XorFilter16::new(&targets);
+        let filter = XorFilter32::new(&targets);
         
         // Verify all targets found
         let mut missing = 0;

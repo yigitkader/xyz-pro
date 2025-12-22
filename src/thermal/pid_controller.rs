@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const INTEGRAL_WINDUP_LIMIT: f32 = 10.0;
 
 // Maximum temperature derivative to prevent spikes on cold start
-// Limits derivative term to ±10°C/s to avoid excessive control action
-const MAX_DERIVATIVE_C_PER_S: f32 = 10.0;
+// Limits derivative term to ±3°C/s (realistic limit, prevents cold start spikes)
+// Previous: 10.0 was too high - 40°C→85°C cold start could produce 45°C/s derivative
+const MAX_DERIVATIVE_C_PER_S: f32 = 3.0;
 
 pub struct PIDController {
     target_temp: f32,
@@ -78,13 +79,18 @@ impl PIDController {
         let i_term = self.ki * self.integral;
         
         // Derivative limiting to prevent spikes on cold start (e.g., 40°C → 85°C)
+        // Ignore derivative for first 10 updates (warm-up phase) to prevent cold start spikes
         let raw_derivative = if self.updates.load(Ordering::Relaxed) > 1 {
             (current_temp - self.last_temp) / dt
         } else {
             0.0
         };
         let temp_derivative = raw_derivative.clamp(-MAX_DERIVATIVE_C_PER_S, MAX_DERIVATIVE_C_PER_S);
-        let d_term = self.kd * temp_derivative;
+        let d_term = if self.updates.load(Ordering::Relaxed) < 10 {
+            0.0  // Ignore derivative during warm-up phase (prevents cold start spike)
+        } else {
+            self.kd * temp_derivative
+        };
         
         self.last_temp = current_temp;
         self.last_error = error;

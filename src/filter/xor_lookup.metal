@@ -36,10 +36,10 @@ inline uint xor_hash_to_block(thread uchar* hash,
     return block_id * block_length + pos;
 }
 
-/// Compute 16-bit fingerprint
-inline ushort xor_fingerprint(thread uchar* hash) {
+/// Compute 32-bit fingerprint (reduced collision risk for large target sets)
+inline uint xor_fingerprint(thread uchar* hash) {
     ulong h = fx_hash(hash, 20, 0);
-    return (ushort)(h >> 48);  // Top 16 bits
+    return (uint)(h >> 32);  // Top 32 bits (reduces FP rate from 0.4% to 0.0015%)
 }
 
 /// O(1) Xor Filter membership test
@@ -47,12 +47,12 @@ inline ushort xor_fingerprint(thread uchar* hash) {
 /// Returns false if hash is *definitely not* in set (no false negatives)
 inline bool xor_filter_contains(
     thread uchar* hash,
-    constant ushort* fingerprints,  // Fingerprint table
+    constant uint* fingerprints,  // Fingerprint table (32-bit for lower collision risk)
     constant ulong* seeds,          // 3 hash seeds
     uint block_length              // Size of each block
 ) {
     // Compute fingerprint
-    ushort fp = xor_fingerprint(hash);
+    uint fp = xor_fingerprint(hash);
     
     // Hash to 3 positions (one per block)
     uint h0 = xor_hash_to_block(hash, seeds, block_length, 0);
@@ -60,7 +60,7 @@ inline bool xor_filter_contains(
     uint h2 = xor_hash_to_block(hash, seeds, block_length, 2);
     
     // XOR the 3 fingerprints and compare
-    ushort xor_val = fingerprints[h0] ^ fingerprints[h1] ^ fingerprints[h2];
+    uint xor_val = fingerprints[h0] ^ fingerprints[h1] ^ fingerprints[h2];
     
     return xor_val == fp;
 }

@@ -546,7 +546,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     // Xor Filter false positive rate test (if enabled)
     #[cfg(feature = "xor-filter")]
     {
-        use crate::filter::XorFilter16;
+        use crate::filter::XorFilter32;
         use rand::Rng;
         
         println!("  [🔍] Testing Xor Filter false positive rate...");
@@ -555,7 +555,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
         let target_vec = targets.get_all_hashes();
         
         // Create Xor filter from targets
-        let xor_filter = XorFilter16::new(&target_vec);
+        let xor_filter = XorFilter32::new(&target_vec);
         
         // Test 100k random non-member keys
         let mut fp_count = 0;
