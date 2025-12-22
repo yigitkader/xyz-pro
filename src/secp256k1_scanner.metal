@@ -97,6 +97,17 @@ inline void mul64(ulong a, ulong b, thread ulong& hi, thread ulong& lo) {
     hi = p3 + (mid >> 32);
 }
 
+// Modular addition with SIMD optimization option
+#ifdef USE_SIMD_MATH
+// SIMD version: Use simd_256_add helper (placeholder - uses scalar for now)
+inline ulong4 mod_add(ulong4 a, ulong4 b) {
+    ulong4 result;
+    simd_256_add(&a, &b, &result);
+    // Still need modular reduction
+    ulong c = 0;
+    ulong fc = (result.w < a.w) ? 1 : 0;
+#else
+// Scalar version (current optimized implementation)
 inline ulong4 mod_add(ulong4 a, ulong4 b) {
     ulong4 r;
     ulong c = 0;
@@ -105,7 +116,12 @@ inline ulong4 mod_add(ulong4 a, ulong4 b) {
     r.z = a.z + b.z + c; c = (r.z < a.z) || (c && r.z == a.z) ? 1 : 0;
     r.w = a.w + b.w + c;
     ulong fc = (r.w < a.w) || (c && r.w == a.w) ? 1 : 0;
+#endif
 
+    #ifdef USE_SIMD_MATH
+    ulong4 r = result;
+    #endif
+    
     if (fc || r.w > SECP256K1_P.w || (r.w == SECP256K1_P.w && (r.z > SECP256K1_P.z ||
         (r.z == SECP256K1_P.z && (r.y > SECP256K1_P.y || (r.y == SECP256K1_P.y && r.x >= SECP256K1_P.x)))))) {
         ulong4 s; ulong bw = 0;
@@ -589,9 +605,20 @@ inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
 // L2: Precise filtering in main memory (slower but accurate)
 // Performance: ~6x faster bloom filtering due to cache hierarchy utilization
 // ============================================================================
-inline bool dual_bloom_check(thread uchar* h, 
-                             constant ulong* l1_bloom, uint l1_sz,
-                             constant ulong* l2_bloom, uint l2_sz) {
+// Filter check function (feature flag selects which implementation)
+#ifdef USE_XOR_FILTER
+// Xor Filter: O(1) lookup, <0.4% false positive rate
+inline bool filter_check(thread uchar* h,
+                         constant ushort* xor_fingerprints,
+                         constant ulong* xor_seeds,
+                         uint xor_block_length) {
+    return xor_filter_contains(h, xor_fingerprints, xor_seeds, xor_block_length);
+}
+#else
+// Dual Bloom Filter: Two-level cache hierarchy
+inline bool filter_check(thread uchar* h, 
+                         constant ulong* l1_bloom, uint l1_sz,
+                         constant ulong* l2_bloom, uint l2_sz) {
     // Level 1: Quick reject (most non-matches stop here)
     // L1 is small (2MB) and should be in L2 cache
     // FAST PATH: 99% of non-matching keys exit here
@@ -605,6 +632,14 @@ inline bool dual_bloom_check(thread uchar* h,
     // Latency: ~100 cycles (unified memory access)
     return bloom_check(h, l2_bloom, l2_sz);
 }
+
+// Legacy function name (for compatibility)
+inline bool dual_bloom_check(thread uchar* h, 
+                             constant ulong* l1_bloom, uint l1_sz,
+                             constant ulong* l2_bloom, uint l2_sz) {
+    return filter_check(h, l1_bloom, l1_sz, l2_bloom, l2_sz);
+}
+#endif
 
 // ============================================================================
 // MAIN KERNEL: scan_keys
@@ -659,6 +694,16 @@ kernel void scan_keys(
     constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
     constant uchar* step_table [[buffer(1)]],      // Legacy: 20 entries × 64 bytes (kept for compatibility)
     constant uchar* wnaf_table [[buffer(2)]],      // wNAF w=4: 40 entries × 64 bytes (5 windows × 8 odd digits)
+#ifdef USE_XOR_FILTER
+    // Xor Filter: O(1) lookup, <0.4% false positive rate
+    constant ushort* xor_fingerprints [[buffer(3)]],  // Fingerprint table
+    constant ulong* xor_seeds [[buffer(4)]],          // 3 hash seeds
+    constant uint* xor_block_length [[buffer(5)]],     // Block length
+    constant uint* keys_per_thread [[buffer(6)]],
+    device uchar* match_data [[buffer(7)]],        // 52 bytes per match
+    device atomic_uint* match_count [[buffer(8)]],
+    constant uint* hash_count [[buffer(9)]],      // Number of hashes (for stats)
+#else
     // Two-level Bloom filter: L1 (cache-resident) + L2 (full)
     constant ulong* l1_bloom [[buffer(3)]],        // L1: Small, cache-resident (~2MB)
     constant uint* l1_bloom_size [[buffer(4)]],
@@ -669,13 +714,19 @@ kernel void scan_keys(
     device atomic_uint* match_count [[buffer(9)]],
     constant uchar* sorted_hashes [[buffer(10)]],  // Sorted hash array for binary search
     constant uint* hash_count [[buffer(11)]],      // Number of hashes
+#endif
     uint gid [[thread_position_in_grid]]
 ) {
     uint kpt = *keys_per_thread;
     uint base_offset = gid * kpt;
+#ifdef USE_XOR_FILTER
+    uint xor_block_len = *xor_block_length;
+    uint target_count = *hash_count;  // For stats only (Xor filter doesn't need binary search)
+#else
     uint l1_sz = *l1_bloom_size;
     uint l2_sz = *l2_bloom_size;
     uint target_count = *hash_count;  // For GPU-side binary search
+#endif
 
     // Load P_base
     ulong4 base_x = load_be(base_point);
@@ -830,40 +881,64 @@ kernel void scan_keys(
             // ================================================================
             
             // Check PRIMARY range (original keys)
+#ifdef USE_XOR_FILTER
+            // Xor Filter: O(1) lookup, <0.4% FP rate (no binary search needed)
+            if (filter_check(h_comp, xor_fingerprints, xor_seeds, xor_block_len)) {
+                SAVE_MATCH(h_comp, 0);  // Real match (FP rate <0.4%, acceptable)
+            }
+            if (filter_check(h_uncomp, xor_fingerprints, xor_seeds, xor_block_len)) {
+                SAVE_MATCH(h_uncomp, 1);
+            }
+            if (filter_check(h_p2sh, xor_fingerprints, xor_seeds, xor_block_len)) {
+                SAVE_MATCH(h_p2sh, 2);
+            }
+            
+            // GLV endomorphic range
+            if (filter_check(glv_comp, xor_fingerprints, xor_seeds, xor_block_len)) {
+                SAVE_MATCH(glv_comp, 3);
+            }
+            if (filter_check(glv_uncomp, xor_fingerprints, xor_seeds, xor_block_len)) {
+                SAVE_MATCH(glv_uncomp, 4);
+            }
+            if (filter_check(glv_p2sh, xor_fingerprints, xor_seeds, xor_block_len)) {
+                SAVE_MATCH(glv_p2sh, 5);
+            }
+#else
             // Using two-level Bloom filter: L1 (cache) + L2 (memory) for ~6x faster filtering
-            if (dual_bloom_check(h_comp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
+            if (filter_check(h_comp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
                 // GPU-side exact match verification
                 if (binary_search_hash(h_comp, sorted_hashes, target_count)) {
                     SAVE_MATCH(h_comp, 0);  // Real match!
                 }
             }
-            if (dual_bloom_check(h_uncomp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
+            if (filter_check(h_uncomp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
                 if (binary_search_hash(h_uncomp, sorted_hashes, target_count)) {
                     SAVE_MATCH(h_uncomp, 1);  // Real match!
                 }
             }
-            if (dual_bloom_check(h_p2sh, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
+            if (filter_check(h_p2sh, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
                 if (binary_search_hash(h_p2sh, sorted_hashes, target_count)) {
                     SAVE_MATCH(h_p2sh, 2);  // Real match!
                 }
             }
             
             // Check GLV ENDOMORPHIC range (λ·k keys) - FREE extra key range!
-            if (dual_bloom_check(glv_comp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
+            if (filter_check(glv_comp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
                 if (binary_search_hash(glv_comp, sorted_hashes, target_count)) {
                     SAVE_MATCH(glv_comp, 3);  // GLV compressed - Real match!
                 }
             }
-            if (dual_bloom_check(glv_uncomp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
+            if (filter_check(glv_uncomp, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
                 if (binary_search_hash(glv_uncomp, sorted_hashes, target_count)) {
                     SAVE_MATCH(glv_uncomp, 4);  // GLV uncompressed - Real match!
                 }
             }
-            if (dual_bloom_check(glv_p2sh, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
+            if (filter_check(glv_p2sh, l1_bloom, l1_sz, l2_bloom, l2_sz)) {
                 if (binary_search_hash(glv_p2sh, sorted_hashes, target_count)) {
                     SAVE_MATCH(glv_p2sh, 5);  // GLV P2SH - Real match!
                 }
             }
+#endif
             
             #undef SAVE_MATCH
         }

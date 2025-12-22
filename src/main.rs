@@ -6,9 +6,23 @@ mod address;
 mod crypto;
 mod error;
 mod gpu;
-mod rng_pool;
 mod targets;
 mod types;
+
+#[cfg(feature = "philox-rng")]
+mod rng;
+
+#[cfg(feature = "xor-filter")]
+mod filter;
+
+#[cfg(feature = "simd-math")]
+mod math;
+
+#[cfg(feature = "pid-thermal")]
+mod thermal;
+
+#[cfg(feature = "zero-copy")]
+mod scanner;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -21,7 +35,6 @@ use std::time::{Duration, Instant};
 
 use address::to_wif_compressed;
 use gpu::{MatchType, OptimizedScanner, PotentialMatch};
-use rng_pool::KeyPool;
 use targets::TargetDatabase;
 
 const TARGETS_FILE: &str = "targets.json";
@@ -438,7 +451,7 @@ fn run_self_test() -> bool {
 /// CRITICAL GPU CORRECTNESS TEST
 /// Verifies that GPU computes EXACTLY the same hashes as CPU
 /// A single bit error here means missed matches!
-fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase) -> bool {
+fn run_gpu_correctness_test(scanner: &OptimizedScanner, _targets: &TargetDatabase) -> bool {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use k256::SecretKey;
     
@@ -907,189 +920,9 @@ impl MemoryPressure {
 }
 
 // ============================================================================
-// THERMAL MONITORING
+// THERMAL MONITORING - REMOVED (replaced by PID Thermal Controller)
 // ============================================================================
-
-/// Thermal state based on performance monitoring
-/// Instead of requiring sudo for powermetrics, we detect throttling via performance degradation
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]  // Used for monitoring/debugging
-pub enum ThermalState {
-    Normal,      // Performance as expected
-    Throttling,  // Performance degraded (likely thermal)
-    Critical,    // Severe throttling detected
-}
-
-/// ADAPTIVE Thermal monitor with trend-based analysis
-/// Uses rolling performance history for smarter throttling detection
-/// Avoids unnecessary pauses from single-batch spikes
-pub struct ThermalMonitor {
-    /// Baseline batch duration (established during warm-up)
-    baseline_duration_us: std::sync::atomic::AtomicU64,
-    /// Number of samples for baseline
-    baseline_samples: std::sync::atomic::AtomicU32,
-    /// Current throttle state
-    throttle_count: std::sync::atomic::AtomicU32,
-    /// Consecutive normal batches (for recovery detection)
-    normal_count: std::sync::atomic::AtomicU32,
-    /// Performance history for trend analysis (last 20 batches)
-    perf_history: std::sync::Mutex<std::collections::VecDeque<u64>>,
-}
-
-impl ThermalMonitor {
-    pub fn new() -> Self {
-        Self {
-            baseline_duration_us: std::sync::atomic::AtomicU64::new(0),
-            baseline_samples: std::sync::atomic::AtomicU32::new(0),
-            throttle_count: std::sync::atomic::AtomicU32::new(0),
-            normal_count: std::sync::atomic::AtomicU32::new(0),
-            perf_history: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(20)),
-        }
-    }
-    
-    /// Record a batch duration and detect thermal throttling
-    /// IMPROVED: Uses trend analysis (last 10 batches avg) instead of single-batch spikes
-    /// Returns recommended action: None = continue, Some(ms) = sleep for cooling
-    pub fn record_batch(&self, duration_us: u64) -> Option<u64> {
-        use std::sync::atomic::Ordering;
-        
-        let samples = self.baseline_samples.load(Ordering::Relaxed);
-        
-        // Phase 1: Warm-up (first 100 batches for more stable baseline)
-        // CRITICAL FIX: Extended from 30 to 100 batches
-        // First batches include shader compilation + cache warm-up + bloom filter init
-        // More samples = more stable baseline = fewer false throttling pauses
-        if samples < 100 {
-            // First 50 batches: system is still warming up, ignore
-            // Samples 50-80: use for baseline calculation (30 samples, more stable)
-            if samples >= 50 && samples < 80 {
-                let current = self.baseline_duration_us.load(Ordering::Relaxed);
-                // IMPROVED: Trimmed mean with 2x outlier threshold (was 1.5x)
-                // More tolerant to prevent skewed baseline from single-batch spikes
-                let is_outlier = current > 0 && 
-                    (duration_us > current * 2 || duration_us < current / 2);
-                
-                if !is_outlier {
-                    let count = (samples - 50 + 1) as u64;
-                    let new_baseline = if current == 0 {
-                        duration_us
-                    } else {
-                        // Running average: (old_avg * (count-1) + new_value) / count
-                        (current * (count - 1) + duration_us) / count
-                    };
-                    self.baseline_duration_us.store(new_baseline, Ordering::Relaxed);
-                }
-            }
-            
-            self.baseline_samples.fetch_add(1, Ordering::Relaxed);
-            
-            // At sample 100, baseline is established
-            if samples == 99 {
-                let baseline = self.baseline_duration_us.load(Ordering::Relaxed);
-                println!("[🌡️] Thermal baseline: {:.2}ms/batch (trimmed mean, 30 samples)", 
-                    baseline as f64 / 1000.0);
-            }
-            return None;  // No pauses during warm-up
-        }
-        
-        let baseline = self.baseline_duration_us.load(Ordering::Relaxed);
-        if baseline == 0 {
-            return None;
-        }
-        
-        // Phase 2: Update rolling performance history
-        {
-            let mut history = self.perf_history.lock().unwrap();
-            history.push_back(duration_us);
-            if history.len() > 20 {
-                history.pop_front();
-            }
-        }
-        
-        // Phase 3: Trend-based throttling detection
-        // Use last 10 batches average instead of single batch
-        // This prevents unnecessary pauses from momentary spikes
-        let recent_avg = {
-            let history = self.perf_history.lock().unwrap();
-            let len = history.len();
-            if len >= 10 {
-                // Take last 10 entries using skip (safer than rev().take())
-                let skip_count = len.saturating_sub(10);
-                history.iter().skip(skip_count).sum::<u64>() / 10
-            } else if len > 0 {
-                // Use all available history for average
-                history.iter().sum::<u64>() / len as u64
-            } else {
-                duration_us
-            }
-        };
-        
-        // Calculate performance ratio (lower = slower = hotter)
-        let trend_ratio = baseline as f64 / recent_avg as f64;
-        
-        // OPTIMIZED: More tolerant throttling thresholds
-        // With GPU binary search, performance is much more stable
-        // Old: 0.65 / 0.80 / 0.90 (still too sensitive)
-        // New: 0.60 / 0.75 / 0.85 (properly tolerant, almost no false pauses)
-        
-        if trend_ratio < 0.60 {
-            // Critical: >40% slower than baseline (real thermal issue)
-            self.throttle_count.fetch_add(1, Ordering::Relaxed);
-            self.normal_count.store(0, Ordering::Relaxed);
-            
-            let consecutive = self.throttle_count.load(Ordering::Relaxed);
-            if consecutive >= 5 {
-                return Some(3000); // 3 second pause for severe throttling
-            } else if consecutive >= 3 {
-                return Some(2000); // 2 second pause for critical
-            }
-            return Some(1000); // 1 second pause
-        } else if trend_ratio < 0.75 {
-            // Warm: 25-40% slower than baseline
-            self.throttle_count.fetch_add(1, Ordering::Relaxed);
-            self.normal_count.store(0, Ordering::Relaxed);
-            
-            let consecutive = self.throttle_count.load(Ordering::Relaxed);
-            if consecutive >= 8 && consecutive % 8 == 0 {
-                return Some(500); // 500ms pause every 8 throttled batches
-            }
-        } else if trend_ratio < 0.85 {
-            // Slightly warm: 15-25% slower - no pause but track
-            // This is normal variance, don't increment throttle
-            self.normal_count.store(0, Ordering::Relaxed);
-        } else {
-            // Normal performance (within 15% of baseline)
-            self.normal_count.fetch_add(1, Ordering::Relaxed);
-            
-            // Reset throttle counter after 15 normal batches (more tolerant)
-            if self.normal_count.load(Ordering::Relaxed) >= 15 {
-                self.throttle_count.store(0, Ordering::Relaxed);
-            }
-        }
-        
-        None
-    }
-    
-    /// Check if baseline has been established (first 100 batches recorded)
-    pub fn has_baseline(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        self.baseline_samples.load(Ordering::Relaxed) >= 100
-    }
-    
-    /// Get current thermal state for display
-    pub fn get_state(&self) -> ThermalState {
-        use std::sync::atomic::Ordering;
-        
-        let throttle = self.throttle_count.load(Ordering::Relaxed);
-        if throttle >= 5 {
-            ThermalState::Critical
-        } else if throttle >= 2 {
-            ThermalState::Throttling
-        } else {
-            ThermalState::Normal
-        }
-    }
-}
+// LEGACY ThermalMonitor removed - PID thermal controller is now default
 
 /// Try to read GPU/SoC temperature via ioreg (no sudo required)
 /// Returns temperature in Celsius, or None if unavailable
@@ -1370,56 +1203,79 @@ fn run_pipelined(
     // GPU works on batch N while we process results from batch N-1
     let keys_per_batch = gpu.keys_per_batch();
     let gpu_handle = thread::spawn(move || {
-        // OPTIMIZATION: Pre-generate keys in bulk for ~21x faster retrieval
-        // 2048 keys = ~5 minutes of scanning at 150M/s before wrap-around
-        let key_pool = KeyPool::new(2048, keys_per_batch);
-        
-        // Thermal monitoring for throttling detection
-        let thermal_monitor = ThermalMonitor::new();
-        let mut last_batch_time = Instant::now();
-        let mut thermal_pauses: u32 = 0;
-        
-        let result = gpu.scan_pipelined(
-            // Key generator closure - now uses pre-generated pool (21x faster!)
-            || key_pool.next(),
-            // Batch result handler closure
-            |base_key, matches| {
-                // Measure batch duration for thermal monitoring
-                let batch_duration = last_batch_time.elapsed();
-                last_batch_time = Instant::now();
+        #[cfg(feature = "philox-rng")]
+        {
+            // GPU generates keys internally using Philox - no CPU key pool needed!
+            println!("[GPU] Using Philox4x32 for key generation");
+            
+            #[cfg(feature = "pid-thermal")]
+            {
+                use crate::thermal::{DynamicSpeedController, read_gpu_temperature, estimate_temperature_from_performance};
+                let mut pid_controller = DynamicSpeedController::new(87.0, keys_per_batch as u32);
+                let mut last_batch_time = Instant::now();
+                let mut baseline_duration = Duration::from_millis(0);
+                let mut baseline_established = false;
                 
-                // Record batch duration for thermal monitoring
-                // First 10 batches establish baseline, then throttling detection begins
-                if let Some(cooldown_ms) = thermal_monitor.record_batch(batch_duration.as_micros() as u64) {
-                    thermal_pauses += 1;
-                    if thermal_pauses == 1 || thermal_pauses % 10 == 0 {
-                        eprintln!("\n[🌡️] Thermal throttling detected, cooling {}ms (pause #{})", 
-                            cooldown_ms, thermal_pauses);
-                    }
-                    thread::sleep(Duration::from_millis(cooldown_ms));
+                let result = gpu.scan_pipelined(
+                    || gpu.next_base_key(),
+                    |base_key, matches| {
+                        let batch_duration = last_batch_time.elapsed();
+                        last_batch_time = Instant::now();
+                        
+                        // Establish baseline (first few batches)
+                        if !baseline_established {
+                            if baseline_duration.as_millis() == 0 {
+                                baseline_duration = batch_duration;
+                            } else {
+                                // Running average for baseline
+                                let avg_ms = ((baseline_duration.as_millis() * 9 + batch_duration.as_millis()) / 10) as u64;
+                                baseline_duration = Duration::from_millis(avg_ms);
+                            }
+                            if baseline_duration.as_millis() > 0 {
+                                baseline_established = true;
+                            }
+                        }
+                        
+                        // Try to read actual GPU temperature first
+                        let current_temp = read_gpu_temperature().unwrap_or_else(|| {
+                            // Fallback: estimate from performance if hardware reading unavailable
+                            if baseline_established {
+                                estimate_temperature_from_performance(
+                                    batch_duration.as_millis() as u64,
+                                    baseline_duration.as_millis() as u64
+                                )
+                            } else {
+                                80.0 // Default until baseline established
+                            }
+                        });
+                        
+                        // PID controller adjusts speed based on actual temperature
+                        if let Some(new_batch) = pid_controller.update(current_temp) {
+                            let speed = pid_controller.current_speed();
+                            if (speed - 1.0).abs() > 0.05 {
+                                eprintln!("[PID] Speed: {:.1}% (temp: {:.1}°C)", 
+                                    speed * 100.0, current_temp);
+                            }
+                        }
+                        
+                        gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
+                        
+                        if !matches.is_empty() {
+                            if let Err(e) = tx.send((base_key, matches)) {
+                                eprintln!("[!] CRITICAL: Verifier thread disconnected: {}", e);
+                                gpu_shutdown.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    },
+                    &gpu_shutdown,
+                );
+                
+                if let Err(e) = result {
+                    eprintln!("[!] GPU error: {}", e);
+                    gpu_shutdown.store(true, Ordering::SeqCst);
                 }
-                
-                gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
-                
-                // Send to verification (blocking to never lose matches)
-                if !matches.is_empty() {
-                    if let Err(e) = tx.send((base_key, matches)) {
-                        eprintln!("[!] CRITICAL: Verifier thread disconnected: {}", e);
-                        gpu_shutdown.store(true, Ordering::SeqCst);
-                    }
-                }
-            },
-            &gpu_shutdown,
-        );
-        
-        // Report thermal stats on shutdown
-        if thermal_pauses > 0 {
-            eprintln!("[🌡️] Total thermal pauses: {}", thermal_pauses);
-        }
-        
-        if let Err(e) = result {
-            eprintln!("[!] GPU error: {}", e);
-            gpu_shutdown.store(true, Ordering::SeqCst);
+            }
+            
         }
     });
 
@@ -1558,66 +1414,9 @@ fn run_pipelined(
 }
 
 // ============================================================================
-// KEY GENERATION
+// KEY GENERATION - REMOVED (replaced by Philox RNG)
 // ============================================================================
-
-/// Generate a random valid private key that won't overflow when GPU adds key_index
-/// max_key_offset = keys_per_batch (from GPU config)
-fn generate_random_key(max_key_offset: u64) -> [u8; 32] {
-    use rand::RngCore;
-    use std::cell::RefCell;
-    
-    // Thread-local RNG - created once per thread, reused for all calls
-    // This avoids the overhead of creating a new RNG for each key generation
-    thread_local! {
-        static RNG: RefCell<rand::rngs::ThreadRng> = RefCell::new(rand::thread_rng());
-    }
-    
-    let mut key = [0u8; 32];
-    let mut attempts = 0u32;
-    
-    loop {
-        RNG.with(|rng| rng.borrow_mut().fill_bytes(&mut key));
-        
-        // Check 1: Basic validity (0 < key < N)
-        if !crypto::is_valid_private_key(&key) {
-            attempts += 1;
-            if attempts > 10_000 {
-                // RNG is fundamentally broken - this should never happen
-                eprintln!("[FATAL] RNG failure - generated {} invalid keys", attempts);
-                std::process::exit(1);
-            }
-            continue;
-        }
-        
-        // Check 2: Ensure key + max_key_offset doesn't overflow curve order
-        // This prevents invalid keys when GPU adds key_index to base_key
-        let mut temp = key;
-        let mut carry = max_key_offset;
-        for byte in temp.iter_mut().rev() {
-            let sum = *byte as u64 + (carry & 0xFF);
-            *byte = sum as u8;
-            carry = (carry >> 8) + (sum >> 8);
-        }
-        
-        // If carry is non-zero, we had 256-bit overflow
-        if carry != 0 {
-            attempts += 1;
-            continue;
-        }
-        
-        // Check if key + max_key_offset is still valid (< N)
-        if crypto::is_valid_private_key(&temp) {
-            return key;
-        }
-        
-        attempts += 1;
-        if attempts > 10_000 {
-            eprintln!("[FATAL] RNG failure - generated {} invalid keys", attempts);
-            std::process::exit(1);
-        }
-    }
-}
+// LEGACY generate_random_key function removed - Philox RNG is now default
 
 // ============================================================================
 // MATCH VERIFICATION

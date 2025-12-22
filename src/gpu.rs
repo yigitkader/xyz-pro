@@ -7,6 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
 
+#[cfg(feature = "philox-rng")]
+use crate::rng::philox::{PhiloxCounter, philox_to_privkey};
+
+#[cfg(feature = "xor-filter")]
+use crate::filter::XorFilter16;
+
 // ============================================================================
 // GPU CONFIGURATION - Auto-detected based on Apple Silicon variant
 // ============================================================================
@@ -14,6 +20,7 @@ use crate::types::Hash160;
 /// GPU configuration profile
 #[derive(Debug, Clone)]
 pub struct GpuConfig {
+    #[allow(dead_code)]  // Used for debugging/logging
     pub name: String,
     pub max_threads: usize,
     pub keys_per_thread: u32,
@@ -219,17 +226,23 @@ impl GpuConfig {
 // ============================================================================
 
 /// Match buffer size default (overridden by GpuConfig)
+/// LEGACY: Kept for backward compatibility, not used with auto-config
+#[allow(dead_code)]
 const DEFAULT_MATCH_BUFFER_SIZE: usize = 1_048_576;
 
 // ============================================================================
-// BLOOM FILTER
+// BLOOM FILTER - REMOVED (replaced by Xor Filter)
 // ============================================================================
+// LEGACY BloomFilter and DualBloomFilter removed - Xor Filter is now default
+// Keeping only for reference if needed for migration
 
+#[cfg(not(feature = "xor-filter"))]
 pub struct BloomFilter {
     bits: Vec<u64>,
     num_bits: usize,
 }
 
+#[cfg(not(feature = "xor-filter"))]
 impl BloomFilter {
     pub fn new(n: usize) -> Self {
         // OPTIMIZED: Adaptive bits_per_element for large target sets (50M+)
@@ -437,13 +450,9 @@ impl BloomFilter {
     }
 }
 
-// ============================================================================
-// L1 CACHE-RESIDENT BLOOM FILTER
-// Two-level filtering: L1 (2MB, fits L2 cache) → L2 (86MB, main memory)
-// Expected speedup: 30-40% from reduced memory latency
-// ============================================================================
-
+#[cfg(not(feature = "xor-filter"))]
 /// Two-level Bloom filter for cache hierarchy optimization
+/// LEGACY - Replaced by Xor Filter
 pub struct DualBloomFilter {
     /// L1: Small, cache-resident filter (2MB)
     /// Purpose: Fast rejection of 99% of non-matching keys
@@ -458,6 +467,7 @@ pub struct DualBloomFilter {
     count: usize,
 }
 
+#[cfg(not(feature = "xor-filter"))]
 impl DualBloomFilter {
     /// Create dual-level Bloom filter
     /// 
@@ -688,10 +698,22 @@ pub struct OptimizedScanner {
     step_table_buf: Buffer,       // Legacy binary step table (20 × 64 bytes)
     wnaf_table_buf: Buffer,       // wNAF w=4 step table (40 × 64 bytes) - 50% faster start point
     
+    // Filter buffers (feature flag selects which type)
+    #[cfg(feature = "xor-filter")]
+    xor_fingerprints_buf: Buffer,  // Xor filter fingerprint table
+    #[cfg(feature = "xor-filter")]
+    xor_seeds_buf: Buffer,          // 3 hash seeds (24 bytes)
+    #[cfg(feature = "xor-filter")]
+    xor_block_length_buf: Buffer,   // Block length (u32)
+    
     // Two-level Bloom filter for cache hierarchy optimization
+    #[cfg(not(feature = "xor-filter"))]
     l1_bloom_buf: Buffer,         // L1: 2MB cache-resident filter (fast rejection)
+    #[cfg(not(feature = "xor-filter"))]
     l1_bloom_size_buf: Buffer,
+    #[cfg(not(feature = "xor-filter"))]
     l2_bloom_buf: Buffer,         // L2: Full filter in unified memory
+    #[cfg(not(feature = "xor-filter"))]
     l2_bloom_size_buf: Buffer,
     
     kpt_buf: Buffer,
@@ -699,6 +721,8 @@ pub struct OptimizedScanner {
     // GPU-SIDE BINARY SEARCH: Second-level exact match verification
     // Eliminates 99.94% of Bloom filter false positives ON GPU!
     // This is the key optimization: GPU does exact hash lookup, not just bloom check
+    // Not needed for Xor filter (already O(1) with low FP rate)
+    #[cfg(not(feature = "xor-filter"))]
     sorted_hashes_buf: Buffer,    // Sorted [u8; 20] hash array for binary search
     hash_count_buf: Buffer,       // Number of hashes (u32)
 
@@ -708,6 +732,10 @@ pub struct OptimizedScanner {
     // Stats
     total_scanned: AtomicU64,
     total_matches: AtomicU64,
+    
+    // Philox RNG (if enabled)
+    #[cfg(feature = "philox-rng")]
+    philox_counter: PhiloxCounter,
 }
 
 /// Match type from GPU
@@ -795,6 +823,121 @@ pub struct PotentialMatch {
 }
 
 impl OptimizedScanner {
+    /// Combine multiple Metal shader files into one source
+    /// Metal doesn't support #include, so we merge files manually
+    fn combine_metal_shaders(base_shader: &str) -> Result<String> {
+        let mut combined = String::new();
+        
+        // Add feature defines first
+        #[cfg(feature = "philox-rng")]
+        combined.push_str("#define USE_PHILOX_RNG\n");
+        
+        #[cfg(feature = "xor-filter")]
+        combined.push_str("#define USE_XOR_FILTER\n");
+        
+        #[cfg(feature = "simd-math")]
+        combined.push_str("#define USE_SIMD_MATH\n");
+        
+        // Include standard library
+        combined.push_str("#include <metal_stdlib>\n");
+        combined.push_str("using namespace metal;\n\n");
+        
+        // Include Philox RNG if enabled
+        #[cfg(feature = "philox-rng")]
+        {
+            let philox_shader = fs::read_to_string("src/rng/philox.metal")
+                .map_err(|e| ScannerError::Gpu(format!("Failed to load philox.metal: {}", e)))?;
+            // Remove #include and using namespace from included file
+            let philox_clean: String = philox_shader
+                .lines()
+                .filter(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.starts_with("#include") && 
+                    !trimmed.starts_with("using namespace") &&
+                    !trimmed.is_empty()
+                })
+                .map(|l| format!("{}\n", l))
+                .collect();
+            combined.push_str("// ============================================================================\n");
+            combined.push_str("// PHILOX4X32 RNG (GPU-native key generation)\n");
+            combined.push_str("// ============================================================================\n");
+            combined.push_str(&philox_clean);
+            combined.push_str("\n\n");
+        }
+        
+        // Include Xor Filter if enabled
+        #[cfg(feature = "xor-filter")]
+        {
+            let xor_shader = fs::read_to_string("src/filter/xor_lookup.metal")
+                .map_err(|e| ScannerError::Gpu(format!("Failed to load xor_lookup.metal: {}", e)))?;
+            let xor_clean: String = xor_shader
+                .lines()
+                .filter(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.starts_with("#include") && 
+                    !trimmed.starts_with("using namespace") &&
+                    !trimmed.is_empty()
+                })
+                .map(|l| format!("{}\n", l))
+                .collect();
+            combined.push_str("// ============================================================================\n");
+            combined.push_str("// XOR FILTER (O(1) lookup)\n");
+            combined.push_str("// ============================================================================\n");
+            combined.push_str(&xor_clean);
+            combined.push_str("\n\n");
+        }
+        
+        // Include SIMD Math if enabled
+        #[cfg(feature = "simd-math")]
+        {
+            // Include simd_bigint.metal
+            let simd_shader = fs::read_to_string("src/math/simd_bigint.metal")
+                .map_err(|e| ScannerError::Gpu(format!("Failed to load simd_bigint.metal: {}", e)))?;
+            let simd_clean: String = simd_shader
+                .lines()
+                .filter(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.starts_with("#include") && 
+                    !trimmed.starts_with("using namespace") &&
+                    !trimmed.is_empty()
+                })
+                .map(|l| format!("{}\n", l))
+                .collect();
+            combined.push_str("// ============================================================================\n");
+            combined.push_str("// SIMD MATH (256-bit arithmetic optimization)\n");
+            combined.push_str("// ============================================================================\n");
+            combined.push_str(&simd_clean);
+            combined.push_str("\n\n");
+            
+            // Include field_ops.metal for modular arithmetic
+            let field_ops_shader = fs::read_to_string("src/math/field_ops.metal")
+                .map_err(|e| ScannerError::Gpu(format!("Failed to load field_ops.metal: {}", e)))?;
+            let field_ops_clean: String = field_ops_shader
+                .lines()
+                .filter(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.starts_with("#include") && 
+                    !trimmed.starts_with("using namespace") &&
+                    !trimmed.is_empty()
+                })
+                .map(|l| format!("{}\n", l))
+                .collect();
+            combined.push_str("// ============================================================================\n");
+            combined.push_str("// FIELD OPERATIONS (modular arithmetic primitives)\n");
+            combined.push_str("// ============================================================================\n");
+            combined.push_str(&field_ops_clean);
+            combined.push_str("\n\n");
+        }
+        
+        // Add main shader
+        combined.push_str("// ============================================================================\n");
+        combined.push_str("// MAIN SCANNER KERNEL\n");
+        combined.push_str("// ============================================================================\n");
+        combined.push_str(base_shader);
+        
+        Ok(combined)
+    }
+    
     pub fn new(target_hashes: &[[u8; 20]]) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| ScannerError::Gpu("No Metal GPU found".into()))?;
@@ -807,13 +950,16 @@ impl OptimizedScanner {
 
         let opts = CompileOptions::new();
 
-        // Load shader
+        // Load and combine shader files
         let shader_path = "src/secp256k1_scanner.metal";
-        let src = fs::read_to_string(shader_path)
+        let base_shader = fs::read_to_string(shader_path)
             .map_err(|e| ScannerError::Gpu(format!(
                 "Failed to load shader '{}': {}. Make sure you're running from the project root directory.",
                 shader_path, e
             )))?;
+
+        // Combine with feature-specific shaders
+        let src = Self::combine_metal_shaders(&base_shader)?;
 
         let lib = device.new_library_with_source(&src, &opts)
             .map_err(|e| ScannerError::Gpu(format!("shader compile: {}", e)))?;
@@ -826,7 +972,11 @@ impl OptimizedScanner {
 
         println!("[GPU] Pipeline: max_threads_per_threadgroup={}", pipeline.max_total_threads_per_threadgroup());
 
-        // Build dual-level Bloom filter for cache optimization
+        // Build filter based on feature flag
+        #[cfg(feature = "xor-filter")]
+        let xor_filter = XorFilter16::new(target_hashes);
+        
+        #[cfg(not(feature = "xor-filter"))]
         let dual_bloom = DualBloomFilter::new(target_hashes);
 
         // Compute StepTables using config's keys_per_thread
@@ -873,30 +1023,61 @@ impl OptimizedScanner {
             storage,
         );
 
-        // Create L1 Bloom buffer (cache-resident, ~2MB)
+        // Create filter buffers based on feature flag
+        #[cfg(feature = "xor-filter")]
+        let (xor_fingerprints, xor_seeds, xor_block_length) = xor_filter.gpu_data();
+        
+        #[cfg(feature = "xor-filter")]
+        let xor_fingerprints_buf = device.new_buffer_with_data(
+            xor_fingerprints.as_ptr() as *const _,
+            (xor_fingerprints.len() * 2) as u64,
+            storage,
+        );
+        
+        #[cfg(feature = "xor-filter")]
+        let xor_seeds_buf = device.new_buffer_with_data(
+            xor_seeds.as_ptr() as *const _,
+            24,  // 3 × 8 bytes
+            storage,
+        );
+        
+        #[cfg(feature = "xor-filter")]
+        let xor_block_length_buf = device.new_buffer_with_data(
+            &xor_block_length as *const u32 as *const _,
+            4,
+            storage,
+        );
+        
+        #[cfg(not(feature = "xor-filter"))]
         let l1_data = dual_bloom.l1_data();
+        #[cfg(not(feature = "xor-filter"))]
         let l1_bloom_buf = device.new_buffer_with_data(
             l1_data.as_ptr() as *const _,
             (l1_data.len() * 8) as u64,
             storage,
         );
         
+        #[cfg(not(feature = "xor-filter"))]
         let l1_size = dual_bloom.l1_size_words() as u32;
+        #[cfg(not(feature = "xor-filter"))]
         let l1_bloom_size_buf = device.new_buffer_with_data(
             &l1_size as *const u32 as *const _,
             4,
             storage,
         );
         
-        // Create L2 Bloom buffer (full filter in unified memory)
+        #[cfg(not(feature = "xor-filter"))]
         let l2_data = dual_bloom.l2_data();
+        #[cfg(not(feature = "xor-filter"))]
         let l2_bloom_buf = device.new_buffer_with_data(
             l2_data.as_ptr() as *const _,
             (l2_data.len() * 8) as u64,
             storage,
         );
         
+        #[cfg(not(feature = "xor-filter"))]
         let l2_size = dual_bloom.l2_size_words() as u32;
+        #[cfg(not(feature = "xor-filter"))]
         let l2_bloom_size_buf = device.new_buffer_with_data(
             &l2_size as *const u32 as *const _,
             4,
@@ -913,6 +1094,8 @@ impl OptimizedScanner {
         // GPU-SIDE BINARY SEARCH: Create sorted hash array for exact matching
         // This eliminates 99.94% of Bloom filter false positives directly on GPU!
         // Memory: 49M × 20 bytes = 980MB (fits in unified memory)
+        // Only needed for Bloom filter (not for Xor filter)
+        #[cfg(not(feature = "xor-filter"))]
         let sorted_hashes_buf = {
             // Sort hashes for binary search
             let mut sorted: Vec<[u8; 20]> = target_hashes.to_vec();
@@ -940,32 +1123,57 @@ impl OptimizedScanner {
 
         // Memory stats
         let double_buf_mem = 2 * (64 + match_buffer_size * 52 + 4);
+        #[cfg(feature = "xor-filter")]
+        let xor_mem = xor_filter.memory_bytes();
+        #[cfg(not(feature = "xor-filter"))]
         let sorted_hash_mem = target_hashes.len() * 20;
+        #[cfg(not(feature = "xor-filter"))]
         let bloom_mem = l1_data.len() * 8 + l2_data.len() * 8;
+        #[cfg(not(feature = "xor-filter"))]
         let shared_mem = 20 * 64 + bloom_mem + 8 + 8 + sorted_hash_mem + 4;
+        #[cfg(feature = "xor-filter")]
+        let shared_mem = 20 * 64 + xor_mem + 8 + 4;  // Step tables + xor filter + kpt + hash_count
         let mem_mb = (double_buf_mem + shared_mem) as f64 / 1_000_000.0;
         
         println!("[GPU] Double buffering enabled for async pipelining");
-        println!("[GPU] Two-level Bloom: L1={:.1}MB (cache), L2={:.1}MB (memory)",
-            l1_data.len() as f64 * 8.0 / 1_000_000.0,
-            l2_data.len() as f64 * 8.0 / 1_000_000.0);
+        #[cfg(feature = "xor-filter")]
+        {
+            println!("[GPU] Xor Filter: {:.1} MB ({:.2} bits/element), FP rate <0.4%",
+                xor_filter.memory_bytes() as f64 / 1_000_000.0,
+                xor_filter.bits_per_element(target_hashes.len()));
+        }
+        #[cfg(not(feature = "xor-filter"))]
+        {
+            println!("[GPU] Two-level Bloom: L1={:.1}MB (cache), L2={:.1}MB (memory)",
+                l1_data.len() as f64 * 8.0 / 1_000_000.0,
+                l2_data.len() as f64 * 8.0 / 1_000_000.0);
+            
+            // Calculate and log expected Bloom filter false positive rate (L2 filter)
+            let n = target_hashes.len() as f64;
+            let m = (dual_bloom.l2_size_words() * 64) as f64;
+            let k = 7.0f64;
+            let fp_rate = (1.0 - (-k * n / m).exp()).powf(k);
+            let keys_per_batch = config.keys_per_batch();
+            let expected_fp_per_batch = (keys_per_batch as f64) * fp_rate;
+            
+            println!("[GPU] L2 Bloom: {} words ({} KB), FP rate: {:.4}%, ~{:.0} FP/batch", 
+                dual_bloom.l2_size_words(), 
+                dual_bloom.l2_size_words() * 8 / 1024,
+                fp_rate * 100.0,
+                expected_fp_per_batch
+            );
+        }
         println!("[GPU] Total buffer memory: {:.2} MB", mem_mb);
-        
-        // Calculate and log expected Bloom filter false positive rate (L2 filter)
-        // FP rate ≈ (1 - e^(-k*n/m))^k where k=7 hash functions, n=items, m=bits
-        let n = target_hashes.len() as f64;
-        let m = (dual_bloom.l2_size_words() * 64) as f64;
-        let k = 7.0f64;
-        let fp_rate = (1.0 - (-k * n / m).exp()).powf(k);
-        let keys_per_batch = config.keys_per_batch();
-        let expected_fp_per_batch = (keys_per_batch as f64) * fp_rate;
-        
-        println!("[GPU] L2 Bloom: {} words ({} KB), FP rate: {:.4}%, ~{:.0} FP/batch", 
-            dual_bloom.l2_size_words(), 
-            dual_bloom.l2_size_words() * 8 / 1024,
-            fp_rate * 100.0,
-            expected_fp_per_batch
-        );
+
+        // Initialize Philox counter
+        #[cfg(feature = "philox-rng")]
+        let philox_counter = {
+            use rand::RngCore;
+            let mut rng = rand::thread_rng();
+            let seed = rng.next_u64();
+            println!("[GPU] Philox RNG initialized with seed: 0x{:016X}", seed);
+            PhiloxCounter::new(seed)
+        };
 
         Ok(Self {
             pipeline,
@@ -973,16 +1181,29 @@ impl OptimizedScanner {
             current_buffer: std::sync::atomic::AtomicUsize::new(0),
             step_table_buf,
             wnaf_table_buf,
+            #[cfg(feature = "xor-filter")]
+            xor_fingerprints_buf,
+            #[cfg(feature = "xor-filter")]
+            xor_seeds_buf,
+            #[cfg(feature = "xor-filter")]
+            xor_block_length_buf,
+            #[cfg(not(feature = "xor-filter"))]
             l1_bloom_buf,
+            #[cfg(not(feature = "xor-filter"))]
             l1_bloom_size_buf,
+            #[cfg(not(feature = "xor-filter"))]
             l2_bloom_buf,
+            #[cfg(not(feature = "xor-filter"))]
             l2_bloom_size_buf,
             kpt_buf,
+            #[cfg(not(feature = "xor-filter"))]
             sorted_hashes_buf,
             hash_count_buf,
             config,
             total_scanned: AtomicU64::new(0),
             total_matches: AtomicU64::new(0),
+            #[cfg(feature = "philox-rng")]
+            philox_counter,
         })
     }
 
@@ -991,18 +1212,42 @@ impl OptimizedScanner {
     fn dispatch_batch(&self, base_key: &[u8; 32], buf_idx: usize) -> Result<()> {
         let buffers = &self.buffer_sets[buf_idx];
 
-        // Compute base point from base_key
-        let secret = SecretKey::from_slice(base_key)
-            .map_err(|e| ScannerError::Gpu(format!("invalid key: {}", e)))?;
-        let pubkey = secret.public_key();
-        let encoded = pubkey.to_encoded_point(false);
-        let pub_bytes = encoded.as_bytes();
+        #[cfg(feature = "philox-rng")]
+        {
+            // For Philox: base_key is already generated by Philox
+            // We still compute base point on CPU (future: move to GPU)
+            // Note: Philox state is managed internally, we just use the generated base_key
+            
+            // Compute base point from base_key (same as legacy)
+            let secret = SecretKey::from_slice(base_key)
+                .map_err(|e| ScannerError::Gpu(format!("invalid Philox key: {}", e)))?;
+            let pubkey = secret.public_key();
+            let encoded = pubkey.to_encoded_point(false);
+            let pub_bytes = encoded.as_bytes();
+            
+            // Copy base point (x || y)
+            unsafe {
+                let ptr = buffers.base_point_buf.contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
+                std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
+            }
+        }
+        
+        #[cfg(not(feature = "philox-rng"))]
+        {
+            // Legacy: Compute base point from base_key
+            let secret = SecretKey::from_slice(base_key)
+                .map_err(|e| ScannerError::Gpu(format!("invalid key: {}", e)))?;
+            let pubkey = secret.public_key();
+            let encoded = pubkey.to_encoded_point(false);
+            let pub_bytes = encoded.as_bytes();
 
-        // Copy base point (x || y)
-        unsafe {
-            let ptr = buffers.base_point_buf.contents() as *mut u8;
-            std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
-            std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
+            // Copy base point (x || y)
+            unsafe {
+                let ptr = buffers.base_point_buf.contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
+                std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
+            }
         }
 
         // Reset match count
@@ -1031,16 +1276,33 @@ impl OptimizedScanner {
             enc.set_buffer(0, Some(&buffers.base_point_buf), 0);
             enc.set_buffer(1, Some(&self.step_table_buf), 0);
             enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);  // wNAF w=4 table
-            // Two-level Bloom filter: L1 (cache-resident) + L2 (full)
-            enc.set_buffer(3, Some(&self.l1_bloom_buf), 0);
-            enc.set_buffer(4, Some(&self.l1_bloom_size_buf), 0);
-            enc.set_buffer(5, Some(&self.l2_bloom_buf), 0);
-            enc.set_buffer(6, Some(&self.l2_bloom_size_buf), 0);
-            enc.set_buffer(7, Some(&self.kpt_buf), 0);
-            enc.set_buffer(8, Some(&buffers.match_data_buf), 0);
-            enc.set_buffer(9, Some(&buffers.match_count_buf), 0);
-            enc.set_buffer(10, Some(&self.sorted_hashes_buf), 0);  // GPU binary search buffer
-            enc.set_buffer(11, Some(&self.hash_count_buf), 0);     // Hash count for binary search
+            
+            // Filter buffers (feature flag selects which type)
+            #[cfg(feature = "xor-filter")]
+            {
+                enc.set_buffer(3, Some(&self.xor_fingerprints_buf), 0);
+                enc.set_buffer(4, Some(&self.xor_seeds_buf), 0);
+                enc.set_buffer(5, Some(&self.xor_block_length_buf), 0);
+                enc.set_buffer(6, Some(&self.kpt_buf), 0);
+                enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
+                enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
+                enc.set_buffer(9, Some(&self.hash_count_buf), 0);
+            }
+            
+            #[cfg(not(feature = "xor-filter"))]
+            {
+                // Two-level Bloom filter: L1 (cache-resident) + L2 (full)
+                enc.set_buffer(3, Some(&self.l1_bloom_buf), 0);
+                enc.set_buffer(4, Some(&self.l1_bloom_size_buf), 0);
+                enc.set_buffer(5, Some(&self.l2_bloom_buf), 0);
+                enc.set_buffer(6, Some(&self.l2_bloom_size_buf), 0);
+                enc.set_buffer(7, Some(&self.kpt_buf), 0);
+                enc.set_buffer(8, Some(&buffers.match_data_buf), 0);
+                enc.set_buffer(9, Some(&buffers.match_count_buf), 0);
+                enc.set_buffer(10, Some(&self.sorted_hashes_buf), 0);  // GPU binary search buffer
+                enc.set_buffer(11, Some(&self.hash_count_buf), 0);     // Hash count for binary search
+            }
+            
             enc.dispatch_threads(grid, group);
             enc.end_encoding();
         }
@@ -1062,15 +1324,27 @@ impl OptimizedScanner {
         let sync_cmd = buffers.queue.new_command_buffer();
         {
             let blit = sync_cmd.new_blit_command_encoder();
-            // Synchronize the buffers - waits for prior compute work on this queue
-            blit.synchronize_resource(&buffers.match_count_buf);
-            blit.synchronize_resource(&buffers.match_data_buf);
+            
+            #[cfg(feature = "zero-copy")]
+            {
+                // Zero-copy: Only sync count buffer (smaller, faster)
+                // Unified memory handles data buffer coherency automatically
+                blit.synchronize_resource(&buffers.match_count_buf);
+            }
+            
+            #[cfg(not(feature = "zero-copy"))]
+            {
+                // Legacy: Full synchronization
+                blit.synchronize_resource(&buffers.match_count_buf);
+                blit.synchronize_resource(&buffers.match_data_buf);
+            }
+            
             blit.end_encoding();
         }
         sync_cmd.commit();
         sync_cmd.wait_until_completed();
 
-        // Read results from buffer
+        // Read results from buffer (unified memory - zero-copy when feature enabled)
         let raw_match_count = unsafe {
             let ptr = buffers.match_count_buf.contents() as *const u32;
             *ptr
@@ -1175,15 +1449,32 @@ impl OptimizedScanner {
         self.config.keys_per_batch()
     }
     
+    /// Generate next base key for scanning (Philox RNG)
+    /// Uses Philox if enabled, otherwise returns error (should use external key pool)
+    #[cfg(feature = "philox-rng")]
+    pub fn next_base_key(&self) -> [u8; 32] {
+        let batch_size = self.keys_per_batch();
+        let state = self.philox_counter.next_batch(batch_size);
+        philox_to_privkey(&state)
+    }
+    
     /// Get current GPU configuration
+    /// Public API for external monitoring/debugging
+    #[allow(dead_code)]  // Public API, may be used externally
     pub fn config(&self) -> &GpuConfig {
         &self.config
     }
 
+    /// Get total number of keys scanned
+    /// Public API for statistics/monitoring
+    #[allow(dead_code)]  // Public API, may be used externally
     pub fn total_scanned(&self) -> u64 {
         self.total_scanned.load(Ordering::Relaxed)
     }
 
+    /// Get total number of matches found
+    /// Public API for statistics/monitoring
+    #[allow(dead_code)]  // Public API, may be used externally
     pub fn total_matches(&self) -> u64 {
         self.total_matches.load(Ordering::Relaxed)
     }
@@ -1202,6 +1493,7 @@ mod tests {
     
     /// Test that BOTH L1 and L2 contain ALL inserted hashes
     /// CRITICAL: L1 must contain ALL hashes, otherwise targets will be missed!
+    #[cfg(not(feature = "xor-filter"))]
     #[test]
     fn test_dual_bloom_all_hashes_in_both() {
         // Create test hashes
@@ -1232,6 +1524,7 @@ mod tests {
     }
     
     /// Test dual bloom filter check logic
+    #[cfg(not(feature = "xor-filter"))]
     #[test]
     fn test_dual_bloom_check_logic() {
         let mut hashes: Vec<[u8; 20]> = Vec::new();
@@ -1256,6 +1549,7 @@ mod tests {
     }
     
     /// Test that BloomFilter power-of-2 sizing works correctly
+    #[cfg(not(feature = "xor-filter"))]
     #[test]
     fn test_bloom_power_of_2() {
         let bloom = BloomFilter::new(1000);
@@ -1267,6 +1561,7 @@ mod tests {
     }
     
     /// Test BloomFilter new_with_bits
+    #[cfg(not(feature = "xor-filter"))]
     #[test]
     fn test_bloom_new_with_bits() {
         let bloom = BloomFilter::new_with_bits(1024 * 1024); // 1M bits = 128KB

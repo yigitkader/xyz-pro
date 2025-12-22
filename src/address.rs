@@ -14,6 +14,7 @@ pub fn p2sh_script_hash(pubkey_hash: &[u8; 20]) -> [u8; 20] {
 
 /// Private key to WIF (compressed format)
 /// Use `to_wif_compressed(key, true)` for compressed, `to_wif_compressed(key, false)` for uncompressed
+#[allow(dead_code)]  // Public API, may be used externally
 pub fn to_wif(key: &[u8; 32]) -> String {
     to_wif_compressed(key, true)
 }

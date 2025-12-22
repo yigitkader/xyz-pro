@@ -12,6 +12,7 @@ pub enum ScannerError {
     Json(#[from] serde_json::Error),
 
     #[error("Invalid address: {0}")]
+    #[allow(dead_code)]  // Reserved for future use
     InvalidAddress(String),
 }
 

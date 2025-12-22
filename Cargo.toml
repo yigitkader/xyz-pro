@@ -39,6 +39,38 @@ chrono = "0.4"
 ctrlc = "3.4"
 fxhash = "0.2"
 
+# Xor Filter (Phase 2)
+xorf = "0.11"
+
+[features]
+default = ["philox-rng", "xor-filter", "pid-thermal", "zero-copy"]  # Ultimate system enabled by default
+
+# Phase 1: Philox RNG
+philox-rng = []        # GPU-native Philox4x32 RNG
+
+# Phase 2: Xor Filter
+xor-filter = []         # O(1) Xor filter (vs Bloom + Binary)
+
+# Phase 3: SIMD Math
+simd-math = []          # SIMD-group 256-bit arithmetic
+
+# Phase 4: PID Thermal
+pid-thermal = []        # PID thermal controller
+
+# Phase 5: Zero-Copy
+zero-copy = []          # Zero-copy unified memory
+
+# Convenience feature sets
+all-features = ["philox-rng", "xor-filter", "simd-math", "pid-thermal", "zero-copy"]
+safe-features = ["philox-rng", "xor-filter", "pid-thermal"]  # Exclude risky SIMD and zero-copy
+
+# Legacy mode (all new features disabled)
+legacy-mode = []
+
+[dev-dependencies]
+hex = "0.4"  # For test vectors
+rand = "0.8"  # For random test data
+
 [profile.release]
 opt-level = 3
 lto = "fat"

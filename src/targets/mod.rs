@@ -1,3 +1,6 @@
+// src/targets/mod.rs
+// Target management module
+
 use bech32::{convert_bits, decode};
 use bs58;
 use fxhash::FxHashMap;
@@ -97,7 +100,7 @@ impl TargetDatabase {
 
     /// Binary formatından yükle (çok hızlı!)
     /// Supports both v1 (u32 count) and v2 (u64 count) formats
-    fn load_binary(path: &str) -> Result<Self> {
+    pub fn load_binary(path: &str) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
@@ -253,6 +256,8 @@ impl TargetDatabase {
 
     /// Check if pubkey_hash matches any target (P2PKH, P2WPKH, or P2SH)
     /// This also computes P2SH script_hash from pubkey_hash and checks that
+    /// Public API for external verification
+    #[allow(dead_code)]  // Public API, may be used externally
     pub fn check(&self, pubkey_hash: &Hash160) -> Option<(String, AddressType)> {
         // Direct check for P2PKH and P2WPKH
         if let Some(result) = self.check_direct(pubkey_hash) {
@@ -266,7 +271,9 @@ impl TargetDatabase {
     }
 
     /// Sadece AddressType dön (adres String'i oluşturmadan)
+    /// Public API for external verification
     #[inline]
+    #[allow(dead_code)]  // Public API, may be used externally
     pub fn check_type(&self, hash: &Hash160) -> Option<AddressType> {
         self.targets.get(hash).copied()
     }
@@ -391,3 +398,4 @@ fn should_use_binary(json_path: &str, bin_path: &str) -> bool {
         _ => bin_path.exists(),
     }
 }
+
