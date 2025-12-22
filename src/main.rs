@@ -1781,38 +1781,50 @@ fn verify_match(
     pm: &PotentialMatch,
     targets: &TargetDatabase,
 ) -> Option<(String, types::AddressType, [u8; 32])> {
-    // Reconstruct private key: base_key + key_index
-    // CRITICAL: Must handle multi-byte addition correctly
-    // key_index is u32, so we add it byte-by-byte with carry propagation
-    let mut priv_key = *base_key;
-    let mut carry = pm.key_index as u64;
-    for byte in priv_key.iter_mut().rev() {
-        // Add current byte of key_index + any carry from previous byte
-        let sum = *byte as u64 + (carry & 0xFF);
-        *byte = sum as u8;
-        // Shift out processed byte and add new carry if sum > 255
-        carry = (carry >> 8) + (sum >> 8);
-    }
-
-    // CRITICAL: Check for 256-bit overflow BEFORE GLV transform
-    // If carry is non-zero after processing all 32 bytes, the result
-    // overflowed the 256-bit space and is invalid
-    if carry != 0 {
-        return None;
-    }
+    use k256::elliptic_curve::PrimeField;
+    use k256::Scalar;
+    
+    // Reconstruct private key: base_key + key_index (MODULAR arithmetic!)
+    // CRITICAL: GPU uses point addition which is inherently modular
+    // CPU must use the same modular arithmetic to match GPU results
+    // 
+    // If base_key + key_index >= n (curve order), we need modular reduction
+    // k256::Scalar handles this automatically via from_repr_vartime
+    let priv_key = {
+        // Parse base_key as scalar
+        // from_repr_vartime returns None if >= curve order
+        let base_scalar = match Scalar::from_repr_vartime((*base_key).into()) {
+            Some(s) => s,
+            None => {
+                // base_key >= curve order - extremely rare edge case
+                // This should never happen with Philox-generated keys
+                // Fall back to linear addition (original behavior)
+                return verify_match_linear(base_key, pm, targets);
+            }
+        };
+        
+        // Add key_index as scalar (modular addition mod n)
+        let offset_scalar = Scalar::from(pm.key_index as u64);
+        let result_scalar = base_scalar + offset_scalar;
+        
+        // Convert back to bytes
+        let result_bytes: [u8; 32] = result_scalar.to_repr().into();
+        result_bytes
+    };
 
     // For GLV matches, the actual private key is λ·k (mod n)
     // This is because GPU used φ(P) = (β·Px, Py) which corresponds to λ·P
     // 
     // CORRECTNESS: glv_transform_key uses k256::Scalar which automatically
     // performs modular arithmetic (mod n where n is the secp256k1 curve order)
-    // No manual overflow handling needed - k256 handles it correctly
     let actual_key = if pm.match_type.is_glv() {
         gpu::glv_transform_key(&priv_key)
     } else {
         priv_key
     };
 
+    // Scalar operations already ensure 0 < key < n
+    // This check is now redundant but kept for safety
     if !crypto::is_valid_private_key(&actual_key) {
         return None;
     }
@@ -1878,6 +1890,65 @@ fn verify_match(
     }
 
     None
+}
+
+/// Fallback verify_match using linear (non-modular) addition
+/// Used when base_key >= curve order (extremely rare edge case)
+fn verify_match_linear(
+    base_key: &[u8; 32],
+    pm: &PotentialMatch,
+    targets: &TargetDatabase,
+) -> Option<(String, types::AddressType, [u8; 32])> {
+    // Linear addition (original algorithm)
+    let mut priv_key = *base_key;
+    let mut carry = pm.key_index as u64;
+    for byte in priv_key.iter_mut().rev() {
+        let sum = *byte as u64 + (carry & 0xFF);
+        *byte = sum as u8;
+        carry = (carry >> 8) + (sum >> 8);
+    }
+
+    if carry != 0 {
+        return None; // 256-bit overflow
+    }
+
+    let actual_key = if pm.match_type.is_glv() {
+        gpu::glv_transform_key(&priv_key)
+    } else {
+        priv_key
+    };
+
+    if !crypto::is_valid_private_key(&actual_key) {
+        return None;
+    }
+
+    let secret = SecretKey::from_slice(&actual_key).ok()?;
+    let pubkey = secret.public_key();
+
+    match pm.match_type {
+        MatchType::Compressed | MatchType::GlvCompressed => {
+            let comp = pubkey.to_encoded_point(true);
+            let comp_hash = crypto::hash160(comp.as_bytes());
+            let comp_h160 = types::Hash160::from_slice(&comp_hash);
+            if comp_h160 != pm.hash { return None; }
+            targets.check_direct(&comp_h160).map(|(addr, atype)| (addr, atype, actual_key))
+        }
+        MatchType::Uncompressed | MatchType::GlvUncompressed => {
+            let uncomp = pubkey.to_encoded_point(false);
+            let uncomp_hash = crypto::hash160(uncomp.as_bytes());
+            let uncomp_h160 = types::Hash160::from_slice(&uncomp_hash);
+            if uncomp_h160 != pm.hash { return None; }
+            targets.check_direct(&uncomp_h160).map(|(addr, atype)| (addr, atype, actual_key))
+        }
+        MatchType::P2SH | MatchType::GlvP2SH => {
+            let comp = pubkey.to_encoded_point(true);
+            let comp_hash = crypto::hash160(comp.as_bytes());
+            let p2sh_hash = address::p2sh_script_hash(&comp_hash);
+            let p2sh_h160 = types::Hash160::from_slice(&p2sh_hash);
+            if p2sh_h160 != pm.hash { return None; }
+            targets.check_direct(&p2sh_h160).map(|(addr, atype)| (addr, atype, actual_key))
+        }
+    }
 }
 
 // ============================================================================
