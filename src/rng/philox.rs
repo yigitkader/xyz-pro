@@ -149,13 +149,28 @@ impl PhiloxCounter {
     
     /// Get state for next GPU batch
     /// 
-    /// SAFETY: Panics if 128-bit counter overflows (after scanning 2^128 keys)
-    /// This is astronomically unlikely but ensures no silent key space wrap-around
+    /// Handles overflow gracefully:
+    /// - 64-bit overflow: Logs warning, wraps around (realistic edge case after 18.4 exakeys)
+    /// - 128-bit overflow: Logs critical error, wraps around (astronomically unlikely)
     pub fn next_batch(&self, batch_size: u64) -> PhiloxState {
         let counter_val = self.counter.fetch_add(batch_size, Ordering::Relaxed);
         let mut state = PhiloxState::new(self.base_seed);
+        
+        // Check for 64-bit overflow first (more likely than 128-bit)
+        if counter_val.checked_add(batch_size).is_none() {
+            eprintln!("[WARN] Philox 64-bit counter overflow! Wrapping around.");
+            // Fallback: wrap around and continue
+            let wrapped = counter_val.wrapping_add(batch_size);
+            state.counter[0] = wrapped as u32;
+            state.counter[1] = (wrapped >> 32) as u32;
+            return state;
+        }
+        
+        // Check for 128-bit overflow (astronomically unlikely)
         if !state.increment(counter_val) {
-            panic!("[FATAL] Philox 128-bit counter overflow! Scanned 2^128 keys - this should never happen.");
+            eprintln!("[CRITICAL] Philox 128-bit counter overflow! 2^128 keys scanned. Wrapping around.");
+            // Instead of panic, wrap around - better to continue scanning than crash
+            state.counter = [0, 0, 0, 0];
         }
         state
     }

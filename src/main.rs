@@ -1139,17 +1139,19 @@ fn main() {
                 // Set high priority QoS on macOS for faster verification
                 #[cfg(target_os = "macos")]
                 {
-                    // pthread_set_qos_class_self_np sets the QoS class for current thread
-                    // QOS_CLASS_USER_INTERACTIVE (0x21) = highest priority for responsive work
+                    // Set QoS class for current thread
+                    // QOS_CLASS_USER_INITIATED (0x19) = high priority for long-running user tasks
+                    // NOTE: USER_INTERACTIVE (0x21) is throttled by macOS for long-running work
+                    //       to protect UI responsiveness. USER_INITIATED is better for brute-force.
                     extern "C" {
                         fn pthread_set_qos_class_self_np(
                             qos_class: u32,
                             relative_priority: i32,
                         ) -> i32;
                     }
-                    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+                    const QOS_CLASS_USER_INITIATED: u32 = 0x19;
                     unsafe {
-                        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
                     }
                 }
                 
@@ -1163,7 +1165,7 @@ fn main() {
     match pool_result {
         Ok(()) => {
             #[cfg(target_os = "macos")]
-            println!("[CPU] Rayon: {} threads (P-cores, QOS_USER_INTERACTIVE)", p_core_count);
+            println!("[CPU] Rayon: {} threads (P-cores, QOS_USER_INITIATED)", p_core_count);
             #[cfg(not(target_os = "macos"))]
             println!("[CPU] Rayon: {} threads (P-cores only)", p_core_count);
         }
