@@ -1271,22 +1271,46 @@ fn get_performance_core_count() -> usize {
         // Method 2: Estimate based on total physical CPUs
         if let Some(total) = get_sysctl_int(b"hw.physicalcpu\0") {
             let total = total as usize;
-                        // Apple Silicon P-core estimates:
-                        // M1 base:  8 total → 4 P + 4 E → use 2 (leave CPU for system!)
-                        // M1 Pro:  10 total → 8 P + 2 E → use 6 (leave headroom)
-                        // M1 Max:  10 total → 8 P + 2 E → use 6
-                        // M1 Ultra: 20 total → 16 P + 4 E → use 10 (leave headroom)
+                        // ═══════════════════════════════════════════════════
+                        // APPLE SILICON CPU P-CORE TABLE
+                        // ═══════════════════════════════════════════════════
+                        // 
+                        // M1 Series:
+                        //   M1 base:   8 total (4P+4E) → use 2 threads
+                        //   M1 Pro:   10 total (6-8P+2E) → use 4-6 threads
+                        //   M1 Max:   10 total (8P+2E) → use 6 threads
+                        //   M1 Ultra: 20 total (16P+4E) → use 10 threads
                         //
-                        // CRITICAL: Base M1 shares bandwidth between GPU and CPU heavily
-                        // Using all 4 P-cores causes system freeze!
+                        // M2 Series:
+                        //   M2 base:   8 total (4P+4E) → use 2 threads
+                        //   M2 Pro:  10-12 total (6-8P+4E) → use 4-6 threads
+                        //   M2 Max:   12 total (8P+4E) → use 6 threads
+                        //   M2 Ultra: 24 total (16P+8E) → use 10 threads
+                        //
+                        // M3 Series:
+                        //   M3 base:   8 total (4P+4E) → use 2 threads
+                        //   M3 Pro:  11-12 total (5-6P+6E) → use 4 threads
+                        //   M3 Max:  14-16 total (10-12P+4E) → use 8 threads
+                        //
+                        // M4 Series:
+                        //   M4 base:  10 total (6P+4E) → use 3 threads
+                        //   M4 Pro:  12-14 total (8-10P+4E) → use 6 threads
+                        //   M4 Max:  14-16 total (10-12P+4E) → use 8 threads
+                        //
+                        // CRITICAL: Leave cores for system + GPU dispatch!
+                        // ═══════════════════════════════════════════════════
                         let p_cores = if total <= 8 {
-                            2  // Base M1: use only 2 threads to prevent freeze
+                            2  // Base M1/M2/M3: 4P, use 2
+                        } else if total == 10 {
+                            3  // M4 base (6P) or M1/M2 Pro (6-8P), use 3
                         } else if total <= 12 {
-                            total - 4  // Pro/Max: leave 4 cores for system
+                            4  // M2/M3 Pro: 6-8P, use 4
+                        } else if total <= 16 {
+                            6  // M3/M4 Max: 10-12P, use 6
                         } else {
-                            total - 6  // Ultra: leave 6 cores for system
+                            8  // Ultra: 16P, use 8
                         };
-            return p_cores.max(2).min(12);
+            return p_cores.max(2).min(10);
         }
     }
     

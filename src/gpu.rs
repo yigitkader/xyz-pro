@@ -79,101 +79,113 @@ impl GpuConfig {
     fn config_for_gpu(name: &str, max_threadgroup: usize, memory_mb: u64) -> (usize, u32, usize, usize) {
         let name_lower = name.to_lowercase();
         let detected_cores = Self::detect_gpu_cores();
-        let is_pro_class = detected_cores.map(|c| c >= 14).unwrap_or(false);
         
+        // ═══════════════════════════════════════════════════════════════════
+        // APPLE SILICON GPU CONFIGURATION TABLE (M1/M2/M3/M4 Series)
+        // ═══════════════════════════════════════════════════════════════════
+        // 
+        // Chip Class Detection Priority:
+        //   1. GPU name contains "ultra/max/pro"
+        //   2. GPU core count (detected via IOKit)
+        //   3. Memory size as fallback
+        //
+        // Thread Formula: gpu_cores × multiplier
+        //   - secp256k1 is register-heavy (~4KB/thread)
+        //   - Smaller threadgroup (64) = better occupancy
+        //   - Ultra/Max: aggressive (4096× cores)
+        //   - Pro: balanced (8192× cores, capped)
+        //   - Base: conservative (2048-3072× cores)
+        //
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // ─────────────────────────────────────────────────────────────────
+        // ULTRA CLASS (M1/M2 Ultra: 48-76 GPU cores, 128-192GB RAM)
+        // ─────────────────────────────────────────────────────────────────
         if name_lower.contains("ultra") || detected_cores.map(|c| c >= 48).unwrap_or(false) {
-            println!("[GPU] Detected: Ultra-class chip (48-64 cores)");
-            (
-                262_144,
-                128,
-                512.min(max_threadgroup),
-                4_194_304,
-            )
-        } else if name_lower.contains("max") {
-            println!("[GPU] Detected: Max-class chip (24-40 cores)");
-            (
-                147_456,
-                128,
-                512.min(max_threadgroup),
-                2_097_152,
-            )
-        } else if name_lower.contains("pro") || is_pro_class {
-            println!("[GPU] Detected: Pro-class chip (14-18 cores)");
+            let cores = detected_cores.unwrap_or(60);
+            println!("[GPU] Detected: ULTRA-class ({} GPU cores)", cores);
+            let threads = (cores * 4096).min(262_144);
+            println!("[GPU] ULTRA config: {} threads × 128 = {:.1}M keys/batch", 
+                threads, (threads * 128) as f64 / 1_000_000.0);
+            (threads, 128, 64.min(max_threadgroup), 4_194_304)
+        }
+        // ─────────────────────────────────────────────────────────────────
+        // MAX CLASS (M1/M2/M3/M4 Max: 24-40 GPU cores, 64-128GB RAM)
+        // ─────────────────────────────────────────────────────────────────
+        else if name_lower.contains("max") || detected_cores.map(|c| c >= 24).unwrap_or(false) {
+            let cores = detected_cores.unwrap_or(32);
+            println!("[GPU] Detected: MAX-class ({} GPU cores)", cores);
+            let threads = (cores * 4096).min(163_840);
+            println!("[GPU] MAX config: {} threads × 128 = {:.1}M keys/batch", 
+                threads, (threads * 128) as f64 / 1_000_000.0);
+            (threads, 128, 64.min(max_threadgroup), 2_097_152)
+        }
+        // ─────────────────────────────────────────────────────────────────
+        // PRO CLASS (M1/M2/M3/M4 Pro: 14-20 GPU cores, 16-48GB RAM)
+        // ─────────────────────────────────────────────────────────────────
+        else if name_lower.contains("pro") || detected_cores.map(|c| c >= 14).unwrap_or(false) {
+            let cores = detected_cores.unwrap_or(16);
+            println!("[GPU] Detected: PRO-class ({} GPU cores)", cores);
             
-            // OPTIMIZED: M1 Pro 14-core GPU with OCCUPANCY TUNING
-            //
-            // M1 Pro 14-core analysis:
-            //   - Secp256k1 is a REGISTER-HEAVY kernel (~4KB/thread)
-            //   - 256 threads/threadgroup causes REGISTER SPILLING
-            //   - Smaller threadgroup (64) = better occupancy = less spilling
-            //
-            // THREADGROUP SIZE 64 vs 256:
-            //   - 64: More threadgroups scheduled, less register spilling
-            //   - 256: Fewer threadgroups, more memory coalescing
-            //   - For secp256k1: 64 wins (+15-20% performance)
-            //
-            // Thread calculation:
-            //   - 14 cores × 64 = 896 threadgroups (same as before)
-            //   - 896 threadgroups × 64 threads = 57,344 threads
-            //   - BUT we need more threadgroups: 3584 × 64 = 229,376 threads
-            let (gpu_cores, max_threads, keys_per_thread, threadgroup_size) = if memory_mb >= 32000 {
-                println!("[GPU] M1 Pro 32GB+: Ultra performance config");
-                (16, 131_072, 128, 64.min(max_threadgroup))  // Smaller threadgroup!
+            // Pro chips: balance performance and stability
+            // M1 Pro (14-16 cores): cap at 131K threads
+            // M2/M3/M4 Pro (16-20 cores): cap at 163K threads
+            let threads = if cores >= 18 {
+                (cores * 8192).min(163_840)
             } else {
-                println!("[GPU] M1 Pro 16GB: 229K threads × 128 keys = 29.3M/batch");
-                // 229,376 threads / 64 = 3,584 threadgroups
-                (14, 229_376, 128, 64.min(max_threadgroup))  // 64 for better occupancy
+                (cores * 8192).min(131_072)
             };
             
-            println!("[GPU] M1 Pro {}-core: {} threads, {} keys/thread, threadgroup {}", 
-                gpu_cores, max_threads, keys_per_thread, threadgroup_size);
+            let match_buffer = if memory_mb >= 32000 { 1_048_576 } else { 524_288 };
+            println!("[GPU] PRO config: {} threads × 128 = {:.1}M keys/batch", 
+                threads, (threads * 128) as f64 / 1_000_000.0);
+            (threads, 128, 64.min(max_threadgroup), match_buffer)
+        }
+        // ─────────────────────────────────────────────────────────────────
+        // BASE CLASS (M1/M2/M3/M4: 7-10 GPU cores, 8-32GB RAM)
+        // ─────────────────────────────────────────────────────────────────
+        // 
+        // CRITICAL: Base chips share memory bandwidth with CPU!
+        // Too many GPU threads → system freeze
+        //
+        // Base chip specs:
+        //   M1:    7-8 GPU cores,  8-16GB, 4P+4E CPU
+        //   M2:   8-10 GPU cores,  8-24GB, 4P+4E CPU
+        //   M3:     10 GPU cores,  8-24GB, 4P+4E CPU
+        //   M4:     10 GPU cores, 16-32GB, 6P+4E CPU
+        //
+        // Conservative thread formula: cores × 2048 (16K-20K threads)
+        // ─────────────────────────────────────────────────────────────────
+        else {
+            let cores = detected_cores.unwrap_or(8);
             
-            // Match buffer sized for 29.3M keys
-            // 29.3M keys × 6 variants × 0.15% FP = ~264K expected matches
-            // Buffer: 524,288 (512K) → ~100% headroom ✓
-            let match_buffer = 524_288;
+            let (threads, match_buffer) = if memory_mb >= 24000 {
+                // M2/M3/M4 with 24-32GB: slightly more aggressive
+                println!("[GPU] Detected: BASE chip with {}GB ({} GPU cores)", memory_mb / 1024, cores);
+                (
+                    (cores * 3072).min(32_768),  // ~24K-30K threads
+                    262_144,
+                )
+            } else if memory_mb >= 16000 {
+                // M1/M2/M3 with 16GB: conservative to prevent freeze
+                println!("[GPU] Detected: BASE chip with 16GB ({} GPU cores)", cores);
+                (
+                    (cores * 2048).min(20_480),  // ~16K-20K threads
+                    196_608,
+                )
+            } else {
+                // 8GB systems: minimal
+                println!("[GPU] Detected: BASE chip with {}GB ({} GPU cores)", memory_mb / 1024, cores);
+                (
+                    (cores * 1024).min(12_288),  // ~8K-12K threads
+                    131_072,
+                )
+            };
             
-            (
-                max_threads,
-                keys_per_thread,
-                threadgroup_size,
-                match_buffer,
-            )
-        } else if memory_mb >= 16000 {
-            // BASE M1 with 16GB - CONSERVATIVE CONFIG to prevent system freeze!
-            // 
-            // Base M1 specs:
-            //   - 8 GPU cores (7-8 active depending on thermal)
-            //   - 4 P-cores + 4 E-cores (CPU)
-            //   - 16GB unified memory (shared with CPU!)
-            //
-            // CRITICAL: Base M1 has HALF the GPU cores of M1 Pro (8 vs 14-16)
-            // and shares memory bandwidth with CPU more aggressively.
-            // Using Pro-level settings causes system freeze!
-            //
-            // Conservative settings:
-            //   - 32K threads (vs 65K) = less GPU pressure
-            //   - 128 keys/thread = same efficiency
-            //   - 64 threadgroup = good occupancy
-            //   - 256K match buffer = enough for 4M keys
-            println!("[GPU] Detected: Base M1 with 16GB (8 GPU cores)");
-            println!("[GPU] Using conservative config to prevent system freeze");
-            (
-                32_768,   // 32K threads (half of previous) - less pressure on 8 GPU cores
-                128,      // Same keys per thread
-                64.min(max_threadgroup),  // 64 for better occupancy
-                262_144,  // 256K match buffer (reduced from 512K)
-            )
-        } else {
-            // Base M1 with 8GB - MINIMAL CONFIG
-            println!("[GPU] Detected: Base M1 (8GB or less)");
-            println!("[GPU] Using minimal config to preserve system resources");
-            (
-                16_384,   // 16K threads - very conservative for 8GB systems
-                128,
-                64.min(max_threadgroup),
-                131_072,  // 128K match buffer
-            )
+            println!("[GPU] BASE config: {} threads × 128 = {:.1}M keys/batch", 
+                threads, (threads * 128) as f64 / 1_000_000.0);
+            println!("[GPU] (Conservative to prevent system freeze)");
+            (threads, 128, 64.min(max_threadgroup), match_buffer)
         }
     }
     
