@@ -87,8 +87,14 @@ impl XorFilter32 {
             (fingerprints.len() * 4) as f64 / 1_000_000.0);
         println!("[Xor] Prefix table: {} unique prefixes ({:.1}% of targets), {:.2} MB",
             prefixes.len(), unique_ratio, prefix_memory_mb);
-        println!("[Xor] Prefix check reduces FP rate: 0.15% → ~{:.3}%",
-            0.15 * (prefixes.len() as f64 / (1u64 << 32) as f64) * 100.0);
+        
+        // Calculate combined FP rate after prefix check
+        // Xor filter FP: 0.15% = 0.0015 (fraction)
+        // Prefix collision: prefixes.len() / 2^32 (probability random hash matches a prefix)
+        // Combined: Xor_FP × Prefix_collision = effective FP rate
+        let prefix_collision_rate = prefixes.len() as f64 / (1u64 << 32) as f64;
+        let combined_fp_rate = 0.0015 * prefix_collision_rate * 100.0;  // As percentage
+        println!("[Xor] Prefix check reduces FP rate: 0.15% → ~{:.4}%", combined_fp_rate);
         
         Self {
             fingerprints,
