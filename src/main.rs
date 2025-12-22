@@ -1249,18 +1249,18 @@ fn get_performance_core_count() -> usize {
         // Method 2: Estimate based on total physical CPUs
         if let Some(total) = get_sysctl_int(b"hw.physicalcpu\0") {
             let total = total as usize;
-            // Apple Silicon P-core estimates:
-            // M1 base:  8 total → 4 P + 4 E → use 4
-            // M1 Pro:  10 total → 8 P + 2 E → use 8
-            // M1 Max:  10 total → 8 P + 2 E → use 8
-            // M1 Ultra: 20 total → 16 P + 4 E → use 12 (leave headroom)
-            let p_cores = if total <= 8 {
-                total / 2  // Base chips: 50% P-cores
-            } else if total <= 12 {
-                total - 2  // Pro/Max: total - 2 E-cores
-            } else {
-                total - 4  // Ultra: total - 4 E-cores
-            };
+                        // Apple Silicon P-core estimates:
+                        // M1 base:  8 total → 4 P + 4 E → use 4
+                        // M1 Pro:  10 total → 8 P + 2 E → use 8
+                        // M1 Max:  10 total → 8 P + 2 E → use 8
+                        // M1 Ultra: 20 total → 16 P + 4 E → use 12 (leave headroom)
+                        let p_cores = if total <= 8 {
+                            total / 2  // Base chips: 50% P-cores
+                        } else if total <= 12 {
+                            total - 2  // Pro/Max: total - 2 E-cores
+                        } else {
+                            total - 4  // Ultra: total - 4 E-cores
+                        };
             return p_cores.max(4).min(16);
         }
     }
@@ -1415,27 +1415,27 @@ fn main() {
     // Heavy tests - skip in fast mode
     if !fast_start {
         // CRITICAL: Run GPU correctness test
-        // This verifies GPU hash calculations match CPU exactly
-        if !run_gpu_correctness_test(&gpu, &targets) {
-            eprintln!("\n[FATAL] GPU correctness test failed. GPU calculations are WRONG!");
-            eprintln!("        DO NOT proceed - results would be unreliable!");
-            std::process::exit(1);
-        }
-        
-        // Run GPU pipeline test to verify async operations work correctly
-        if !run_gpu_pipeline_test(&gpu) {
-            eprintln!("\n[FATAL] GPU pipeline test failed. Exiting to prevent data corruption.");
-            std::process::exit(1);
-        }
-        
+    // This verifies GPU hash calculations match CPU exactly
+    if !run_gpu_correctness_test(&gpu, &targets) {
+        eprintln!("\n[FATAL] GPU correctness test failed. GPU calculations are WRONG!");
+        eprintln!("        DO NOT proceed - results would be unreliable!");
+        std::process::exit(1);
+    }
+    
+    // Run GPU pipeline test to verify async operations work correctly
+    if !run_gpu_pipeline_test(&gpu) {
+        eprintln!("\n[FATAL] GPU pipeline test failed. Exiting to prevent data corruption.");
+        std::process::exit(1);
+    }
+    
         // Quick startup verification
-        #[cfg(feature = "philox-rng")]
-        {
+    #[cfg(feature = "philox-rng")]
+    {
             if !run_startup_verification(&gpu) {
                 eprintln!("\n[FATAL] Startup verification failed. Run 'cargo test' for detailed diagnostics.");
-                std::process::exit(1);
-            }
+            std::process::exit(1);
         }
+    }
     } else {
         // Fast mode: Just verify GPU can run one batch
         print!("[⚡] Quick GPU check... ");
@@ -1448,7 +1448,7 @@ fn main() {
             Err(e) => {
                 println!("FAILED");
                 eprintln!("[FATAL] GPU initialization failed: {}", e);
-                std::process::exit(1);
+            std::process::exit(1);
             }
         }
     }
@@ -1526,14 +1526,17 @@ fn run_pipelined(
                 let mut last_batch_time = Instant::now();
                 let mut baseline_duration = Duration::from_millis(0);
                 let mut baseline_established = false;
+                let mut last_pid_print = Instant::now();
+                let mut batch_count = 0u32;
                 
                 let result = gpu.scan_pipelined(
                     || gpu.next_base_key(),
                     |base_key, matches| {
                         let batch_duration = last_batch_time.elapsed();
                         last_batch_time = Instant::now();
+                        batch_count += 1;
                         
-                        // Establish baseline (first few batches)
+                        // Establish baseline from first 5 batches (more stable)
                         if !baseline_established {
                             if baseline_duration.as_millis() == 0 {
                                 baseline_duration = batch_duration;
@@ -1542,7 +1545,8 @@ fn run_pipelined(
                                 let avg_ms = ((baseline_duration.as_millis() * 9 + batch_duration.as_millis()) / 10) as u64;
                                 baseline_duration = Duration::from_millis(avg_ms);
                             }
-                            if baseline_duration.as_millis() > 0 {
+                            // Wait for at least 5 batches before establishing baseline
+                            if batch_count >= 5 && baseline_duration.as_millis() > 0 {
                                 baseline_established = true;
                             }
                         }
@@ -1556,16 +1560,20 @@ fn run_pipelined(
                                     baseline_duration.as_millis() as u64
                                 )
                             } else {
-                                80.0 // Default until baseline established
+                                70.0 // Safe neutral estimate until baseline established
                             }
                         });
                         
                         // PID controller adjusts speed based on actual temperature
                         if let Some(_new_batch) = pid_controller.update(current_temp) {
                             let speed = pid_controller.current_speed();
-                            if (speed - 1.0).abs() > 0.05 {
-                                eprintln!("[PID] Speed: {:.1}% (temp: {:.1}°C)", 
+                            // Rate-limit PID output to every 10 seconds (was every batch!)
+                            // This prevents console spam and makes logs readable
+                            let should_print = last_pid_print.elapsed() >= Duration::from_secs(10);
+                            if should_print && (speed - 1.0).abs() > 0.05 {
+                                eprintln!("[PID] Speed: {:.1}% (temp: ~{:.0}°C)", 
                                     speed * 100.0, current_temp);
+                                last_pid_print = Instant::now();
                             }
                         }
                         
@@ -1628,8 +1636,8 @@ fn run_pipelined(
             
             let process_match = |pm: &PotentialMatch| {
                 if let Some((addr, atype, privkey)) = verify_match(&base_key, pm, &targets) {
-                    let compressed = pm.match_type != gpu::MatchType::Uncompressed 
-                        && pm.match_type != gpu::MatchType::GlvUncompressed;
+                            let compressed = pm.match_type != gpu::MatchType::Uncompressed 
+                                && pm.match_type != gpu::MatchType::GlvUncompressed;
                     
                     let mut keys = found_keys_clone.lock().unwrap();
                     if !keys.contains(&privkey) {
@@ -1659,6 +1667,7 @@ fn run_pipelined(
     let mut last_count = 0u64;
     let mut last_mem_check = Instant::now();
     let mut mem_warning_shown = false;
+    let mut rolling_speed = 0.0f64; // EMA for smooth speed display (no more 0/s jumps)
 
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
@@ -1695,14 +1704,28 @@ fn run_pipelined(
         if last_stat.elapsed() >= Duration::from_millis(500) {
             let count = counter.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
-            let speed = (count - last_count) as f64 / last_stat.elapsed().as_secs_f64();
+            let interval = last_stat.elapsed().as_secs_f64();
+            let instant_speed = (count - last_count) as f64 / interval;
+            
+            // Use EMA (Exponential Moving Average) for smooth speed display
+            // This prevents jarring 0/s → 48M/s jumps caused by triple buffering timing
+            // α = 0.3 for responsive but smooth updates
+            if rolling_speed == 0.0 && instant_speed > 0.0 {
+                // First valid reading: initialize
+                rolling_speed = instant_speed;
+            } else if instant_speed > 0.0 {
+                // Normal update: blend with previous
+                rolling_speed = rolling_speed * 0.7 + instant_speed * 0.3;
+            }
+            // If instant_speed == 0, keep the previous rolling_speed (don't reset to 0)
+            
             let avg = count as f64 / elapsed;
             let fp_count = verify_fp.load(Ordering::Relaxed);
 
             print!(
                 "\r[⚡] {} keys | {} (avg {}) | {} found | {} FP | {}    ",
                 format_num(count),
-                format_speed(speed),
+                format_speed(rolling_speed),
                 format_speed(avg),
                 found.load(Ordering::Relaxed),
                 format_num(fp_count),
@@ -1931,9 +1954,9 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
     std::thread::Builder::new()
         .name("logger".to_string())
         .spawn(move || {
-            use chrono::Local;
-            use std::fs::OpenOptions;
-            
+    use chrono::Local;
+    use std::fs::OpenOptions;
+
             // Pre-open file for faster writes
             let mut file = OpenOptions::new()
                 .create(true)
@@ -1945,19 +1968,19 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
                 let hex = hex::encode(&entry.privkey);
                 let wif = to_wif_compressed(&entry.privkey, entry.compressed);
                 let key_type = if entry.compressed { "compressed" } else { "uncompressed" };
-                let time = Local::now().format("%Y-%m-%d %H:%M:%S");
-                
+    let time = Local::now().format("%Y-%m-%d %H:%M:%S");
+
                 // Console output
-                println!("\n\n\x1b[1;32m");
-                println!("╔═══════════════════════════════════════════════════════╗");
-                println!("║                   🎉 KEY FOUND! 🎉                     ║");
-                println!("╠═══════════════════════════════════════════════════════╣");
+    println!("\n\n\x1b[1;32m");
+    println!("╔═══════════════════════════════════════════════════════╗");
+    println!("║                   🎉 KEY FOUND! 🎉                     ║");
+    println!("╠═══════════════════════════════════════════════════════╣");
                 println!("║ Address: {} ({})", entry.addr, entry.atype.as_str());
-                println!("║ Key: {} ({})", hex, key_type);
-                println!("║ WIF: {}", wif);
-                println!("╚═══════════════════════════════════════════════════════╝");
-                println!("\x1b[0m");
-                
+    println!("║ Key: {} ({})", hex, key_type);
+    println!("║ WIF: {}", wif);
+    println!("╚═══════════════════════════════════════════════════════╝");
+    println!("\x1b[0m");
+
                 // File write
                 if let Some(ref mut f) = file {
                     writeln!(f, "[{}] {} | {} | {} | {} | {}", 
