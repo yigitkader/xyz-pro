@@ -1,17 +1,11 @@
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-#[cfg(not(feature = "philox-rng"))]
-use k256::SecretKey;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
-
-#[cfg(feature = "philox-rng")]
 use crate::rng::philox::{PhiloxCounter, philox_to_privkey};
-
-#[cfg(feature = "xor-filter")]
 use crate::filter::XorFilter32;
 
 
@@ -159,277 +153,6 @@ impl GpuConfig {
 }
 
 
-// ============================================================================
-// BLOOM FILTER REMOVED - Using Xor Filter32 exclusively for better performance
-// 
-// Benefits of Xor Filter32 over Bloom Filter:
-// - 90% reduction in cache misses (no L1/L2 dual bloom overhead)
-// - 40% reduction in GPU thread idle time
-// - 30% reduction in code complexity
-// - Lower false positive rate (0.15% vs 0.4% for Bloom)
-// 
-// Bloom Filter code has been removed. Xor Filter32 is now the only filter.
-// ============================================================================
-
-// DEPRECATED: Bloom Filter removed - use Xor Filter32 instead
-#[deprecated(note = "Bloom Filter removed. Use XorFilter32 instead (enabled by default)")]
-#[cfg(not(feature = "xor-filter"))]
-pub struct BloomFilter {
-    bits: Vec<u64>,
-    num_bits: usize,
-}
-
-#[deprecated(note = "Bloom Filter removed. Use XorFilter32 instead")]
-#[cfg(not(feature = "xor-filter"))]
-impl BloomFilter {
-    pub fn new(n: usize) -> Self {
-        let bits_per_element = if n <= 1_000_000 {
-            16
-        } else if n <= 5_000_000 {
-            14
-        } else if n <= 20_000_000 {
-            13
-        } else if n <= 100_000_000 {
-            14
-        } else {
-            12
-        };
-        
-        let raw_bits = n * bits_per_element;
-        let num_bits = raw_bits.next_power_of_two().max(1024);
-        
-        let expansion_pct = (num_bits as f64 / raw_bits as f64 - 1.0) * 100.0;
-        if n > 100_000 && expansion_pct > 10.0 {
-            println!("[Bloom] Power-of-2 expansion: {:.1}MB → {:.1}MB (+{:.0}%)", 
-                raw_bits as f64 / 8_000_000.0,
-                num_bits as f64 / 8_000_000.0,
-                expansion_pct);
-        }
-        let num_words = num_bits / 64;
-        
-        let filter_size_mb = (num_words * 8) as f64 / 1_000_000.0;
-        let cache_status = if filter_size_mb <= 20.0 {
-            "fits L2 ✓"
-        } else if filter_size_mb <= 40.0 {
-            "uses unified memory"
-        } else {
-            "large filter ⚠"
-        };
-        
-        let k = 7.0f64;
-        let m = num_bits as f64;
-        let n_f = n as f64;
-        let fp_rate = (1.0 - (-k * n_f / m).exp()).powf(k) * 100.0;
-        
-        if n > 100_000 {
-            println!("[Bloom] {} targets × {} bits = {:.1}MB filter ({}, FP ~{:.2}%)", 
-                Self::format_count(n), bits_per_element, filter_size_mb, cache_status, fp_rate);
-        }
-        
-        if filter_size_mb > 50.0 {
-            eprintln!("[Bloom] WARNING: {:.1}MB filter is very large", filter_size_mb);
-        }
-        
-        Self {
-            bits: vec![0u64; num_words],
-            num_bits,
-        }
-    }
-    
-    fn format_count(n: usize) -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.1}K", n as f64 / 1_000.0)
-        } else {
-            format!("{}", n)
-        }
-    }
-
-    pub fn insert(&mut self, h: &[u8; 20]) {
-        for pos in self.positions(h) {
-            let (w, b) = (pos / 64, pos % 64);
-            if w < self.bits.len() {
-                self.bits[w] |= 1u64 << b;
-            }
-        }
-    }
-
-    fn positions(&self, h: &[u8; 20]) -> [usize; 7] {
-        let h1 = u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
-        let h2 = u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
-        let h3 = u32::from_le_bytes([h[16], h[17], h[18], h[19]]) as u64;
-        
-        let mask = (self.num_bits - 1) as u64;
-        
-        let mut p = [0usize; 7];
-        for i in 0..7 {
-            let m = (i + 1) as u64;
-            let hash_val = h1.wrapping_add(h2.wrapping_mul(m)).wrapping_add(h3.wrapping_mul(m * m));
-            p[i] = (hash_val & mask) as usize;
-        }
-        p
-    }
-
-    pub fn as_slice(&self) -> &[u64] {
-        &self.bits
-    }
-
-    pub fn size_words(&self) -> usize {
-        self.bits.len()
-    }
-    
-    #[allow(dead_code)]
-    pub fn contains(&self, h: &[u8; 20]) -> bool {
-        for pos in self.positions(h) {
-            let (w, b) = (pos / 64, pos % 64);
-            if w >= self.bits.len() || (self.bits[w] & (1u64 << b)) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-    
-    pub fn new_with_bits(num_bits: usize) -> Self {
-        assert!(num_bits.is_power_of_two(), "num_bits must be power of 2");
-        assert!(num_bits >= 1024, "num_bits must be at least 1024");
-        
-        let num_words = num_bits / 64;
-        
-        Self {
-            bits: vec![0u64; num_words],
-            num_bits,
-        }
-    }
-}
-
-#[deprecated(note = "DualBloomFilter removed. Use XorFilter32 instead (enabled by default)")]
-#[cfg(not(feature = "xor-filter"))]
-pub struct DualBloomFilter {
-    l1: BloomFilter,
-    l2: BloomFilter,
-    count: usize,
-}
-
-#[deprecated(note = "DualBloomFilter removed. Use XorFilter32 instead")]
-#[cfg(not(feature = "xor-filter"))]
-impl DualBloomFilter {
-    pub fn new(target_hashes: &[[u8; 20]]) -> Self {
-        println!("[Bloom] Creating dual-level filter for {} targets...", target_hashes.len());
-        
-        // Reduced from 4 to 2 bits per element to fit in L2 cache (12MB on M1 Pro)
-        // 50M targets × 2 bits = 100MB (still large but better than 200MB)
-        // Better solution: Remove L1 entirely and use only Xor Filter (see analiz.md)
-        const L1_BITS_PER_ELEMENT: usize = 2;
-        
-        let l1_raw_bits = target_hashes.len() * L1_BITS_PER_ELEMENT;
-        let l1_bits = l1_raw_bits.next_power_of_two().max(1024);
-        let l1_size_mb = l1_bits as f64 / 8_000_000.0;
-        
-        let k = 7.0f64;
-        let m = l1_bits as f64;
-        let n = target_hashes.len() as f64;
-        let l1_fp_rate = (1.0 - (-k * n / m).exp()).powf(k) * 100.0;
-        
-        println!("[Bloom] L1: {} targets × {} bits = {:.1}MB (FP ~{:.1}%)",
-            target_hashes.len(), L1_BITS_PER_ELEMENT, l1_size_mb, l1_fp_rate);
-        
-        let mut l1 = BloomFilter::new_with_bits(l1_bits);
-        for hash in target_hashes {
-            l1.insert(hash);
-        }
-        
-        let mut l2 = BloomFilter::new(target_hashes.len());
-        for hash in target_hashes {
-            l2.insert(hash);
-        }
-        
-        let l2_size_mb = (l2.size_words() * 8) as f64 / 1_000_000.0;
-        let l2_m = (l2.size_words() * 64) as f64;
-        let l2_fp_rate = (1.0 - (-k * n / l2_m).exp()).powf(k) * 100.0;
-        println!("[Bloom] L2: {} targets = {:.1}MB (FP ~{:.3}%)", 
-            target_hashes.len(), l2_size_mb, l2_fp_rate);
-        
-        if l1_size_mb > 24.0 {
-            eprintln!("[!] WARNING: L1 filter ({:.1}MB) exceeds L2 cache!", l1_size_mb);
-        }
-        
-        Self {
-            l1,
-            l2,
-            count: target_hashes.len(),
-        }
-    }
-    
-    pub fn l1_data(&self) -> &[u64] {
-        self.l1.as_slice()
-    }
-    
-    pub fn l2_data(&self) -> &[u64] {
-        self.l2.as_slice()
-    }
-    
-    pub fn l1_size_words(&self) -> usize {
-        self.l1.size_words()
-    }
-    
-    pub fn l2_size_words(&self) -> usize {
-        self.l2.size_words()
-    }
-    
-    #[allow(dead_code)]
-    pub fn target_count(&self) -> usize {
-        self.count
-    }
-    
-    #[allow(dead_code)]
-    pub fn contains(&self, h: &[u8; 20]) -> bool {
-        if !self.l1.contains(h) {
-            return false;
-        }
-        self.l2.contains(h)
-    }
-    
-    #[allow(dead_code)]
-    pub fn l1_contains(&self, h: &[u8; 20]) -> bool {
-        self.l1.contains(h)
-    }
-    
-    #[allow(dead_code)]
-    pub fn l2_contains(&self, h: &[u8; 20]) -> bool {
-        self.l2.contains(h)
-    }
-}
-
-fn compute_step_table(keys_per_thread: u32) -> [[u8; 64]; 20] {
-    use k256::elliptic_curve::PrimeField;
-    use k256::ProjectivePoint;
-    use k256::Scalar;
-
-    let mut table = [[0u8; 64]; 20];
-
-    let kpt_bytes = {
-        let mut b = [0u8; 32];
-        b[28..32].copy_from_slice(&keys_per_thread.to_be_bytes());
-        b
-    };
-
-    let kpt_scalar = Scalar::from_repr_vartime(kpt_bytes.into()).unwrap();
-    let mut current = ProjectivePoint::GENERATOR * kpt_scalar;
-
-    for i in 0..20 {
-        let affine = current.to_affine();
-        let encoded = affine.to_encoded_point(false);
-        let bytes = encoded.as_bytes();
-
-        table[i][..32].copy_from_slice(&bytes[1..33]);
-        table[i][32..64].copy_from_slice(&bytes[33..65]);
-
-        current = current.double();
-    }
-
-    table
-}
 
 fn compute_wnaf_step_table(keys_per_thread: u32) -> [[u8; 64]; 75] {
     use k256::elliptic_curve::PrimeField;
@@ -474,11 +197,7 @@ fn compute_wnaf_step_table(keys_per_thread: u32) -> [[u8; 64]; 75] {
 
 struct BufferSet {
     queue: CommandQueue,
-    #[cfg(not(feature = "philox-rng"))]
-    base_point_buf: Buffer,
-    #[cfg(feature = "philox-rng")]
     philox_key_buf: Buffer,
-    #[cfg(feature = "philox-rng")]
     philox_counter_buf: Buffer,
     match_data_buf: Buffer,
     match_count_buf: Buffer,
@@ -488,7 +207,6 @@ pub struct OptimizedScanner {
     pipeline: ComputePipelineState,
     buffer_sets: [BufferSet; 2],
     current_buffer: std::sync::atomic::AtomicUsize,
-    step_table_buf: Buffer,
     wnaf_table_buf: Buffer,
     
     // Xor Filter32 buffers (Bloom Filter removed for better performance)
@@ -502,8 +220,6 @@ pub struct OptimizedScanner {
     config: GpuConfig,
     total_scanned: AtomicU64,
     total_matches: AtomicU64,
-    
-    #[cfg(feature = "philox-rng")]
     philox_counter: PhiloxCounter,
 }
 
@@ -582,10 +298,7 @@ pub struct PotentialMatch {
 impl OptimizedScanner {
     fn combine_metal_shaders(base_shader: &str) -> Result<String> {
         let mut combined = String::new();
-        #[cfg(feature = "philox-rng")]
         combined.push_str("#define USE_PHILOX_RNG\n");
-        
-        #[cfg(feature = "xor-filter")]
         combined.push_str("#define USE_XOR_FILTER\n");
         
         #[cfg(feature = "simd-math")]
@@ -595,49 +308,43 @@ impl OptimizedScanner {
         combined.push_str("#include <metal_stdlib>\n");
         combined.push_str("using namespace metal;\n\n");
         
-        // Include Philox RNG if enabled
-        #[cfg(feature = "philox-rng")]
-        {
-            let philox_shader = fs::read_to_string("src/rng/philox.metal")
-                .map_err(|e| ScannerError::Gpu(format!("Failed to load philox.metal: {}", e)))?;
-            let philox_clean: String = philox_shader
-                .lines()
-                .filter(|l| {
-                    let trimmed = l.trim();
-                    !trimmed.starts_with("#include") && 
-                    !trimmed.starts_with("using namespace") &&
-                    !trimmed.is_empty()
-                })
-                .map(|l| format!("{}\n", l))
-                .collect();
-            combined.push_str("// ============================================================================\n");
-            combined.push_str("// PHILOX4X32 RNG (GPU-native key generation)\n");
-            combined.push_str("// ============================================================================\n");
-            combined.push_str(&philox_clean);
-            combined.push_str("\n\n");
-        }
+        // Include Philox RNG (always enabled)
+        let philox_shader = fs::read_to_string("src/rng/philox.metal")
+            .map_err(|e| ScannerError::Gpu(format!("Failed to load philox.metal: {}", e)))?;
+        let philox_clean: String = philox_shader
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.starts_with("#include") && 
+                !trimmed.starts_with("using namespace") &&
+                !trimmed.is_empty()
+            })
+            .map(|l| format!("{}\n", l))
+            .collect();
+        combined.push_str("// ============================================================================\n");
+        combined.push_str("// PHILOX4X32 RNG (GPU-native key generation)\n");
+        combined.push_str("// ============================================================================\n");
+        combined.push_str(&philox_clean);
+        combined.push_str("\n\n");
         
-        // Include Xor Filter if enabled
-        #[cfg(feature = "xor-filter")]
-        {
-            let xor_shader = fs::read_to_string("src/filter/xor_lookup.metal")
-                .map_err(|e| ScannerError::Gpu(format!("Failed to load xor_lookup.metal: {}", e)))?;
-            let xor_clean: String = xor_shader
-                .lines()
-                .filter(|l| {
-                    let trimmed = l.trim();
-                    !trimmed.starts_with("#include") && 
-                    !trimmed.starts_with("using namespace") &&
-                    !trimmed.is_empty()
-                })
-                .map(|l| format!("{}\n", l))
-                .collect();
-            combined.push_str("// ============================================================================\n");
-            combined.push_str("// XOR FILTER (O(1) lookup)\n");
-            combined.push_str("// ============================================================================\n");
-            combined.push_str(&xor_clean);
-            combined.push_str("\n\n");
-        }
+        // Include Xor Filter (always enabled)
+        let xor_shader = fs::read_to_string("src/filter/xor_lookup.metal")
+            .map_err(|e| ScannerError::Gpu(format!("Failed to load xor_lookup.metal: {}", e)))?;
+        let xor_clean: String = xor_shader
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.starts_with("#include") && 
+                !trimmed.starts_with("using namespace") &&
+                !trimmed.is_empty()
+            })
+            .map(|l| format!("{}\n", l))
+            .collect();
+        combined.push_str("// ============================================================================\n");
+        combined.push_str("// XOR FILTER32 (O(1) lookup, <0.15% FP rate)\n");
+        combined.push_str("// ============================================================================\n");
+        combined.push_str(&xor_clean);
+        combined.push_str("\n\n");
         
         // Include SIMD Math if enabled
         #[cfg(feature = "simd-math")]
@@ -725,8 +432,7 @@ impl OptimizedScanner {
         // - Lower false positive rate (0.15% vs 0.4%)
         let xor_filter = XorFilter32::new(target_hashes);
 
-        // Compute StepTables using config's keys_per_thread
-        let step_table = compute_step_table(config.keys_per_thread);
+        // Compute Windowed NAF table using config's keys_per_thread
         let wnaf_table = compute_wnaf_step_table(config.keys_per_thread);
         
         println!("[GPU] Windowed step table: {} entries (5 windows × 15 digits) for 50% faster thread start", wnaf_table.len());
@@ -741,22 +447,14 @@ impl OptimizedScanner {
         let buffer_sets = [
             BufferSet {
                 queue: device.new_command_queue(),  // Queue 0 for buffer 0
-                #[cfg(not(feature = "philox-rng"))]
-                base_point_buf: device.new_buffer(64, storage),
-                #[cfg(feature = "philox-rng")]
                 philox_key_buf: device.new_buffer(8, storage),  // uint2 = 8 bytes
-                #[cfg(feature = "philox-rng")]
                 philox_counter_buf: device.new_buffer(16, storage),  // uint4 = 16 bytes
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
             BufferSet {
                 queue: device.new_command_queue(),  // Queue 1 for buffer 1
-                #[cfg(not(feature = "philox-rng"))]
-                base_point_buf: device.new_buffer(64, storage),
-                #[cfg(feature = "philox-rng")]
                 philox_key_buf: device.new_buffer(8, storage),
-                #[cfg(feature = "philox-rng")]
                 philox_counter_buf: device.new_buffer(16, storage),
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
@@ -766,13 +464,7 @@ impl OptimizedScanner {
         println!("[GPU] Dual command queues for true parallel pipelining");
 
         // Shared read-only buffers
-        let step_table_buf = device.new_buffer_with_data(
-            step_table.as_ptr() as *const _,
-            (20 * 64) as u64,
-            storage,
-        );
-        
-        // Windowed step table: 5 windows × 15 non-zero digits = 75 entries
+        // Windowed NAF table: 5 windows × 15 non-zero digits = 75 entries
         let wnaf_table_buf = device.new_buffer_with_data(
             wnaf_table.as_ptr() as *const _,
             (75 * 64) as u64,
@@ -808,8 +500,7 @@ impl OptimizedScanner {
         );
         
         // Xor Filter32 doesn't need binary search (FP rate <0.15% is acceptable)
-        // Bloom Filter required binary search to eliminate false positives, but Xor Filter32
-        // has low enough FP rate that CPU-side verification is sufficient
+        // CPU-side verification is sufficient for the low false positive rate
         
         let hash_count = target_hashes.len() as u32;
         let hash_count_buf = device.new_buffer_with_data(
@@ -818,10 +509,10 @@ impl OptimizedScanner {
             storage,
         );
 
-        // Memory stats (Xor Filter32 only - Bloom Filter removed)
-        let double_buf_mem = 2 * (64 + match_buffer_size * 52 + 4);
+        // Memory stats (Xor Filter32 only)
+        let double_buf_mem = 2 * (8 + 16 + match_buffer_size * 52 + 4);  // philox_key + philox_counter + match_data + match_count
         let xor_mem = xor_filter.memory_bytes();
-        let shared_mem = 20 * 64 + xor_mem + 8 + 4;  // Step tables + xor filter + kpt + hash_count
+        let shared_mem = 75 * 64 + xor_mem + 4 + 4;  // wnaf_table + xor filter + kpt + hash_count
         let mem_mb = (double_buf_mem + shared_mem) as f64 / 1_000_000.0;
         
         println!("[GPU] Double buffering enabled for async pipelining");
@@ -831,7 +522,6 @@ impl OptimizedScanner {
         println!("[GPU] Total buffer memory: {:.2} MB", mem_mb);
 
         // Initialize Philox counter
-        #[cfg(feature = "philox-rng")]
         let philox_counter = {
             use rand::RngCore;
             let mut rng = rand::thread_rng();
@@ -844,7 +534,6 @@ impl OptimizedScanner {
             pipeline,
             buffer_sets,
             current_buffer: std::sync::atomic::AtomicUsize::new(0),
-            step_table_buf,
             wnaf_table_buf,
             xor_fingerprints_buf,
             xor_seeds_buf,
@@ -854,7 +543,6 @@ impl OptimizedScanner {
             config,
             total_scanned: AtomicU64::new(0),
             total_matches: AtomicU64::new(0),
-            #[cfg(feature = "philox-rng")]
             philox_counter,
         })
     }
@@ -862,42 +550,21 @@ impl OptimizedScanner {
     fn dispatch_batch(&self, base_key: &[u8; 32], buf_idx: usize) -> Result<()> {
         let buffers = &self.buffer_sets[buf_idx];
 
-        #[cfg(feature = "philox-rng")]
-        {
-            // PHILOX RNG MODE: Send only seed + counter to GPU (96 bytes vs 64KB base_point)
-            // GPU will generate private keys and compute public keys internally
-            // base_key parameter is unused in this mode
-            let _ = base_key;
-            let batch_size = self.config.keys_per_batch();
-            let state = self.philox_counter.next_batch(batch_size);
-            
-            unsafe {
-                // Send Philox key (uint2 = 8 bytes)
-                let key_ptr = buffers.philox_key_buf.contents() as *mut u32;
-                std::ptr::copy_nonoverlapping(state.key.as_ptr(), key_ptr, 2);
-                
-                // Send Philox counter (uint4 = 16 bytes)
-                let ctr_ptr = buffers.philox_counter_buf.contents() as *mut u32;
-                std::ptr::copy_nonoverlapping(state.counter.as_ptr(), ctr_ptr, 4);
-            }
-            
-            // base_point_buf is unused in Philox mode (GPU computes it from private key)
-        }
+        // PHILOX RNG MODE: Send only seed + counter to GPU (96 bytes vs 64KB base_point)
+        // GPU will generate private keys and compute public keys internally
+        // base_key parameter is unused in this mode
+        let _ = base_key;
+        let batch_size = self.config.keys_per_batch();
+        let state = self.philox_counter.next_batch(batch_size);
         
-        #[cfg(not(feature = "philox-rng"))]
-        {
-            // LEGACY MODE: Send base_point to GPU
-            let secret = SecretKey::from_slice(base_key)
-                .map_err(|e| ScannerError::Gpu(format!("invalid key: {}", e)))?;
-            let pubkey = secret.public_key();
-            let encoded = pubkey.to_encoded_point(false);
-            let pub_bytes = encoded.as_bytes();
-
-            unsafe {
-                let ptr = buffers.base_point_buf.contents() as *mut u8;
-                std::ptr::copy_nonoverlapping(pub_bytes[1..33].as_ptr(), ptr, 32);
-                std::ptr::copy_nonoverlapping(pub_bytes[33..65].as_ptr(), ptr.add(32), 32);
-            }
+        unsafe {
+            // Send Philox key (uint2 = 8 bytes)
+            let key_ptr = buffers.philox_key_buf.contents() as *mut u32;
+            std::ptr::copy_nonoverlapping(state.key.as_ptr(), key_ptr, 2);
+            
+            // Send Philox counter (uint4 = 16 bytes)
+            let ctr_ptr = buffers.philox_counter_buf.contents() as *mut u32;
+            std::ptr::copy_nonoverlapping(state.counter.as_ptr(), ctr_ptr, 4);
         }
 
         unsafe {
@@ -922,47 +589,27 @@ impl OptimizedScanner {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline);
                 
-                #[cfg(feature = "philox-rng")]
-                {
-                    // PHILOX RNG MODE: Buffer layout (Xor Filter32 only - Bloom Filter removed)
-                    // buffer(0) = philox_key (uint2)
-                    // buffer(1) = philox_counter (uint4)
-                    // buffer(2) = step_table (legacy, kept for compatibility)
-                    // buffer(3) = wnaf_table
-                    // buffer(4) = xor_fingerprints (32-bit)
-                    // buffer(5) = xor_seeds
-                    // buffer(6) = xor_block_length
-                    // buffer(7) = keys_per_thread
-                    // buffer(8) = match_data
-                    // buffer(9) = match_count
-                    // buffer(10) = hash_count
-                    enc.set_buffer(0, Some(&buffers.philox_key_buf), 0);
-                    enc.set_buffer(1, Some(&buffers.philox_counter_buf), 0);
-                    enc.set_buffer(2, Some(&self.step_table_buf), 0);
-                    enc.set_buffer(3, Some(&self.wnaf_table_buf), 0);
-                    enc.set_buffer(4, Some(&self.xor_fingerprints_buf), 0);
-                    enc.set_buffer(5, Some(&self.xor_seeds_buf), 0);
-                    enc.set_buffer(6, Some(&self.xor_block_length_buf), 0);
-                    enc.set_buffer(7, Some(&self.kpt_buf), 0);
-                    enc.set_buffer(8, Some(&buffers.match_data_buf), 0);
-                    enc.set_buffer(9, Some(&buffers.match_count_buf), 0);
-                    enc.set_buffer(10, Some(&self.hash_count_buf), 0);
-                }
-                
-                #[cfg(not(feature = "philox-rng"))]
-                {
-                    // LEGACY MODE: Buffer layout (Xor Filter32 only - Bloom Filter removed)
-                    enc.set_buffer(0, Some(&buffers.base_point_buf), 0);
-                    enc.set_buffer(1, Some(&self.step_table_buf), 0);
-                    enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);
-                    enc.set_buffer(3, Some(&self.xor_fingerprints_buf), 0);
-                    enc.set_buffer(4, Some(&self.xor_seeds_buf), 0);
-                    enc.set_buffer(5, Some(&self.xor_block_length_buf), 0);
-                    enc.set_buffer(6, Some(&self.kpt_buf), 0);
-                    enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
-                    enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
-                    enc.set_buffer(9, Some(&self.hash_count_buf), 0);
-                }
+                // PHILOX RNG MODE: Buffer layout (Xor Filter32 only)
+                // buffer(0) = philox_key (uint2)
+                // buffer(1) = philox_counter (uint4)
+                // buffer(2) = wnaf_table
+                // buffer(3) = xor_fingerprints (32-bit)
+                // buffer(4) = xor_seeds
+                // buffer(5) = xor_block_length
+                // buffer(6) = keys_per_thread
+                // buffer(7) = match_data
+                // buffer(8) = match_count
+                // buffer(9) = hash_count
+                enc.set_buffer(0, Some(&buffers.philox_key_buf), 0);
+                enc.set_buffer(1, Some(&buffers.philox_counter_buf), 0);
+                enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);
+                enc.set_buffer(3, Some(&self.xor_fingerprints_buf), 0);
+                enc.set_buffer(4, Some(&self.xor_seeds_buf), 0);
+                enc.set_buffer(5, Some(&self.xor_block_length_buf), 0);
+                enc.set_buffer(6, Some(&self.kpt_buf), 0);
+                enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
+                enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
+                enc.set_buffer(9, Some(&self.hash_count_buf), 0);
             
             enc.dispatch_threads(grid, group);
             enc.end_encoding();
@@ -1123,7 +770,6 @@ impl OptimizedScanner {
         self.config.keys_per_batch()
     }
     
-    #[cfg(feature = "philox-rng")]
     pub fn next_base_key(&self) -> [u8; 32] {
         let batch_size = self.keys_per_batch();
         let state = self.philox_counter.next_batch(batch_size);
@@ -1153,102 +799,33 @@ unsafe impl Sync for OptimizedScanner {}
 mod tests {
     use super::*;
     
-    #[cfg(not(feature = "xor-filter"))]
-    #[test]
-    fn test_dual_bloom_all_hashes_in_both() {
-        let mut hashes: Vec<[u8; 20]> = Vec::new();
-        for i in 0u32..2000 {
-            let mut h = [0u8; 20];
-            h[0..4].copy_from_slice(&i.to_be_bytes());
-            h[16..20].copy_from_slice(&(i * 7).to_be_bytes());
-            hashes.push(h);
-        }
-        
-        let dual = DualBloomFilter::new(&hashes);
-        
-        for (i, h) in hashes.iter().enumerate() {
-            assert!(dual.l1_contains(h), 
-                "L1 MUST contain hash {} - otherwise target will be missed!", i);
-            assert!(dual.l2_contains(h), 
-                "L2 should contain hash {}", i);
-        }
-        
-        for (i, h) in hashes.iter().enumerate() {
-            assert!(dual.contains(h),
-                "DualBloom should find hash {}", i);
-        }
-    }
-    
-    #[cfg(not(feature = "xor-filter"))]
-    #[test]
-    fn test_dual_bloom_check_logic() {
-        let mut hashes: Vec<[u8; 20]> = Vec::new();
-        for i in 0u32..500 {
-            let mut h = [0u8; 20];
-            h[0..4].copy_from_slice(&i.to_be_bytes());
-            hashes.push(h);
-        }
-        
-        let dual = DualBloomFilter::new(&hashes);
-        
-        for h in &hashes {
-            assert!(dual.contains(h), "Inserted hash should be found");
-        }
-    }
-    
-    #[cfg(not(feature = "xor-filter"))]
-    #[test]
-    fn test_bloom_power_of_2() {
-        let bloom = BloomFilter::new(1000);
-        let size = bloom.size_words() * 64;
-        
-        assert!(size.is_power_of_two(), 
-            "Bloom filter size {} is not power of 2", size);
-    }
-    
-    #[cfg(not(feature = "xor-filter"))]
-    #[test]
-    fn test_bloom_new_with_bits() {
-        let bloom = BloomFilter::new_with_bits(1024 * 1024);
-        assert_eq!(bloom.size_words(), 1024 * 1024 / 64);
-        
-        let hash: [u8; 20] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
-        let mut bloom = BloomFilter::new_with_bits(1024 * 1024);
-        bloom.insert(&hash);
-        assert!(bloom.contains(&hash), "Inserted hash should be found");
-    }
-    
     /// Test buffer index constants match between Metal and Rust
     /// This is a documentation test - actual verification requires running GPU
     #[test]
     fn test_buffer_index_documentation() {
-        // Buffer indices in dispatch_batch():
-        // 0: base_point_buf
-        // 1: step_table_buf
+        // Buffer indices in dispatch_batch() (Philox RNG mode):
+        // 0: philox_key_buf
+        // 1: philox_counter_buf
         // 2: wnaf_table_buf
-        // 3: l1_bloom_buf        (NEW)
-        // 4: l1_bloom_size_buf   (NEW)
-        // 5: l2_bloom_buf        (NEW)
-        // 6: l2_bloom_size_buf   (NEW)
-        // 7: kpt_buf             (was 5)
-        // 8: match_data_buf      (was 6)
-        // 9: match_count_buf     (was 7)
-        // 10: sorted_hashes_buf  (was 8)
-        // 11: hash_count_buf     (was 9)
+        // 3: xor_fingerprints_buf
+        // 4: xor_seeds_buf
+        // 5: xor_block_length_buf
+        // 6: kpt_buf
+        // 7: match_data_buf
+        // 8: match_count_buf
+        // 9: hash_count_buf
         
         // These must match Metal shader:
-        // buffer(0): base_point
-        // buffer(1): step_table
+        // buffer(0): philox_key
+        // buffer(1): philox_counter
         // buffer(2): wnaf_table
-        // buffer(3): l1_bloom
-        // buffer(4): l1_bloom_size
-        // buffer(5): l2_bloom
-        // buffer(6): l2_bloom_size
-        // buffer(7): keys_per_thread
-        // buffer(8): match_data
-        // buffer(9): match_count
-        // buffer(10): sorted_hashes
-        // buffer(11): hash_count
+        // buffer(3): xor_fingerprints
+        // buffer(4): xor_seeds
+        // buffer(5): xor_block_length
+        // buffer(6): keys_per_thread
+        // buffer(7): match_data
+        // buffer(8): match_count
+        // buffer(9): hash_count
         
         // If these don't match, GPU will read wrong data!
         // This test documents the expected layout.

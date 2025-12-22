@@ -593,7 +593,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     
     match scanner.scan_batch(&base_key) {
         Ok(matches) => {
-            println!("      Bloom filter hits in batch: {}", matches.len());
+            println!("      Xor Filter32 matches in batch: {}", matches.len());
             
             // CRITICAL TEST: Verify EVERY match from GPU against CPU calculation
             // This is the definitive test - if even ONE hash differs, GPU is broken
@@ -747,7 +747,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
                 }
             }
         } else {
-            println!("  [⚠] No matches to verify (bloom filter may not contain test hashes)");
+            println!("  [⚠] No matches to verify (Xor Filter32 may not contain test hashes)");
         }
     }
     
@@ -880,7 +880,7 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
     
     match (result_a1, result_b1, result_a2, result_b2) {
         (Ok(a1), Ok(b1), Ok(a2), Ok(b2)) => {
-            // Same keys should produce same match counts (bloom filter is deterministic)
+            // Same keys should produce same match counts (Xor Filter32 is deterministic)
             if a1.len() == a2.len() && b1.len() == b2.len() {
                 println!("  [✓] Double-buffer consistency verified");
             } else {
@@ -1377,7 +1377,7 @@ fn run_pipelined(
 
     // CPU verification with PARALLEL processing using rayon
     // This is the critical fix: single-threaded verification was the bottleneck
-    let verify_fp = Arc::new(AtomicU64::new(0)); // Track bloom false positives
+    let verify_fp = Arc::new(AtomicU64::new(0)); // Track Xor Filter32 false positives
     let verify_fp_clone = verify_fp.clone();
     
     // Simple Vec for found keys - collision probability is effectively zero (2²⁵⁶ key space)
@@ -1566,7 +1566,7 @@ fn verify_match(
 
             // Verify hash matches what GPU found
             if comp_h160 != pm.hash {
-                return None; // Hash mismatch - bloom false positive
+                return None; // Hash mismatch - Xor Filter32 false positive
             }
 
             // OPTIMIZATION: Use check_direct() instead of check()
@@ -1584,7 +1584,7 @@ fn verify_match(
 
             // Verify hash matches what GPU found
             if uncomp_h160 != pm.hash {
-                return None; // Hash mismatch - bloom false positive
+                return None; // Hash mismatch - Xor Filter32 false positive
             }
 
             // Check in targets - direct lookup only (uncompressed only for P2PKH legacy)
@@ -1601,7 +1601,7 @@ fn verify_match(
 
             // Verify hash matches what GPU found
             if p2sh_h160 != pm.hash {
-                return None; // Hash mismatch - bloom false positive
+                return None; // Hash mismatch - Xor Filter32 false positive
             }
 
             // Check in targets using the SCRIPT HASH directly (not pubkey hash!)

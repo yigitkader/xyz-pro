@@ -3,11 +3,11 @@ using namespace metal;
 
 // ============================================================================
 // XYZ-PRO OPTIMIZED GPU SCANNER
-// - StepTable for O(20) thread start point
-// - Montgomery batch inversion (1 mod_inv per 4 points)
+// - Windowed NAF table for fast thread start point
+// - Montgomery batch inversion (1 mod_inv per batch)
 // - Compressed + Uncompressed + P2SH hash160
-// - GPU-side Bloom filter check
-// Target: 100+ M/s on Apple M1
+// - GPU-side Xor Filter32 check (O(1) lookup, <0.15% FP rate)
+// Target: 250+ M/s on Apple M1 Pro
 // ============================================================================
 
 // SECP256K1 CONSTANTS
@@ -559,46 +559,6 @@ void compute_p2sh_script_hash(thread const uchar* pubkey_hash, thread uchar* scr
     ripemd160_32(sha, script_hash);
 }
 
-// OPTIMIZED: Bloom filter check with power-of-2 bitwise AND
-// Performance: ~40x faster than modulo (1 cycle vs 30-40 cycles)
-// Requirement: bloom filter size must be power-of-2 (guaranteed by gpu.rs)
-inline bool bloom_check(thread uchar* h, constant ulong* bloom, uint sz) {
-    if (sz == 0) return false;
-    
-    // Load hash bytes as ulong values (little-endian for consistency with Rust)
-    ulong h1 = ((ulong)h[0]) | ((ulong)h[1]<<8) | ((ulong)h[2]<<16) | ((ulong)h[3]<<24) | 
-               ((ulong)h[4]<<32) | ((ulong)h[5]<<40) | ((ulong)h[6]<<48) | ((ulong)h[7]<<56);
-    ulong h2 = ((ulong)h[8]) | ((ulong)h[9]<<8) | ((ulong)h[10]<<16) | ((ulong)h[11]<<24) | 
-               ((ulong)h[12]<<32) | ((ulong)h[13]<<40) | ((ulong)h[14]<<48) | ((ulong)h[15]<<56);
-    ulong h3 = ((ulong)h[16]) | ((ulong)h[17]<<8) | ((ulong)h[18]<<16) | ((ulong)h[19]<<24);
-    
-    // Total bits in filter (sz is number of 64-bit words)
-    ulong total = (ulong)sz * 64ULL;
-    
-    // CRITICAL OPTIMIZATION: Use bitwise AND instead of modulo
-    // Filter size is guaranteed to be power-of-2 by gpu.rs
-    // Bitwise AND: 1 cycle, Modulo: 30-40 cycles → 40x faster!
-    ulong mask = total - 1ULL;  // Power-of-2 mask (e.g., 128MB → 0x7FFFFFF)
-    
-    // 7-hash check with enhanced double hashing: h1 + i*h2 + i²*h3
-    for (uint i = 0; i < 7; i++) {
-        ulong m = (ulong)(i + 1);
-        ulong hash_val = h1 + h2 * m + h3 * m * m;
-        
-        // Bitwise AND for fast modulo (power-of-2 guaranteed)
-        ulong bit = hash_val & mask;
-        
-        // Check bit in bloom filter
-        ulong word_idx = bit >> 6;           // bit / 64
-        ulong bit_pos = bit & 63ULL;         // bit % 64
-        
-        if ((bloom[word_idx] & (1ULL << bit_pos)) == 0) {
-            return false;  // Definitely not in set
-        }
-    }
-    return true;  // Probably in set (check CPU to confirm)
-}
-
 // ============================================================================
 // XOR FILTER32 CHECK (Bloom Filter removed for better performance)
 // 
@@ -617,74 +577,32 @@ inline bool filter_check(thread uchar* h,
 
 // ============================================================================
 // MAIN KERNEL: scan_keys
-// - StepTable for O(20) thread start point
+// - Windowed NAF table for fast thread start point
 // - Montgomery batch inversion (BATCH_SIZE = 16)
 // - Hash160 compressed + uncompressed + P2SH
-// - Xor Filter32 check (Bloom Filter removed for better performance)
+// - Xor Filter32 check (O(1) lookup, <0.15% false positive rate)
 // ============================================================================
 
 // Match buffer size - must match config.match_buffer_size in gpu.rs
-// OPTIMIZED: 512K is sufficient with 12-bit bloom filter (FP ~0.2%)
+// OPTIMIZED: 512K is sufficient with Xor Filter32 (FP ~0.15%)
 // Memory savings: 4M → 512K = 87.5% reduction
 #define MAX_MATCHES 524288
-
-// ============================================================================
-// GPU-SIDE BINARY SEARCH: Eliminates 99.94% of Bloom filter false positives!
-// This is the key optimization for high-target-count scanning.
-// Instead of sending 166K FP matches to CPU, we verify on GPU first.
-// ============================================================================
-
-// Binary search for exact hash match in sorted array
-// Returns true if hash is found (real match), false if not (bloom FP)
-inline bool binary_search_hash(thread uchar* hash, constant uchar* sorted_hashes, uint count) {
-    if (count == 0) return false;
-    
-    uint left = 0;
-    uint right = count;
-    
-    while (left < right) {
-        uint mid = left + (right - left) / 2;
-        constant uchar* target = sorted_hashes + mid * 20;
-        
-        // Compare 20-byte hashes (lexicographic)
-        int cmp = 0;
-        for (int i = 0; i < 20 && cmp == 0; i++) {
-            cmp = (int)hash[i] - (int)target[i];
-        }
-        
-        if (cmp == 0) {
-            return true;  // Exact match found!
-        } else if (cmp < 0) {
-            right = mid;
-        } else {
-            left = mid + 1;
-        }
-    }
-    
-    return false;  // Not found (bloom false positive)
-}
 
 kernel void scan_keys(
 #ifdef USE_PHILOX_RNG
     // PHILOX RNG MODE: GPU generates private keys internally
     constant uint2* philox_key [[buffer(0)]],      // Seed (uint2 = 8 bytes)
     constant uint4* philox_counter [[buffer(1)]],  // Batch counter (uint4 = 16 bytes)
-    constant uchar* step_table [[buffer(2)]],      // Legacy: 20 entries × 64 bytes
-    constant uchar* wnaf_table [[buffer(3)]],      // wNAF w=4: 75 entries × 64 bytes
-#else
-    // LEGACY MODE: CPU sends base_point
-    constant uchar* base_point [[buffer(0)]],      // P_base (64 bytes: x || y)
-    constant uchar* step_table [[buffer(1)]],      // Legacy: 20 entries × 64 bytes
     constant uchar* wnaf_table [[buffer(2)]],      // wNAF w=4: 75 entries × 64 bytes
 #endif
-    // Xor Filter32: O(1) lookup, <0.15% false positive rate (Bloom Filter removed)
-    constant uint* xor_fingerprints [[buffer(4)]],  // Fingerprint table (32-bit)
-    constant ulong* xor_seeds [[buffer(5)]],          // 3 hash seeds
-    constant uint* xor_block_length [[buffer(6)]],     // Block length
-    constant uint* keys_per_thread [[buffer(7)]],
-    device uchar* match_data [[buffer(8)]],        // 52 bytes per match
-    device atomic_uint* match_count [[buffer(9)]],
-    constant uint* hash_count [[buffer(10)]],      // Number of hashes (for stats)
+    // Xor Filter32: O(1) lookup, <0.15% false positive rate
+    constant uint* xor_fingerprints [[buffer(3)]],  // Fingerprint table (32-bit)
+    constant ulong* xor_seeds [[buffer(4)]],          // 3 hash seeds
+    constant uint* xor_block_length [[buffer(5)]],     // Block length
+    constant uint* keys_per_thread [[buffer(6)]],
+    device uchar* match_data [[buffer(7)]],        // 52 bytes per match
+    device atomic_uint* match_count [[buffer(8)]],
+    constant uint* hash_count [[buffer(9)]],      // Number of hashes (for stats)
     uint gid [[thread_position_in_grid]]
 ) {
     uint kpt = *keys_per_thread;
@@ -765,11 +683,6 @@ kernel void scan_keys(
         base_x = mod_mul(cur_X, z_inv2);
         base_y = mod_mul(cur_Y, z_inv3);
     }
-#else
-    // LEGACY MODE: Load P_base from CPU
-    ulong4 base_x = load_be(base_point);
-    ulong4 base_y = load_be(base_point + 32);
-#endif
 
     // Thread start point using WINDOWED StepTable (4-bit windows)
     // EXTENDED JACOBIAN: (X, Y, Z, ZZ) where ZZ = Z² - saves 1 squaring per add
@@ -880,7 +793,7 @@ kernel void scan_keys(
             batch_Zinv[product_map[0]] = inv;
         }
 
-        // Phase 3: Convert to affine, hash, check bloom
+        // Phase 3: Convert to affine, hash, check Xor Filter32
         // GLV DUAL-RANGE: For each point P, also check φ(P) = (β·x, y)
         // This effectively DOUBLES our key scanning throughput!
         // match_type: 0=compressed, 1=uncompressed, 2=p2sh
@@ -928,16 +841,7 @@ kernel void scan_keys(
                 for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = hash_arr[hh]; \
             } while(0)
             
-            // ================================================================
-            // TWO-LEVEL VERIFICATION:
-            // 1. Bloom filter (fast probabilistic) → may have false positives
-            // 2. Binary search (exact match) → eliminates ALL false positives
-            // 
-            // Result: Only REAL matches are saved! CPU verification is trivial.
-            // Performance: 166K bloom hits → ~100 real matches per batch
-            // ================================================================
-            
-            // Check PRIMARY range (original keys) - Xor Filter32 only (Bloom Filter removed)
+            // Check PRIMARY range (original keys) - Xor Filter32 (O(1) lookup, <0.15% FP rate)
             // Xor Filter32: O(1) lookup, <0.15% FP rate (no binary search needed)
             if (filter_check(h_comp, xor_fingerprints, xor_seeds, xor_block_len)) {
                 SAVE_MATCH(h_comp, 0);  // Real match (FP rate <0.15%, acceptable)

@@ -278,7 +278,7 @@ impl TargetDatabase {
         self.targets.get(hash).copied()
     }
 
-    /// Get all hashes for Bloom filter
+    /// Get all hashes for Xor Filter32
     pub fn get_all_hashes(&self) -> Vec<[u8; 20]> {
         self.targets.keys().map(|h| *h.as_bytes()).collect()
     }
