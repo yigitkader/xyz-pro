@@ -1266,61 +1266,65 @@ fn try_read_soc_temperature() -> Option<f32> {
 
 /// Detect number of Performance cores on Apple Silicon
 /// Uses macOS sysctl to get accurate P-core count (excludes E-cores)
-/// Falls back to conservative estimate based on total CPU count
+/// OPTIMIZED: Uses native sysctlbyname instead of Command::new("sysctl")
+/// This avoids process forking overhead (~2-3ms per call)
 fn get_performance_core_count() -> usize {
-    // Try macOS sysctl first (most accurate for Apple Silicon)
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
+        // Native sysctlbyname - no process fork, microseconds instead of milliseconds
+        extern "C" {
+            fn sysctlbyname(
+                name: *const libc::c_char,
+                oldp: *mut libc::c_void,
+                oldlenp: *mut libc::size_t,
+                newp: *const libc::c_void,
+                newlen: libc::size_t,
+            ) -> libc::c_int;
+        }
         
-        // Method 1: Direct P-core count via hw.perflevel0.physicalcpu
-        // This is the most accurate for Apple Silicon
-        if let Ok(output) = Command::new("sysctl")
-            .args(["-n", "hw.perflevel0.physicalcpu"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(count_str) = std::str::from_utf8(&output.stdout) {
-                    if let Ok(count) = count_str.trim().parse::<usize>() {
-                        if count > 0 && count <= 32 {
-                            return count;
-                        }
-                    }
-                }
+        // Helper to get sysctl value
+        fn get_sysctl_int(name: &[u8]) -> Option<i32> {
+            unsafe {
+                let mut value: i32 = 0;
+                let mut size = std::mem::size_of::<i32>();
+                let result = sysctlbyname(
+                    name.as_ptr() as *const libc::c_char,
+                    &mut value as *mut i32 as *mut libc::c_void,
+                    &mut size,
+                    std::ptr::null(),
+                    0,
+                );
+                if result == 0 { Some(value) } else { None }
+            }
+        }
+        
+        // Method 1: Direct P-core count via hw.perflevel0.physicalcpu (most accurate)
+        if let Some(count) = get_sysctl_int(b"hw.perflevel0.physicalcpu\0") {
+            if count > 0 && count <= 32 {
+                return count as usize;
             }
         }
         
         // Method 2: Estimate based on total physical CPUs
-        // Use chip-aware calculation instead of simple division
-        if let Ok(output) = Command::new("sysctl")
-            .args(["-n", "hw.physicalcpu"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(count_str) = std::str::from_utf8(&output.stdout) {
-                    if let Ok(total) = count_str.trim().parse::<usize>() {
-                        // Apple Silicon P-core estimates:
-                        // M1 base:  8 total → 4 P + 4 E → use 4
-                        // M1 Pro:  10 total → 8 P + 2 E → use 8
-                        // M1 Max:  10 total → 8 P + 2 E → use 8
-                        // M1 Ultra: 20 total → 16 P + 4 E → use 12 (leave headroom)
-                        // M2/M3/M4: Similar ratios
-                        let p_cores = if total <= 8 {
-                            total / 2  // Base chips: 50% P-cores
-                        } else if total <= 12 {
-                            total - 2  // Pro/Max: total - 2 E-cores
-                        } else {
-                            total - 4  // Ultra: total - 4 E-cores
-                        };
-                        return p_cores.max(4).min(16); // Clamp to reasonable range
-                    }
-                }
-            }
+        if let Some(total) = get_sysctl_int(b"hw.physicalcpu\0") {
+            let total = total as usize;
+            // Apple Silicon P-core estimates:
+            // M1 base:  8 total → 4 P + 4 E → use 4
+            // M1 Pro:  10 total → 8 P + 2 E → use 8
+            // M1 Max:  10 total → 8 P + 2 E → use 8
+            // M1 Ultra: 20 total → 16 P + 4 E → use 12 (leave headroom)
+            let p_cores = if total <= 8 {
+                total / 2  // Base chips: 50% P-cores
+            } else if total <= 12 {
+                total - 2  // Pro/Max: total - 2 E-cores
+            } else {
+                total - 4  // Ultra: total - 4 E-cores
+            };
+            return p_cores.max(4).min(16);
         }
     }
     
     // Default fallback for non-macOS or if detection fails
-    // 6 is a safe default (was 4, too conservative for modern hardware)
     6
 }
 
@@ -1427,7 +1431,17 @@ fn main() {
         }
     }
 
-    // CRITICAL: Run self-test before anything else
+    // Check for fast startup mode (skip heavy tests)
+    // Use: FAST_START=1 ./xyz-pro OR ./xyz-pro --fast
+    let fast_start = std::env::var("FAST_START").is_ok() 
+        || std::env::args().any(|arg| arg == "--fast" || arg == "-f");
+    
+    if fast_start {
+        println!("[⚡] Fast start mode - skipping heavy startup tests");
+        println!("     (Run without --fast for full validation)\n");
+    }
+
+    // CRITICAL: Run self-test (lightweight, always run)
     // This ensures hash calculations are correct - a bug here means missed matches
     if !run_self_test() {
         eprintln!("\n[FATAL] Self-test failed. Exiting to prevent incorrect scanning.");
@@ -1457,28 +1471,44 @@ fn main() {
         }
     };
 
-    // CRITICAL: Run GPU correctness test FIRST
-    // This verifies GPU hash calculations match CPU exactly
-    // A single bit error means missed matches!
-    if !run_gpu_correctness_test(&gpu, &targets) {
-        eprintln!("\n[FATAL] GPU correctness test failed. GPU calculations are WRONG!");
-        eprintln!("        DO NOT proceed - results would be unreliable!");
-        std::process::exit(1);
-    }
-    
-    // Run GPU pipeline test to verify async operations work correctly
-    if !run_gpu_pipeline_test(&gpu) {
-        eprintln!("\n[FATAL] GPU pipeline test failed. Exiting to prevent data corruption.");
-        std::process::exit(1);
-    }
-    
-    // CRITICAL: Quick startup verification (full tests in tests/integration/)
-    // Verify basic functionality before scanning
-    #[cfg(feature = "philox-rng")]
-    {
-        if !run_startup_verification(&gpu) {
-            eprintln!("\n[FATAL] Startup verification failed. Run 'cargo test' for detailed diagnostics.");
+    // Heavy tests - skip in fast mode
+    if !fast_start {
+        // CRITICAL: Run GPU correctness test
+        // This verifies GPU hash calculations match CPU exactly
+        if !run_gpu_correctness_test(&gpu, &targets) {
+            eprintln!("\n[FATAL] GPU correctness test failed. GPU calculations are WRONG!");
+            eprintln!("        DO NOT proceed - results would be unreliable!");
             std::process::exit(1);
+        }
+        
+        // Run GPU pipeline test to verify async operations work correctly
+        if !run_gpu_pipeline_test(&gpu) {
+            eprintln!("\n[FATAL] GPU pipeline test failed. Exiting to prevent data corruption.");
+            std::process::exit(1);
+        }
+        
+        // Quick startup verification
+        #[cfg(feature = "philox-rng")]
+        {
+            if !run_startup_verification(&gpu) {
+                eprintln!("\n[FATAL] Startup verification failed. Run 'cargo test' for detailed diagnostics.");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Fast mode: Just verify GPU can run one batch
+        print!("[⚡] Quick GPU check... ");
+        stdout().flush().ok();
+        // Use a valid private key (key = 1)
+        let mut test_key = [0u8; 32];
+        test_key[31] = 1; // key = 1 (valid non-zero key)
+        match gpu.scan_batch(&test_key) {
+            Ok(_) => println!("OK"),
+            Err(e) => {
+                println!("FAILED");
+                eprintln!("[FATAL] GPU initialization failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -1633,61 +1663,41 @@ fn run_pipelined(
     let verify_handle = thread::spawn(move || {
         use rayon::prelude::*;
         
-        // OPTIMIZED: Minimal batch accumulation for lowest latency
-        // WHY: Smaller accumulation = lower latency
-        // - 2 batches × 14K FP = 28K verifications
-        // - 8 cores × 28K / 8 = 3,500 each
-        // - 3,500 × 60µs = 210ms verification time
-        // - vs GPU 64ms × 2 = 128ms → still slower but acceptable
+        // OPTIMIZED: Event-driven verification (no batch accumulation)
+        // WHY: Process matches immediately as they arrive
+        // - Zero wait time for batches to accumulate
+        // - Rayon's work-stealing handles load balancing automatically
+        // - Lower latency, better pipeline utilization
         //
-        // With PIPELINE_DEPTH=8, GPU has sufficient buffering (512ms)!
-        const MAX_BATCH_ACCUMULATION: usize = 2;
+        // The GPU runs ahead with triple buffering, so verification
+        // doesn't block the main scanning loop
         
         while !verify_shutdown.load(Ordering::Relaxed) {
-            // Collect batches for parallel processing
-            let mut batches: Vec<VerifyBatch> = Vec::with_capacity(MAX_BATCH_ACCUMULATION);
-            
-            // Wait for first batch with reduced timeout for faster response
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(batch) => {
-                    batches.push(batch);
-                    // Grab a few more if available (non-blocking)
-                    while batches.len() < MAX_BATCH_ACCUMULATION {
-                        match rx.try_recv() {
-                            Ok(b) => batches.push(b),
-                            Err(_) => break,
-                        }
-                    }
-                }
+            // Wait for a batch with short timeout (responsive shutdown)
+            let (base_key, matches) = match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(batch) => batch,
                 Err(_) => continue, // Timeout, check shutdown
-            }
+            };
             
-            // Parallel verification with simple Vec (collision probability effectively zero)
-            batches.par_iter()
-                .flat_map(|(base_key, matches)| {
-                    matches.par_iter().filter_map(|pm| {
-                        if let Some((addr, atype, privkey)) = verify_match(base_key, pm, &targets) {
-                            let compressed = pm.match_type != gpu::MatchType::Uncompressed 
-                                && pm.match_type != gpu::MatchType::GlvUncompressed;
-                            Some((addr, atype, privkey, compressed))
-                        } else {
-                            // Count false positives (atomic, safe)
-                            verify_fp_clone.fetch_add(1, Ordering::Relaxed);
-                            None
-                        }
-                    })
-                })
-                .for_each(|(addr, atype, privkey, compressed)| {
+            // Event-driven: spawn verification immediately
+            // Each match is verified as a Rayon task
+            matches.par_iter().for_each(|pm| {
+                if let Some((addr, atype, privkey)) = verify_match(&base_key, pm, &targets) {
+                    let compressed = pm.match_type != gpu::MatchType::Uncompressed 
+                        && pm.match_type != gpu::MatchType::GlvUncompressed;
+                    
                     // Simple Vec - check if key already seen before reporting
-                    // Collision between different keys is impossible (2²⁵⁶ space), but same key
-                    // could theoretically appear in multiple matches
                     let mut keys = found_keys_clone.lock().unwrap();
                     if !keys.contains(&privkey) {
                         keys.push(privkey);
                         verify_found.fetch_add(1, Ordering::Relaxed);
                         report(&privkey, &addr, atype, compressed);
                     }
-                });
+                } else {
+                    // Count false positives (atomic, safe)
+                    verify_fp_clone.fetch_add(1, Ordering::Relaxed);
+                }
+            });
         }
     });
 
@@ -1772,22 +1782,31 @@ fn verify_match(
     targets: &TargetDatabase,
 ) -> Option<(String, types::AddressType, [u8; 32])> {
     // Reconstruct private key: base_key + key_index
+    // CRITICAL: Must handle multi-byte addition correctly
+    // key_index is u32, so we add it byte-by-byte with carry propagation
     let mut priv_key = *base_key;
     let mut carry = pm.key_index as u64;
     for byte in priv_key.iter_mut().rev() {
+        // Add current byte of key_index + any carry from previous byte
         let sum = *byte as u64 + (carry & 0xFF);
         *byte = sum as u8;
+        // Shift out processed byte and add new carry if sum > 255
         carry = (carry >> 8) + (sum >> 8);
     }
 
-    // Check for overflow - if carry is non-zero after processing all bytes,
-    // the result wrapped around and is invalid
+    // CRITICAL: Check for 256-bit overflow BEFORE GLV transform
+    // If carry is non-zero after processing all 32 bytes, the result
+    // overflowed the 256-bit space and is invalid
     if carry != 0 {
         return None;
     }
 
     // For GLV matches, the actual private key is λ·k (mod n)
     // This is because GPU used φ(P) = (β·Px, Py) which corresponds to λ·P
+    // 
+    // CORRECTNESS: glv_transform_key uses k256::Scalar which automatically
+    // performs modular arithmetic (mod n where n is the secp256k1 curve order)
+    // No manual overflow handling needed - k256 handles it correctly
     let actual_key = if pm.match_type.is_glv() {
         gpu::glv_transform_key(&priv_key)
     } else {
@@ -1865,34 +1884,83 @@ fn verify_match(
 // REPORT
 // ============================================================================
 
+/// Async logging channel (global singleton)
+/// This eliminates blocking I/O from verification threads
+use std::sync::OnceLock;
+static REPORT_TX: OnceLock<crossbeam_channel::Sender<ReportEntry>> = OnceLock::new();
+
+/// Report entry for async logging
+struct ReportEntry {
+    privkey: [u8; 32],
+    addr: String,
+    atype: types::AddressType,
+    compressed: bool,
+}
+
+/// Initialize async logging thread (call once at startup)
+fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
+    use crossbeam_channel::unbounded;
+    
+    let (tx, rx) = unbounded::<ReportEntry>();
+    
+    // Spawn dedicated logging thread (low priority, won't block verification)
+    std::thread::Builder::new()
+        .name("logger".to_string())
+        .spawn(move || {
+            use chrono::Local;
+            use std::fs::OpenOptions;
+            
+            // Pre-open file for faster writes
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("found.txt")
+                .ok();
+            
+            for entry in rx {
+                let hex = hex::encode(&entry.privkey);
+                let wif = to_wif_compressed(&entry.privkey, entry.compressed);
+                let key_type = if entry.compressed { "compressed" } else { "uncompressed" };
+                let time = Local::now().format("%Y-%m-%d %H:%M:%S");
+                
+                // Console output
+                println!("\n\n\x1b[1;32m");
+                println!("╔═══════════════════════════════════════════════════════╗");
+                println!("║                   🎉 KEY FOUND! 🎉                     ║");
+                println!("╠═══════════════════════════════════════════════════════╣");
+                println!("║ Address: {} ({})", entry.addr, entry.atype.as_str());
+                println!("║ Key: {} ({})", hex, key_type);
+                println!("║ WIF: {}", wif);
+                println!("╚═══════════════════════════════════════════════════════╝");
+                println!("\x1b[0m");
+                
+                // File write
+                if let Some(ref mut f) = file {
+                    writeln!(f, "[{}] {} | {} | {} | {} | {}", 
+                        time, entry.addr, entry.atype.as_str(), key_type, hex, wif).ok();
+                    // Flush to ensure write persists
+                    use std::io::Write;
+                    let _ = f.flush();
+                }
+            }
+        })
+        .expect("Failed to spawn logger thread");
+    
+    tx
+}
+
+/// Non-blocking report (sends to async logger)
 fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType, compressed: bool) {
-    use chrono::Local;
-    use std::fs::OpenOptions;
-
-    let hex = hex::encode(privkey);
-    // CRITICAL: Use correct WIF format based on pubkey compression
-    // Wrong format = user cannot access coins!
-    let wif = to_wif_compressed(privkey, compressed);
-    let key_type = if compressed { "compressed" } else { "uncompressed" };
-    let time = Local::now().format("%Y-%m-%d %H:%M:%S");
-
-    println!("\n\n\x1b[1;32m");
-    println!("╔═══════════════════════════════════════════════════════╗");
-    println!("║                   🎉 KEY FOUND! 🎉                     ║");
-    println!("╠═══════════════════════════════════════════════════════╣");
-    println!("║ Address: {} ({})", addr, atype.as_str());
-    println!("║ Key: {} ({})", hex, key_type);
-    println!("║ WIF: {}", wif);
-    println!("╚═══════════════════════════════════════════════════════╝");
-    println!("\x1b[0m");
-
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("found.txt")
-    {
-        writeln!(f, "[{}] {} | {} | {} | {} | {}", time, addr, atype.as_str(), key_type, hex, wif).ok();
-    }
+    // Get or initialize the global logger
+    let tx = REPORT_TX.get_or_init(init_async_logger);
+    
+    // Non-blocking send (unbounded channel never blocks)
+    let _ = tx.send(ReportEntry {
+        privkey: *privkey,
+        addr: addr.to_string(),
+        atype,
+        compressed,
+    });
 }
 
 // ============================================================================

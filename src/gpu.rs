@@ -319,15 +319,24 @@ lazy_static::lazy_static! {
 /// Note: The Y coordinate is preserved in the endomorphism (y unchanged),
 /// so when reconstructing the public key from the transformed private key,
 /// the Y coordinate should match the original. Hash verification ensures correctness.
+/// 
+/// CORRECTNESS GUARANTEES:
+/// - k256::Scalar automatically reduces all values modulo n (curve order)
+/// - Multiplication is computed as (k × λ) mod n - no manual overflow handling needed
+/// - If key >= n, from_repr_vartime returns None and we fall back to original key
 pub fn glv_transform_key(key: &[u8; 32]) -> [u8; 32] {
     use k256::elliptic_curve::PrimeField;
     use k256::Scalar;
     
+    // Parse key as a scalar element of secp256k1
+    // Returns None if key >= n (curve order) - extremely rare edge case
+    // In that case, fall back to original key (will fail hash verification anyway)
     let key_scalar = match Scalar::from_repr_vartime((*key).into()) {
         Some(s) => s,
         None => return *key,
     };
     
+    // Compute λ·k mod n - k256 automatically handles modular reduction
     let result = key_scalar * *GLV_LAMBDA_SCALAR;
     result.to_repr().into()
 }
