@@ -285,9 +285,18 @@ mod tests {
             
             println!("Size {}: {:.2} bits/element", size, bits_per_elem);
             
-            // Should be around 18-24 bits/element (Xor32 uses 32-bit fingerprints vs 16-bit)
-            // Retry mechanism increases capacity if needed, so allow up to 24 bits
-            assert!(bits_per_elem < 24.0, "Too much space: {:.2} bits/elem", bits_per_elem);
+            // XorFilter32 uses 32-bit fingerprints (vs 16-bit for XorFilter16)
+            // This doubles the memory compared to XorFilter16, so expect ~40 bits/element
+            // Small sets may have higher overhead due to minimum capacity
+            // Large sets should be around 35-45 bits/element for XorFilter32
+            let max_bits = if size < 10_000 {
+                50.0  // Allow higher overhead for small sets
+            } else if size < 100_000 {
+                45.0  // Medium sets
+            } else {
+                42.0  // Large sets should be more efficient
+            };
+            assert!(bits_per_elem < max_bits, "Too much space: {:.2} bits/elem", bits_per_elem);
         }
     }
     

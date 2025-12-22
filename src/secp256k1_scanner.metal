@@ -589,12 +589,10 @@ inline bool filter_check(thread uchar* h,
 #define MAX_MATCHES 524288
 
 kernel void scan_keys(
-#ifdef USE_PHILOX_RNG
     // PHILOX RNG MODE: GPU generates private keys internally
     constant uint2* philox_key [[buffer(0)]],      // Seed (uint2 = 8 bytes)
     constant uint4* philox_counter [[buffer(1)]],  // Batch counter (uint4 = 16 bytes)
     constant uchar* wnaf_table [[buffer(2)]],      // wNAF w=4: 75 entries × 64 bytes
-#endif
     // Xor Filter32: O(1) lookup, <0.15% false positive rate
     constant uint* xor_fingerprints [[buffer(3)]],  // Fingerprint table (32-bit)
     constant ulong* xor_seeds [[buffer(4)]],          // 3 hash seeds
@@ -611,7 +609,6 @@ kernel void scan_keys(
     uint target_count = *hash_count;  // For stats only (Xor Filter32 doesn't need binary search)
 
     // PHILOX RNG MODE: Generate private key and compute public key
-#ifdef USE_PHILOX_RNG
     // Each thread generates its own private key from Philox
     PhiloxState philox_state = philox_for_thread(philox_key, philox_counter, gid);
     uchar privkey[32];
@@ -621,6 +618,7 @@ kernel void scan_keys(
     // Use windowed method: process private key in 4-bit windows (wNAF)
     // Start at infinity
     ulong4 cur_X = {0,0,0,0}, cur_Y = {1,0,0,0}, cur_Z = {0,0,0,0}, cur_ZZ = {0,0,0,0};
+    ulong4 base_x, base_y;
     
     // Process private key in 4-bit windows (64 windows for 256 bits)
     // Read private key as big-endian (Bitcoin standard)
