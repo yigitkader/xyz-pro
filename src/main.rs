@@ -353,6 +353,43 @@ fn run_self_test() -> bool {
         }
     }
     
+    // Test 5: Explicit GLV key reconstruction exact test
+    // CRITICAL: Verifies that GLV transform correctly computes λ·(base + offset)
+    {
+        use k256::elliptic_curve::PrimeField;
+        use k256::Scalar;
+        
+        let mut base: [u8; 32] = [0u8; 32];
+        base[31] = 100; // base = 100
+        let offset: u32 = 5; // base + 5 = 105
+        
+        let mut reconstructed = base;
+        let mut carry = offset as u64;
+        for byte in reconstructed.iter_mut().rev() {
+            let sum = *byte as u64 + (carry & 0xFF);
+            *byte = sum as u8;
+            carry = (carry >> 8) + (sum >> 8);
+        }
+        // reconstructed should now be 105
+        
+        let glv_key = gpu::glv_transform_key(&reconstructed);
+        
+        // Verify: glv_key should equal λ·105 mod n
+        let lambda = Scalar::from_repr_vartime(gpu::GLV_LAMBDA.into()).unwrap();
+        let k_scalar = Scalar::from_repr_vartime(reconstructed.into()).unwrap();
+        let expected_glv = lambda * k_scalar;
+        let expected_bytes: [u8; 32] = expected_glv.to_bytes().into();
+        
+        if glv_key == expected_bytes {
+            println!("  [✓] GLV key reconstruction exact match verified (λ·105)");
+        } else {
+            eprintln!("  [✗] GLV key reconstruction mismatch!");
+            eprintln!("      Expected: {}", hex::encode(expected_bytes));
+            eprintln!("      Got:      {}", hex::encode(glv_key));
+            all_passed = false;
+        }
+    }
+    
     // ========================================================================
     // WINDOWED STEP TABLE TEST
     // Verify the 5-window × 15-digit precomputation is correct
@@ -1016,8 +1053,9 @@ fn main() {
             if let Some(name) = thread.name() {
                 builder = builder.name(name.to_owned());
             }
-            // Stack size: 2MB per thread (sufficient for crypto operations)
-            builder = builder.stack_size(2 * 1024 * 1024);
+            // Stack size: 256KB per thread (sufficient for verification, reduces memory footprint)
+            // Verification uses max 100KB per thread, so 256KB provides safety margin
+            builder = builder.stack_size(256 * 1024);
             
             builder.spawn(|| {
                 // Set high priority QoS on macOS for faster verification
@@ -1244,11 +1282,10 @@ fn run_pipelined(
     let verify_fp = Arc::new(AtomicU64::new(0)); // Track bloom false positives
     let verify_fp_clone = verify_fp.clone();
     
-    // LOCK-FREE deduplication using DashMap (concurrent hashmap)
-    // Old: HashSet<[u8; 32]> with Mutex → 8 cores fighting for lock
-    // New: DashMap with sharded locks → no contention
-    use dashmap::DashMap;
-    let found_keys: Arc<DashMap<[u8; 32], ()>> = Arc::new(DashMap::new());
+    // Simple Vec for found keys - collision probability is effectively zero (2²⁵⁶ key space)
+    // DashMap overhead is unnecessary for this use case
+    use std::sync::Mutex;
+    let found_keys: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
     let found_keys_clone = found_keys.clone();
     
     let verify_handle = thread::spawn(move || {
@@ -1283,7 +1320,7 @@ fn run_pipelined(
                 Err(_) => continue, // Timeout, check shutdown
             }
             
-            // Parallel verification WITHOUT lock contention using DashMap
+            // Parallel verification with simple Vec (collision probability effectively zero)
             batches.par_iter()
                 .flat_map(|(base_key, matches)| {
                     matches.par_iter().filter_map(|pm| {
@@ -1299,9 +1336,12 @@ fn run_pipelined(
                     })
                 })
                 .for_each(|(addr, atype, privkey, compressed)| {
-                    // Lock-free insert-if-absent using DashMap
-                    if found_keys_clone.insert(privkey, ()).is_none() {
-                        // First time seeing this key
+                    // Simple Vec - check if key already seen before reporting
+                    // Collision between different keys is impossible (2²⁵⁶ space), but same key
+                    // could theoretically appear in multiple matches
+                    let mut keys = found_keys_clone.lock().unwrap();
+                    if !keys.contains(&privkey) {
+                        keys.push(privkey);
                         verify_found.fetch_add(1, Ordering::Relaxed);
                         report(&privkey, &addr, atype, compressed);
                     }

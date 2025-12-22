@@ -1,6 +1,13 @@
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Prevents runaway integral term accumulation
+const INTEGRAL_WINDUP_LIMIT: f32 = 10.0;
+
+// Maximum temperature derivative to prevent spikes on cold start
+// Limits derivative term to ±10°C/s to avoid excessive control action
+const MAX_DERIVATIVE_C_PER_S: f32 = 10.0;
+
 pub struct PIDController {
     target_temp: f32,
     kp: f32,
@@ -39,7 +46,7 @@ impl PIDController {
             last_speed: 1.0,
             min_speed: 0.5,
             max_speed: 1.2,
-            integral_max: 10.0,
+            integral_max: INTEGRAL_WINDUP_LIMIT,
             updates: AtomicU64::new(0),
             adjustments: AtomicU64::new(0),
             time_at_target: AtomicU64::new(0),
@@ -70,11 +77,13 @@ impl PIDController {
         self.integral = self.integral.clamp(-self.integral_max, self.integral_max);
         let i_term = self.ki * self.integral;
         
-        let temp_derivative = if self.updates.load(Ordering::Relaxed) > 1 {
+        // Derivative limiting to prevent spikes on cold start (e.g., 40°C → 85°C)
+        let raw_derivative = if self.updates.load(Ordering::Relaxed) > 1 {
             (current_temp - self.last_temp) / dt
         } else {
             0.0
         };
+        let temp_derivative = raw_derivative.clamp(-MAX_DERIVATIVE_C_PER_S, MAX_DERIVATIVE_C_PER_S);
         let d_term = self.kd * temp_derivative;
         
         self.last_temp = current_temp;

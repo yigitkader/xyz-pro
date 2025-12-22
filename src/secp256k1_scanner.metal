@@ -739,23 +739,23 @@ kernel void scan_keys(
     // Entry[window * 15 + (digit-1)] = digit * 2^(4*window) * kpt * G
     ulong4 cur_X = base_x, cur_Y = base_y, cur_Z = {1,0,0,0}, cur_ZZ = {1,0,0,0};
 
-    if (gid > 0) {
-        // Process 5 windows of 4 bits each (covers gid up to 2^20 = 1M threads)
-        #define WINDOW_ADD(window) { \
-            uint digit = (gid >> (4 * window)) & 0xF; \
-            if (digit != 0) { \
-                uint idx = window * 15 + (digit - 1); \
-                constant uchar* wp = wnaf_table + idx * 64; \
-                ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, load_be(wp), load_be(wp + 32), cur_X, cur_Y, cur_Z, cur_ZZ); \
-            } \
-        }
-        WINDOW_ADD(0)
-        WINDOW_ADD(1)
-        WINDOW_ADD(2)
-        WINDOW_ADD(3)
-        WINDOW_ADD(4)
-        #undef WINDOW_ADD
+    // FIXED: ALL threads use windowed table (even gid=0)
+    // This ensures synchronization and consistent performance across all threads
+    // Process 5 windows of 4 bits each (covers gid up to 2^20 = 1M threads)
+    #define WINDOW_ADD(window) { \
+        uint digit = (gid >> (4 * window)) & 0xF; \
+        if (digit != 0) { \
+            uint idx = window * 15 + (digit - 1); \
+            constant uchar* wp = wnaf_table + idx * 64; \
+            ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, load_be(wp), load_be(wp + 32), cur_X, cur_Y, cur_Z, cur_ZZ); \
+        } \
     }
+    WINDOW_ADD(0)
+    WINDOW_ADD(1)
+    WINDOW_ADD(2)
+    WINDOW_ADD(3)
+    WINDOW_ADD(4)
+    #undef WINDOW_ADD
 
     // Montgomery batch inversion (BATCH_SIZE = 48)
     // OPTIMIZED FOR M1 Pro 16GB: 48 = maximum occupancy without register spilling
@@ -856,17 +856,18 @@ kernel void scan_keys(
             uint key = base_offset + keys_done + b;
             
             // Optimized match saving macro
+            // FIXED: Single atomic operation to prevent TOCTOU race condition
+            // The atomic_fetch_add already increments, so idx is the value BEFORE increment
+            // This ensures only threads with idx < MAX_MATCHES can write
             #define SAVE_MATCH(hash_arr, type_val) do { \
-                uint cur = atomic_load_explicit(match_count, memory_order_relaxed); \
-                if (cur < MAX_MATCHES) { \
-                    uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed); \
-                    if (idx < MAX_MATCHES) { \
-                        uint off = idx * 52; \
-                        match_data[off+0] = key; match_data[off+1] = key>>8; \
-                        match_data[off+2] = key>>16; match_data[off+3] = key>>24; \
-                        match_data[off+4] = type_val; \
-                        for (int p = 5; p < 32; p++) match_data[off+p] = 0; \
-                        for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = hash_arr[hh]; \
+                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed); \
+                if (idx < MAX_MATCHES) { \
+                    uint off = idx * 52; \
+                    match_data[off+0] = key; match_data[off+1] = key>>8; \
+                    match_data[off+2] = key>>16; match_data[off+3] = key>>24; \
+                    match_data[off+4] = type_val; \
+                    for (int p = 5; p < 32; p++) match_data[off+p] = 0; \
+                    for (int hh = 0; hh < 20; hh++) match_data[off+32+hh] = hash_arr[hh]; \
                     } \
                 } \
             } while(0)
