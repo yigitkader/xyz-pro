@@ -3,7 +3,32 @@
 // 3 memory accesses + 2 XOR operations = ~6 cycles
 
 /// FxHash implementation for GPU (matches Rust FxHasher)
+/// Overload for constant address space (kernel parameters)
 inline ulong fx_hash(constant uchar* data, uint len, ulong seed) {
+    ulong hash = seed;
+    
+    // Process 8-byte chunks
+    for (uint i = 0; i + 8 <= len; i += 8) {
+        ulong chunk = ((ulong)data[i]) | ((ulong)data[i+1] << 8) | 
+                     ((ulong)data[i+2] << 16) | ((ulong)data[i+3] << 24) |
+                     ((ulong)data[i+4] << 32) | ((ulong)data[i+5] << 40) |
+                     ((ulong)data[i+6] << 48) | ((ulong)data[i+7] << 56);
+        
+        hash = hash ^ chunk;
+        hash = hash * 0x517cc1b727220a95UL;  // FxHash multiplier
+    }
+    
+    // Process remaining bytes
+    for (uint i = (len / 8) * 8; i < len; i++) {
+        hash = hash ^ (ulong)data[i];
+        hash = hash * 0x517cc1b727220a95UL;
+    }
+    
+    return hash;
+}
+
+/// FxHash overload for thread address space (local computed hashes)
+inline ulong fx_hash(thread uchar* data, uint len, ulong seed) {
     ulong hash = seed;
     
     // Process 8-byte chunks
