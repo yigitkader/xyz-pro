@@ -93,7 +93,7 @@ fn test_pid_stability() {
         temp -= temp_change;
         
         // Add small random noise to simulate real conditions
-        let noise = (step as f32 % 7) as f32 * 0.1 - 0.3;
+        let noise = (step as f32 % 7.0) * 0.1 - 0.3;
         temp += noise;
         
         temp = temp.max(85.0).min(89.0);  // Keep near target

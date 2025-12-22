@@ -109,85 +109,103 @@ impl XorFilter32 {
         block_length: usize,
         seeds: &[u64; 3],
     ) -> bool {
-        // Mapping phase: assign each key to 3 positions
-        let mut sets: Vec<Vec<usize>> = vec![Vec::new(); fingerprints.len()];
-        let mut key_fingerprints = Vec::with_capacity(targets.len());
+        // HIGHLY OPTIMIZED XOR FILTER CONSTRUCTION
+        //
+        // Algorithm: Standard Xor filter peeling with flat arrays
+        // Time: O(n) with small constant factor
+        // Memory: ~8n bytes for key data + 2n bytes for counts
+        //
+        // Key insight: Don't store position→key mappings at all!
+        // Instead: count + XOR of key indices at each position
+        // When count==1, XOR gives the single key index directly
         
-        for (idx, hash) in targets.iter().enumerate() {
+        let num_positions = fingerprints.len();
+        let num_targets = targets.len();
+        
+        // Pre-compute hashes and fingerprints
+        // Store as: (fingerprint, h0, h1, h2) packed efficiently
+        let mut key_fp: Vec<u32> = Vec::with_capacity(num_targets);
+        let mut key_h0: Vec<u32> = Vec::with_capacity(num_targets);
+        let mut key_h1: Vec<u32> = Vec::with_capacity(num_targets);
+        let mut key_h2: Vec<u32> = Vec::with_capacity(num_targets);
+        
+        // Count and XOR of key indices at each position
+        // XOR trick: when count==1, xor_val contains the single key index
+        let mut counts: Vec<u32> = vec![0; num_positions];
+        let mut xor_vals: Vec<u32> = vec![0; num_positions];
+        
+        for (key_idx, hash) in targets.iter().enumerate() {
             let fp = Self::compute_fingerprint(hash);
-            key_fingerprints.push(fp);
-            
             let (h0, h1, h2) = Self::hash_triple(hash, seeds, block_length);
-            sets[h0].push(idx);
-            sets[h1].push(idx);
-            sets[h2].push(idx);
+            
+            key_fp.push(fp);
+            key_h0.push(h0 as u32);
+            key_h1.push(h1 as u32);
+            key_h2.push(h2 as u32);
+            
+            let ki = key_idx as u32;
+            counts[h0] += 1;
+            counts[h1] += 1;
+            counts[h2] += 1;
+            xor_vals[h0] ^= ki;
+            xor_vals[h1] ^= ki;
+            xor_vals[h2] ^= ki;
         }
         
-        // Peeling phase: find order to assign fingerprints
-        let mut queue: Vec<usize> = Vec::new();
-        let mut alone = vec![false; fingerprints.len()];
+        // Find initial singletons (count == 1)
+        let mut queue: Vec<usize> = counts.iter()
+            .enumerate()
+            .filter(|(_, &c)| c == 1)
+            .map(|(pos, _)| pos)
+            .collect();
         
-        // Find singleton sets
-        for (pos, set) in sets.iter().enumerate() {
-            if set.len() == 1 {
-                alone[pos] = true;
-                queue.push(pos);
-            }
-        }
-        
-        // Peel the graph and store peeling order
-        let mut assignments = vec![None; targets.len()];
-        let mut peeling_order = Vec::new();  // Store order for reverse processing
+        // Peeling phase
+        let mut peeling_order: Vec<(u32, usize)> = Vec::with_capacity(num_targets);
         
         while let Some(pos) = queue.pop() {
-            if sets[pos].len() != 1 {
-                continue;
+            if counts[pos] != 1 {
+                continue;  // No longer singleton
             }
             
-            let key_idx = sets[pos][0];
-            assignments[key_idx] = Some(pos);
-            peeling_order.push(key_idx);  // Record peeling order
+            // XOR trick: when count==1, xor_val IS the key index
+            let key_idx = xor_vals[pos] as usize;
+            peeling_order.push((key_idx as u32, pos));
             
-            // Remove this key from all its sets
-            let hash = &targets[key_idx];
-            let (h0, h1, h2) = Self::hash_triple(hash, seeds, block_length);
+            // "Remove" this key from all its positions
+            let h0 = key_h0[key_idx] as usize;
+            let h1 = key_h1[key_idx] as usize;
+            let h2 = key_h2[key_idx] as usize;
+            let ki = key_idx as u32;
             
-            for &h in &[h0, h1, h2] {
-                if h == pos {
-                    continue;
-                }
-                
-                sets[h].retain(|&x| x != key_idx);
-                
-                if sets[h].len() == 1 && !alone[h] {
-                    alone[h] = true;
-                    queue.push(h);
-                }
-            }
+            // Decrement counts and update XOR values
+            counts[h0] -= 1;
+            counts[h1] -= 1;
+            counts[h2] -= 1;
+            xor_vals[h0] ^= ki;
+            xor_vals[h1] ^= ki;
+            xor_vals[h2] ^= ki;
+            
+            // Check for new singletons
+            if counts[h0] == 1 { queue.push(h0); }
+            if counts[h1] == 1 { queue.push(h1); }
+            if counts[h2] == 1 { queue.push(h2); }
         }
         
-        // Check if all keys were assigned (graph was fully peeled)
-        let unassigned = assignments.iter().filter(|&&a| a.is_none()).count();
-        if unassigned > 0 {
-            // Graph couldn't be fully peeled - construction failed
-            return false;
+        // Check if all keys were peeled
+        if peeling_order.len() != num_targets {
+            return false;  // Graph couldn't be fully peeled
         }
         
-        // Assignment phase: compute fingerprints in REVERSE order of peeling
-        // This ensures dependencies are resolved correctly
-        // Process keys in reverse order (last peeled first)
-        for &key_idx in peeling_order.iter().rev() {
-            if let Some(assigned_pos) = assignments[key_idx] {
-                let hash = &targets[key_idx];
-                let fp = key_fingerprints[key_idx];
-                let (h0, h1, h2) = Self::hash_triple(hash, seeds, block_length);
-                
-                // XOR all three positions
-                // Note: In reverse order, h0, h1, h2 may already have values set
-                // (except for assigned_pos which we're setting now)
-                let xor_val = fingerprints[h0] ^ fingerprints[h1] ^ fingerprints[h2];
-                fingerprints[assigned_pos] = xor_val ^ fp;
-            }
+        // Assignment phase: compute fingerprints in reverse order
+        for (key_idx, assigned_pos) in peeling_order.into_iter().rev() {
+            let ki = key_idx as usize;
+            let fp = key_fp[ki];
+            let h0 = key_h0[ki] as usize;
+            let h1 = key_h1[ki] as usize;
+            let h2 = key_h2[ki] as usize;
+            
+            let xor_val = fingerprints[h0] ^ fingerprints[h1] ^ fingerprints[h2];
+            fingerprints[assigned_pos] = xor_val ^ fp;
         }
         
         true  // Construction succeeded

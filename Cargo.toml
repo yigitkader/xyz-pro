@@ -72,6 +72,7 @@ legacy-mode = []
 [dev-dependencies]
 hex = "0.4"  # For test vectors
 rand = "0.8"  # For random test data
+k256 = { version = "0.13", features = ["ecdsa"] }  # For pubkey tests
 
 [profile.release]
 opt-level = 3

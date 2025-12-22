@@ -21,8 +21,7 @@ mod thermal;
 #[cfg(feature = "zero-copy")]
 mod scanner;
 
-#[cfg(feature = "philox-rng")]
-mod tests;
+// Self-tests moved to tests/integration/ - startup verification inline below
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -548,6 +547,7 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     {
         use crate::filter::XorFilter32;
         use rand::Rng;
+        use std::collections::HashSet;
         
         println!("  [🔍] Testing Xor Filter false positive rate...");
         
@@ -556,6 +556,11 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
         
         // Create Xor filter from targets
         let xor_filter = XorFilter32::new(&target_vec);
+        
+        // Build HashSet for O(1) membership check (instead of O(n) linear search)
+        // This is critical for large target sets (49M+ targets)
+        let target_set: HashSet<[u8; 20]> = target_vec.iter().copied().collect();
+        println!("  [Xor] Built HashSet for {} targets", target_set.len());
         
         // Test 100k random non-member keys
         let mut fp_count = 0;
@@ -566,8 +571,8 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
             let mut random_hash = [0u8; 20];
             rng.fill(&mut random_hash);
             
-            // Check if it's NOT in targets but filter says it is (false positive)
-            let in_targets = target_vec.iter().any(|&h| h == random_hash);
+            // O(1) HashSet lookup instead of O(n) linear search
+            let in_targets = target_set.contains(&random_hash);
             if !in_targets && xor_filter.contains(&random_hash) {
                 fp_count += 1;
             }
@@ -900,6 +905,107 @@ fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
         println!("[✓] GPU pipeline test passed\n");
     } else {
         eprintln!("[✗] GPU PIPELINE TEST FAILED!\n");
+    }
+    
+    all_passed
+}
+
+/// Quick startup verification - checks critical components before scanning
+/// Full tests are in tests/integration/ - run 'cargo test' for comprehensive testing
+#[cfg(feature = "philox-rng")]
+fn run_startup_verification(scanner: &OptimizedScanner) -> bool {
+    use crate::rng::{PhiloxCounter, PhiloxState, philox4x32_10};
+    
+    println!("[🔍] Running startup verification...");
+    
+    let mut all_passed = true;
+    
+    // Test 1: Philox RNG produces non-zero output
+    {
+        let state = PhiloxState::new(12345);
+        let output = philox4x32_10(&state);
+        if output[0] == 0 && output[1] == 0 && output[2] == 0 && output[3] == 0 {
+            eprintln!("  [✗] Philox RNG produced all-zero output!");
+            all_passed = false;
+        } else {
+            println!("  [✓] Philox RNG: OK");
+        }
+    }
+    
+    // Test 2: Counter increment works
+    {
+        let counter = PhiloxCounter::new(42);
+        let state1 = counter.next_batch(128);
+        let state2 = counter.next_batch(128);
+        // States should be different
+        if state1.counter == state2.counter {
+            eprintln!("  [✗] Philox counter increment failed!");
+            all_passed = false;
+        } else {
+            println!("  [✓] Philox counter: OK");
+        }
+    }
+    
+    // Test 3: GPU can scan a batch
+    {
+        let test_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap().try_into().unwrap();
+        
+        match scanner.scan_batch(&test_key) {
+            Ok(_) => {
+                println!("  [✓] GPU scan: OK");
+            }
+            Err(e) => {
+                eprintln!("  [✗] GPU scan failed: {}", e);
+                all_passed = false;
+            }
+        }
+    }
+    
+    // Test 4: Known Bitcoin test vector
+    {
+        use crypto::hash160;
+        
+        let priv_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap().try_into().unwrap();
+        let secret = SecretKey::from_slice(&priv_key).unwrap();
+        let pubkey = secret.public_key();
+        let compressed = pubkey.to_encoded_point(true);
+        let hash = hash160(compressed.as_bytes());
+        
+        let expected: [u8; 20] = hex::decode("751e76e8199196d454941c45d1b3a323f1433bd6")
+            .unwrap().try_into().unwrap();
+        
+        if hash == expected {
+            println!("  [✓] CPU hash calculation: OK");
+        } else {
+            eprintln!("  [✗] CPU hash calculation mismatch!");
+            all_passed = false;
+        }
+    }
+    
+    // Test 5: GLV transform works
+    {
+        let key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000005")
+            .unwrap().try_into().unwrap();
+        
+        let glv1 = gpu::glv_transform_key(&key);
+        let glv2 = gpu::glv_transform_key(&glv1);
+        let glv3 = gpu::glv_transform_key(&glv2);
+        
+        if glv3 == key {
+            println!("  [✓] GLV endomorphism: OK (λ³ = 1)");
+        } else {
+            eprintln!("  [✗] GLV endomorphism failed: λ³ ≠ 1");
+            all_passed = false;
+        }
+    }
+    
+    if all_passed {
+        println!("[✓] Startup verification passed\n");
+    } else {
+        eprintln!("[✗] STARTUP VERIFICATION FAILED!\n");
+        eprintln!("    Run 'cargo test --test integration' for detailed diagnostics.\n");
     }
     
     all_passed
@@ -1298,23 +1404,12 @@ fn main() {
         std::process::exit(1);
     }
     
-    // CRITICAL: Run comprehensive edge case tests
-    // These catch bugs in edge cases that normal tests might miss
+    // CRITICAL: Quick startup verification (full tests in tests/integration/)
+    // Verify basic functionality before scanning
     #[cfg(feature = "philox-rng")]
     {
-        use crate::tests::edge_cases;
-        if !edge_cases::run_all_edge_case_tests() {
-            eprintln!("\n[FATAL] Edge case tests failed. Exiting to prevent bugs.");
-            std::process::exit(1);
-        }
-    }
-    
-    // CRITICAL: Run CPU/GPU/Metal/Xor Filter integration tests
-    // Verifies all components work correctly together
-    {
-        use crate::tests::cpu_gpu_xor_integration;
-        if !cpu_gpu_xor_integration::run_cpu_gpu_xor_integration_tests(&gpu, &targets) {
-            eprintln!("\n[FATAL] CPU/GPU/Metal/Xor Filter integration tests failed. Exiting to prevent incorrect results.");
+        if !run_startup_verification(&gpu) {
+            eprintln!("\n[FATAL] Startup verification failed. Run 'cargo test' for detailed diagnostics.");
             std::process::exit(1);
         }
     }

@@ -107,7 +107,7 @@ fn bench_batch_latency() {
     
     let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
     let min = latencies.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-    let max = latencies.iter().fold(0.0, |a, &b| a.max(b));
+    let max = latencies.iter().fold(0.0f64, |a, &b| a.max(b));
     
     // Calculate standard deviation
     let variance = latencies.iter()

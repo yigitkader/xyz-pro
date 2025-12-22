@@ -260,7 +260,7 @@ fn test_full_pipeline() {
         .expect("Scan failed");
     
     // Should find the match
-    let found = matches.iter().any(|m| m.hash.as_slice() == target_hash);
+    let found = matches.iter().any(|m| *m.hash.as_bytes() == target_hash);
     
     if found {
         println!("✓ Full pipeline: Match found!");
