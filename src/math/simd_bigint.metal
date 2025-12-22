@@ -77,9 +77,31 @@ inline void simd_256_add(thread ulong4* a, thread ulong4* b, thread ulong4* resu
             else result->w = (result->w & 0xFFFFFFFF) | ((ulong)sum << 32);
         }
         
-        // Handle carry propagation (simplified - full SIMD coordination deferred)
-        // For now, fall back to scalar addition for correctness
-        *result = *a + *b;
+        // REAL SIMD: Use threadgroup memory for carry propagation
+        // This reduces register pressure by sharing data across SIMD group
+        threadgroup uint simd_carries[8];
+        simd_carries[chunk_idx] = carry;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // Get carry from previous thread
+        uint prev_carry = (chunk_idx > 0) ? simd_carries[chunk_idx - 1] : 0;
+        uint final_sum = sum + prev_carry;
+        
+        // Store results in threadgroup memory
+        threadgroup uint simd_results[8];
+        simd_results[chunk_idx] = final_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // Reconstruct result (all threads participate, but only one writes)
+        if (chunk_idx == 0) {
+            result->x = ((ulong)simd_results[1] << 32) | (ulong)simd_results[0];
+            result->y = ((ulong)simd_results[3] << 32) | (ulong)simd_results[2];
+            result->z = ((ulong)simd_results[5] << 32) | (ulong)simd_results[4];
+            result->w = ((ulong)simd_results[7] << 32) | (ulong)simd_results[6];
+        }
+        
+        // Broadcast result to all threads (via threadgroup barrier)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     } else {
         // Fallback to scalar addition if SIMD group size < 8
         ulong4 r;
