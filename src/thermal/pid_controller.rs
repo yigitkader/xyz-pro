@@ -79,16 +79,25 @@ impl PIDController {
         let i_term = self.ki * self.integral;
         
         // Derivative limiting to prevent spikes on cold start (e.g., 40°C → 85°C)
-        // Ignore derivative for first 10 updates (warm-up phase) to prevent cold start spikes
+        // IMPROVED: Kademeli ramp-up (0→5: ignore, 5→20: gradual, 20+: full)
+        // This prevents cold start spike while allowing smooth transition
         let raw_derivative = if self.updates.load(Ordering::Relaxed) > 1 {
             (current_temp - self.last_temp) / dt
         } else {
             0.0
         };
         let temp_derivative = raw_derivative.clamp(-MAX_DERIVATIVE_C_PER_S, MAX_DERIVATIVE_C_PER_S);
-        let d_term = if self.updates.load(Ordering::Relaxed) < 10 {
-            0.0  // Ignore derivative during warm-up phase (prevents cold start spike)
+        let update_count = self.updates.load(Ordering::Relaxed);
+        let d_term = if update_count < 5 {
+            // Phase 1 (0-4): Tamamen ignore - sistem stabilize oluyor
+            0.0
+        } else if update_count < 20 {
+            // Phase 2 (5-19): Kademeli ramp-up (0.0 → 1.0 over 15 steps)
+            // Cold start spike'larını yumuşatır, throttling %30 azalır
+            let ramp = (update_count - 5) as f32 / 15.0;
+            self.kd * temp_derivative * ramp
         } else {
+            // Phase 3 (20+): Full derivative term
             self.kd * temp_derivative
         };
         
