@@ -1095,7 +1095,8 @@ fn get_performance_core_count() -> usize {
     }
     
     // Default fallback for non-macOS or if detection fails
-    4
+    // 6 is a safe default (was 4, too conservative for modern hardware)
+    6
 }
 
 fn main() {
@@ -1456,9 +1457,10 @@ fn run_pipelined(
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
 
-        // Memory pressure check every 5 minutes (reduced overhead from vm_stat fork)
-        // vm_stat fork is expensive (~2-3% CPU), pressure rarely changes rapidly
-        if last_mem_check.elapsed() >= Duration::from_secs(300) {
+        // Memory pressure check every 10 minutes (was 5 min)
+        // vm_stat fork is expensive (~2-3% CPU overhead), M1 Pro 16GB rarely needs this
+        // Memory pressure changes slowly - 10 min interval is sufficient
+        if last_mem_check.elapsed() >= Duration::from_secs(600) {
             let mem_free_pct = check_memory_pressure();
             let pressure = MemoryPressure::from_free_pct(mem_free_pct);
             
@@ -1483,7 +1485,8 @@ fn run_pipelined(
             last_mem_check = Instant::now();
         }
 
-        if last_stat.elapsed() >= Duration::from_millis(200) {
+        // Stats update: 500ms interval (was 200ms - reduced stdout flush overhead)
+        if last_stat.elapsed() >= Duration::from_millis(500) {
             let count = counter.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let speed = (count - last_count) as f64 / last_stat.elapsed().as_secs_f64();

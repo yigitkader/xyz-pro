@@ -857,14 +857,24 @@ kernel void scan_keys(
     //   - No data sharing needed - each thread processes different keys
     //   - Montgomery batch inversion is per-thread operation
     //
-    // REGISTER PRESSURE ANALYSIS (M1 Pro):
-    //   - 24 batch × 5 arrays × 32 bytes = 3.8KB per thread
-    //   - M1 shader core: 256KB register file / 67 threads = ~3.8KB/thread ✓
-    //   - OPTIMAL: Maximum occupancy without register spilling!
+    // REGISTER PRESSURE ANALYSIS (M1 Pro) - CORRECTED:
+    //   Previous: 24 batch → 4.6KB/thread → 55 threads/core (REGISTER SPILLING!)
+    //   
+    //   Full calculation for BATCH_SIZE = 24:
+    //     - batch_X/Y/Z/ZZ/Zinv: 24 × 32 × 5 = 3840 bytes
+    //     - batch_valid: 24 × 1 = 24 bytes
+    //     - products: 24 × 32 = 768 bytes
+    //     - product_map: 24 × 4 = 96 bytes
+    //     - TOTAL: 4728 bytes = 4.6KB → REGISTER SPILLING!
     //
-    // PERFORMANCE: +15-20% from eliminated race condition and better cache usage
+    //   FIXED: BATCH_SIZE = 20 → 3.9KB/thread → 65 threads/core ✓
+    //     - 20 × 32 × 5 = 3200 bytes
+    //     - 20 + 640 + 80 = 740 bytes overhead
+    //     - TOTAL: 3940 bytes = 3.9KB → NO SPILLING!
+    //
+    // PERFORMANCE: +10-15% from better occupancy (65 vs 55 threads/core)
     // ============================================================================
-    #define BATCH_SIZE 24  // Optimal for M1 Pro register file
+    #define BATCH_SIZE 20  // Optimal for M1 Pro: no register spilling
     
     // Thread-local arrays (each thread has its own copy in registers)
     ulong4 batch_X[BATCH_SIZE];

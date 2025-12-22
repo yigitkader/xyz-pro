@@ -32,9 +32,9 @@ pub fn to_wif_compressed(key: &[u8; 32], compressed: bool) -> String {
     data.extend_from_slice(key);
     
     if compressed {
-        data.push(0x01); // Compression flag
+        data.push(0x01); // Compression flag (0x01 suffix)
     }
-    // Uncompressed: no extra byte
+    // Uncompressed: no 0x01 suffix (only prefix + key + checksum = 37 bytes)
     
     let checksum = Sha256::digest(&Sha256::digest(&data));
     data.extend_from_slice(&checksum[..4]);

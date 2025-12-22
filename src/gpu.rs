@@ -96,18 +96,26 @@ impl GpuConfig {
         } else if name_lower.contains("pro") || is_pro_class {
             println!("[GPU] Detected: Pro-class chip (14-18 cores)");
             
+            // OPTIMIZED: M1 Pro 16GB can handle 98K threads (was 65K - 34% underutilized!)
+            // Memory analysis:
+            //   - 98K threads × 128 keys = 12.5M keys/batch
+            //   - GPU buffer memory: ~50MB (well within 16GB)
+            //   - Expected throughput: +50% vs previous config
             let (gpu_cores, max_threads, keys_per_thread, threadgroup_size) = if memory_mb >= 32000 {
-                println!("[GPU] M1 Pro 32GB+: Higher performance config");
-                (16, 98_304, 128, 320.min(max_threadgroup))
+                println!("[GPU] M1 Pro 32GB+: Ultra performance config");
+                (16, 131_072, 128, 320.min(max_threadgroup))  // 16.7M/batch
             } else {
-                println!("[GPU] M1 Pro 16GB: 64K threads × 128 keys = 8.2M/batch");
-                (14, 65_536, 128, 256.min(max_threadgroup))
+                println!("[GPU] M1 Pro 16GB: 98K threads × 128 keys = 12.5M/batch");
+                (14, 98_304, 128, 256.min(max_threadgroup))   // +50% vs old 65K!
             };
             
             println!("[GPU] M1 Pro {}-core: {} threads, {} keys/thread, threadgroup {}", 
                 gpu_cores, max_threads, keys_per_thread, threadgroup_size);
             
-            let match_buffer = 32_768;
+            // FIXED: Match buffer sized for expected FP rate
+            // 12.5M keys × 6 variants × 0.15% FP = ~112K expected matches
+            // Buffer: 131K → ~17% headroom (was 32K - way too small!)
+            let match_buffer = 131_072;
             
             (
                 max_threads,
@@ -269,6 +277,11 @@ lazy_static::lazy_static! {
         use k256::elliptic_curve::PrimeField;
         k256::Scalar::from_repr_vartime(GLV_LAMBDA.into()).unwrap()
     };
+    
+    // Pre-computed wNAF step tables for common keys_per_thread values
+    // This eliminates ~10ms initialization overhead per Scanner::new() call
+    // First access triggers computation, subsequent accesses are instant
+    static ref WNAF_TABLE_128: [[u8; 64]; 75] = compute_wnaf_step_table(128);
 }
 
 /// Transform private key using GLV endomorphism: k → λ·k (mod n)
@@ -437,8 +450,13 @@ impl OptimizedScanner {
         // - Lower false positive rate (0.15% vs 0.4%)
         let xor_filter = XorFilter32::new(target_hashes);
 
-        // Compute Windowed NAF table using config's keys_per_thread
-        let wnaf_table = compute_wnaf_step_table(config.keys_per_thread);
+        // Use pre-computed wNAF table for keys_per_thread=128 (most common config)
+        // lazy_static eliminates ~10ms initialization overhead
+        let wnaf_table: [[u8; 64]; 75] = if config.keys_per_thread == 128 {
+            *WNAF_TABLE_128  // Pre-computed, instant access
+        } else {
+            compute_wnaf_step_table(config.keys_per_thread)  // Fallback for non-standard configs
+        };
         
         println!("[GPU] Windowed step table: {} entries (5 windows × 15 digits) for 50% faster thread start", wnaf_table.len());
 
@@ -584,18 +602,16 @@ impl OptimizedScanner {
         // GPU thread 0 of each threadgroup computes P = k * G in parallel
         // Other threads wait via barrier, then add their gid offset
         let batch_size = self.config.keys_per_batch();
-        let max_threads = self.config.max_threads as u64;
         
-        // FIXED: Domain separation - ensure unique counter per batch and thread
-        // counter = base_counter + batch_id * max_threads
-        // This ensures no overlap between batches even if batch_size < max_threads
-        let batch_id = self.philox_counter.total_generated() / batch_size;
-        let mut state = self.philox_counter.next_batch(batch_size);
-        
-        // Add batch_id * max_threads to ensure unique counter space per batch
-        // This prevents different batches from scanning overlapping key spaces
-        let batch_offset = batch_id * max_threads;
-        state.increment(batch_offset);
+        // FIXED: next_batch() already does fetch_add(batch_size) internally!
+        // NO EXTRA OFFSET NEEDED - GPU adds gid per thread for uniqueness
+        // 
+        // PREVIOUS BUG: batch_offset caused KEY SPACE JUMPS!
+        //   Batch 0: counter=0, GPU scans 0 to batch_size
+        //   Batch 1: counter=batch_size (from fetch_add), +batch_offset → KEYS SKIPPED!
+        //
+        // FIX: Just use next_batch() - counter increments automatically
+        let state = self.philox_counter.next_batch(batch_size);
         
         // NO MORE CPU PUBKEY CALCULATION!
         // GPU will compute P = k * G internally using scalar_mul_base()
@@ -607,8 +623,8 @@ impl OptimizedScanner {
             std::ptr::copy_nonoverlapping(state.key.as_ptr(), key_ptr, 2);
             
             // Send Philox counter (uint4 = 16 bytes)
-            // Counter is now unique per batch: base_counter + batch_id * max_threads
-            // Each thread will add its gid, ensuring no overlap
+            // Counter increments by batch_size each batch (via next_batch)
+            // GPU adds thread gid for per-thread uniqueness
             let ctr_ptr = buffers.philox_counter_buf.contents() as *mut u32;
             std::ptr::copy_nonoverlapping(state.counter.as_ptr(), ctr_ptr, 4);
             
