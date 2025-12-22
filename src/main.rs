@@ -1720,79 +1720,84 @@ fn run_pipelined(
         }
     });
 
-    // Stats display in main thread with memory monitoring
+    // DEBUG MODE: Comprehensive stats display with system monitoring
     let mut last_stat = Instant::now();
     let mut last_count = 0u64;
-    let mut last_mem_check = Instant::now();
-    let mut mem_warning_shown = false;
-    let mut rolling_speed = 0.0f64; // EMA for smooth speed display (no more 0/s jumps)
+    let mut last_fp_count = 0u64;
+    let mut rolling_speed = 0.0f64;
+    let mut batch_count = 0u64;
+
+    println!("\n[DEBUG] Monitoring enabled - showing RAM/stats every second");
+    println!("[DEBUG] Press Ctrl+C to stop\n");
 
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
 
-        // Memory pressure check every 10 minutes (was 5 min)
-        // vm_stat fork is expensive (~2-3% CPU overhead), M1 Pro 16GB rarely needs this
-        // Memory pressure changes slowly - 10 min interval is sufficient
-        if last_mem_check.elapsed() >= Duration::from_secs(600) {
-            let mem_free_pct = check_memory_pressure();
-            let pressure = MemoryPressure::from_free_pct(mem_free_pct);
-            
-            match pressure {
-                MemoryPressure::Critical => {
-                    if !mem_warning_shown {
-                        eprintln!("\n[!] CRITICAL: Low memory ({:.1}% free)!", mem_free_pct);
-                        eprintln!("    Consider reducing target count or closing other apps.");
-                        mem_warning_shown = true;
-                    }
-                }
-                MemoryPressure::Warning => {
-                    if !mem_warning_shown {
-                        eprintln!("\n[!] WARNING: Memory pressure detected ({:.1}% free)", mem_free_pct);
-                        mem_warning_shown = true;
-                    }
-                }
-                MemoryPressure::Normal => {
-                    mem_warning_shown = false; // Reset for next warning cycle
-                }
-            }
-            last_mem_check = Instant::now();
-        }
-
-        // Stats update: 500ms interval (was 200ms - reduced stdout flush overhead)
-        if last_stat.elapsed() >= Duration::from_millis(500) {
+        // Stats update every 1 second with full debug info
+        if last_stat.elapsed() >= Duration::from_millis(1000) {
             let count = counter.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let interval = last_stat.elapsed().as_secs_f64();
             let instant_speed = (count - last_count) as f64 / interval;
             
-            // Use EMA (Exponential Moving Average) for smooth speed display
-            // This prevents jarring 0/s → 48M/s jumps caused by triple buffering timing
-            // α = 0.3 for responsive but smooth updates
+            // EMA for smooth speed
             if rolling_speed == 0.0 && instant_speed > 0.0 {
-                // First valid reading: initialize
                 rolling_speed = instant_speed;
             } else if instant_speed > 0.0 {
-                // Normal update: blend with previous
                 rolling_speed = rolling_speed * 0.7 + instant_speed * 0.3;
             }
-            // If instant_speed == 0, keep the previous rolling_speed (don't reset to 0)
             
             let avg = count as f64 / elapsed;
             let fp_count = verify_fp.load(Ordering::Relaxed);
+            let found_count = found.load(Ordering::Relaxed);
+            
+            // Calculate batch count (approximate)
+            let keys_per_batch = 1_048_576u64; // 1M keys/batch
+            let new_batches = (count - last_count) / keys_per_batch;
+            batch_count += new_batches;
+            
+            // Get memory usage
+            let mem_free_pct = check_memory_pressure();
+            let mem_used_pct = 100.0 - mem_free_pct;
+            
+            // FP rate calculation
+            let fp_delta = fp_count - last_fp_count;
+            let keys_delta = count - last_count;
+            let fp_rate = if keys_delta > 0 {
+                (fp_delta as f64 / keys_delta as f64) * 100.0
+            } else {
+                0.0
+            };
 
-            print!(
-                "\r[⚡] {} keys | {} (avg {}) | {} found | {} FP | {}    ",
+            // Clear line and print comprehensive stats
+            print!("\r\x1b[K"); // Clear line
+            println!(
+                "[⚡] {} keys | {} (avg {}) | {} found | {} FP ({:.4}%) | RAM: {:.1}% | {}",
                 format_num(count),
                 format_speed(rolling_speed),
                 format_speed(avg),
-                found.load(Ordering::Relaxed),
+                found_count,
                 format_num(fp_count),
+                fp_rate,
+                mem_used_pct,
                 format_time(elapsed)
             );
-            stdout().flush().ok();
+            
+            // Memory warning
+            if mem_used_pct > 90.0 {
+                println!("  [!] CRITICAL: RAM at {:.1}% - risk of system freeze!", mem_used_pct);
+            } else if mem_used_pct > 80.0 {
+                println!("  [!] WARNING: RAM at {:.1}%", mem_used_pct);
+            }
+            
+            // Debug: show if FP count is suspiciously low
+            if elapsed > 5.0 && fp_count == 0 && count > 1_000_000 {
+                println!("  [DEBUG] 0 FP after {}M keys - XorFilter or FxHash issue!", count / 1_000_000);
+            }
 
             last_stat = Instant::now();
             last_count = count;
+            last_fp_count = fp_count;
         }
     }
 
