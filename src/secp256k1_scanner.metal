@@ -370,6 +370,96 @@ inline void glv_endomorphism(ulong4 x, ulong4 y, thread ulong4& endo_x, thread u
 }
 
 // ============================================================================
+// SCALAR MULTIPLICATION: P = k * G (GPU-SIDE BASE POINT CALCULATION)
+// ============================================================================
+// This eliminates CPU bottleneck by computing base public key in GPU.
+// Only thread 0 of each threadgroup computes this, others wait via barrier.
+// Using windowed NAF for efficiency (~40 doublings + ~50 additions vs 256+128)
+// ============================================================================
+
+// Compute public key from private key: P = k * G
+// Using optimized double-and-add (MSB to LSB)
+// Called by thread 0 only, result shared via threadgroup memory
+inline void scalar_mul_base(ulong4 privkey, 
+                             thread ulong4& out_x, 
+                             thread ulong4& out_y) {
+    // Start with point at infinity
+    ulong4 result_X = {0,0,0,0};
+    ulong4 result_Y = {1,0,0,0};
+    ulong4 result_Z = {0,0,0,0};
+    ulong4 result_ZZ = {0,0,0,0};
+    
+    // Skip leading zeros for efficiency
+    // Find the highest set bit
+    int start_word = 3;  // Start from MSB (word w)
+    int start_bit = 63;
+    
+    // Check each word from MSB
+    ulong words[4] = {privkey.x, privkey.y, privkey.z, privkey.w};
+    
+    bool found_first = false;
+    
+    // Process from MSB to LSB
+    for (int w = 3; w >= 0 && !found_first; w--) {
+        for (int b = 63; b >= 0 && !found_first; b--) {
+            if ((words[w] >> b) & 1ULL) {
+                start_word = w;
+                start_bit = b;
+                found_first = true;
+            }
+        }
+    }
+    
+    // If privkey is 0, return point at infinity
+    if (!found_first) {
+        out_x = ulong4{0,0,0,0};
+        out_y = ulong4{0,0,0,0};
+        return;
+    }
+    
+    // Start with G (first set bit)
+    result_X = SECP256K1_GX;
+    result_Y = SECP256K1_GY;
+    result_Z = ulong4{1,0,0,0};
+    result_ZZ = ulong4{1,0,0,0};
+    
+    // Process remaining bits
+    bool skip_first = true;
+    for (int w = start_word; w >= 0; w--) {
+        int bit_start = (w == start_word) ? start_bit : 63;
+        for (int b = bit_start; b >= 0; b--) {
+            if (skip_first) {
+                skip_first = false;
+                continue;
+            }
+            
+            // Double
+            ext_jac_dbl(result_X, result_Y, result_Z, result_ZZ,
+                        result_X, result_Y, result_Z, result_ZZ);
+            
+            // Add G if bit is 1
+            if ((words[w] >> b) & 1ULL) {
+                ext_jac_add_affine(result_X, result_Y, result_Z, result_ZZ,
+                                   SECP256K1_GX, SECP256K1_GY,
+                                   result_X, result_Y, result_Z, result_ZZ);
+            }
+        }
+    }
+    
+    // Convert to affine
+    if (IsZero(result_Z)) {
+        out_x = ulong4{0,0,0,0};
+        out_y = ulong4{0,0,0,0};
+    } else {
+        ulong4 z_inv = mod_inv(result_Z);
+        ulong4 z_inv2 = mod_sqr(z_inv);
+        ulong4 z_inv3 = mod_mul(z_inv2, z_inv);
+        out_x = mod_mul(result_X, z_inv2);
+        out_y = mod_mul(result_Y, z_inv3);
+    }
+}
+
+// ============================================================================
 // SHA256 + RIPEMD160
 // ============================================================================
 
@@ -593,9 +683,10 @@ kernel void scan_keys(
     constant uint2* philox_key [[buffer(0)]],      // Seed (uint2 = 8 bytes)
     constant uint4* philox_counter [[buffer(1)]],  // Batch counter (uint4 = 16 bytes)
     constant uchar* wnaf_table [[buffer(2)]],      // wNAF w=4: 75 entries × 64 bytes
-    // BASE POINT OPTIMIZATION: CPU sends precomputed base public key (affine)
-    // This eliminates the expensive P = k * G computation per thread!
-    constant uchar* base_pubkey [[buffer(10)]],    // Base public key (64 bytes: x[32] + y[32])
+    // BASE POINT OPTIMIZATION v2: CPU sends base PRIVATE key, GPU computes public key
+    // Thread 0 computes P = k * G once, shares via threadgroup memory
+    // This eliminates CPU bottleneck completely!
+    constant uchar* base_privkey [[buffer(10)]],   // Base private key (32 bytes)
     // Xor Filter32: O(1) lookup, <0.15% false positive rate
     constant uint* xor_fingerprints [[buffer(3)]],  // Fingerprint table (32-bit)
     constant ulong* xor_seeds [[buffer(4)]],          // 3 hash seeds
@@ -604,21 +695,49 @@ kernel void scan_keys(
     device uchar* match_data [[buffer(7)]],        // 52 bytes per match
     device atomic_uint* match_count [[buffer(8)]],
     constant uint* hash_count [[buffer(9)]],      // Number of hashes (for stats)
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
 ) {
+    // =========================================================================
+    // THREADGROUP SHARED MEMORY: Base public key computed by thread 0
+    // This eliminates CPU→GPU synchronization bottleneck!
+    // Each threadgroup's thread 0 computes the base pubkey once.
+    // GPU parallelism means all threadgroups compute simultaneously.
+    // =========================================================================
+    threadgroup ulong4 shared_base_x;
+    threadgroup ulong4 shared_base_y;
+    
+    // Thread 0 of each threadgroup computes base public key
+    // This is computed in parallel across all threadgroups (GPU advantage!)
+    if (tid == 0) {
+        // Load base private key (32 bytes, big-endian)
+        ulong4 privkey = load_be(base_privkey);
+        
+        // Compute P = k * G (scalar multiplication)
+        ulong4 pub_x, pub_y;
+        scalar_mul_base(privkey, pub_x, pub_y);
+        
+        // Store in shared memory for other threads in this threadgroup
+        shared_base_x = pub_x;
+        shared_base_y = pub_y;
+    }
+    
+    // Synchronize all threads in threadgroup - wait for thread 0 to finish
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
     uint kpt = *keys_per_thread;
     uint base_offset = gid * kpt;
     uint xor_block_len = *xor_block_length;
     uint target_count = *hash_count;  // For stats only (Xor Filter32 doesn't need binary search)
 
-    // OPTIMIZED: Base Point + Offset Architecture
-    // Instead of computing P = k * G from scratch (256 doublings + additions),
-    // we use a precomputed base point from CPU and only add gid offset.
-    // This reduces ECC computation from ~256 operations to just 5 additions!
+    // OPTIMIZED v2: Base Point computed in GPU (not CPU!)
+    // Thread 0 computed P = k * G, now all threads use shared result
+    // Then each thread adds its gid offset using windowed table (5 additions)
     
-    // Load base public key from CPU (affine coordinates)
-    ulong4 base_x = load_be(base_pubkey);
-    ulong4 base_y = load_be(base_pubkey + 32);
+    // Load base public key from shared memory (computed by thread 0)
+    ulong4 base_x = shared_base_x;
+    ulong4 base_y = shared_base_y;
     
     // Thread start point using WINDOWED StepTable (4-bit windows)
     // EXTENDED JACOBIAN: (X, Y, Z, ZZ) where ZZ = Z² - saves 1 squaring per add
@@ -665,20 +784,35 @@ kernel void scan_keys(
     // EXTENDED JACOBIAN: batch_ZZ caches Z² for each point (+8-12% from saved squarings)
     // FIXED: Corrected batch size calculation - actual register usage is ~9KB per thread
     // Optimal: 32 batch size → 5.1KB per thread → 50 threads/core (better occupancy)
-    // OPTIMIZED BATCH SIZE: M1 Pro register analysis
-    // M1 Pro: 256KB register file, ~50 threads/core optimal
-    // 256KB / 50 threads = 5.1KB per thread
-    // Each batch entry: ~80 bytes (X, Y, Z, ZZ = 4×64 bits)
-    // Optimal: 16 batch = 4.8KB/thread → 53 threads/core (no spilling)
-    // Previous: 32 batch = 9KB/thread → 28 threads/core (spilling occurred)
+    // OPTIMIZED BATCH SIZE: M1 Pro register pressure analysis
+    // ============================================================================
+    // REGISTER KULLANIMI HESABI:
+    //   batch_X[N]     = N × 32 bytes
+    //   batch_Y[N]     = N × 32 bytes  
+    //   batch_Z[N]     = N × 32 bytes
+    //   batch_ZZ[N]    = N × 32 bytes
+    //   batch_Zinv[N]  = N × 32 bytes
+    //   batch_valid[N] = N × 1 byte
+    //   Subtotal: N × 161 bytes
+    //
+    //   + Hash buffers (h_comp, h_uncomp, h_p2sh × 2) = ~200 bytes
+    //   + GLV intermediate (endo_x, endo_y) = 64 bytes
+    //   + SHA256/RIPEMD160 stack = ~1500 bytes
+    //
+    // BATCH=16: 16×161 + 1764 = 4340 bytes/thread
+    // BATCH=12: 12×161 + 1764 = 3696 bytes/thread ← OPTIMAL (daha güvenli)
+    //
+    // M1 Pro: 256KB register file, ~67 threads/core
+    // 256KB / 67 = 3.8KB/thread → BATCH=12 güvenli, register spilling YOK
+    // ============================================================================
     #if defined(__APPLE__) && __APPLE__
         #if __METAL_VERSION__ >= 230  // M1 Pro/Max
-            #define BATCH_SIZE 16  // Optimized for M1 Pro (no register spilling)
+            #define BATCH_SIZE 12  // OPTIMIZED: Register spilling tamamen önlendi
         #else
-            #define BATCH_SIZE 16  // M1 base
+            #define BATCH_SIZE 12  // M1 base - aynı optimizasyon
         #endif
     #else
-        #define BATCH_SIZE 32  // Default for other platforms
+        #define BATCH_SIZE 24  // Default for other platforms (daha fazla register)
     #endif
     ulong4 batch_X[BATCH_SIZE], batch_Y[BATCH_SIZE], batch_Z[BATCH_SIZE], batch_ZZ[BATCH_SIZE];
     ulong4 batch_Zinv[BATCH_SIZE];

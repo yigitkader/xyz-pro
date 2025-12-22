@@ -199,7 +199,7 @@ struct BufferSet {
     queue: CommandQueue,
     philox_key_buf: Buffer,
     philox_counter_buf: Buffer,
-    base_pubkey_buf: Buffer,  // Base public key (64 bytes: x[32] + y[32])
+    base_privkey_buf: Buffer,  // Base private key (32 bytes) - GPU computes pubkey!
     match_data_buf: Buffer,
     match_count_buf: Buffer,
 }
@@ -445,12 +445,14 @@ impl OptimizedScanner {
         // Double buffer sets with SEPARATE QUEUES for TRUE parallel pipelining
         // Each queue can run independently, allowing batch N to process
         // while we collect results from batch N-1
+        // 
+        // OPTIMIZATION: GPU computes base pubkey from privkey (no CPU bottleneck!)
         let buffer_sets = [
             BufferSet {
                 queue: device.new_command_queue(),  // Queue 0 for buffer 0
                 philox_key_buf: device.new_buffer(8, storage),  // uint2 = 8 bytes
                 philox_counter_buf: device.new_buffer(16, storage),  // uint4 = 16 bytes
-                base_pubkey_buf: device.new_buffer(64, storage),  // Base public key (x[32] + y[32])
+                base_privkey_buf: device.new_buffer(32, storage),  // GPU computes pubkey!
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
@@ -458,7 +460,7 @@ impl OptimizedScanner {
                 queue: device.new_command_queue(),  // Queue 1 for buffer 1
                 philox_key_buf: device.new_buffer(8, storage),
                 philox_counter_buf: device.new_buffer(16, storage),
-                base_pubkey_buf: device.new_buffer(64, storage),  // Base public key (x[32] + y[32])
+                base_privkey_buf: device.new_buffer(32, storage),  // GPU computes pubkey!
                 match_data_buf: device.new_buffer((match_buffer_size * 52) as u64, storage),
                 match_count_buf: device.new_buffer(4, storage),
             },
@@ -553,9 +555,10 @@ impl OptimizedScanner {
     fn dispatch_batch(&self, base_key: &[u8; 32], buf_idx: usize) -> Result<()> {
         let buffers = &self.buffer_sets[buf_idx];
 
-        // OPTIMIZED: Base Point + Offset Architecture
-        // CPU computes base public key from base private key (once per batch)
-        // GPU threads only add their gid offset (5 additions vs 256 operations!)
+        // OPTIMIZED v2: GPU computes base pubkey from privkey!
+        // CPU BOTTLENECK ELIMINATED: No more k256::SecretKey::public_key() call
+        // GPU thread 0 of each threadgroup computes P = k * G in parallel
+        // Other threads wait via barrier, then add their gid offset
         let batch_size = self.config.keys_per_batch();
         let max_threads = self.config.max_threads as u64;
         
@@ -570,15 +573,9 @@ impl OptimizedScanner {
         let batch_offset = batch_id * max_threads;
         state.increment(batch_offset);
         
-        // Compute base public key from base private key
-        // This eliminates expensive P = k * G computation on GPU per thread
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
-        use k256::SecretKey;
-        let base_secret = SecretKey::from_slice(base_key)
-            .map_err(|e| ScannerError::Gpu(format!("Invalid base key: {}", e)))?;
-        let base_pubkey = base_secret.public_key();
-        let encoded = base_pubkey.to_encoded_point(false);
-        let pubkey_bytes = encoded.as_bytes();
+        // NO MORE CPU PUBKEY CALCULATION!
+        // GPU will compute P = k * G internally using scalar_mul_base()
+        // This eliminates the CPU→GPU synchronization bottleneck
         
         unsafe {
             // Send Philox key (uint2 = 8 bytes)
@@ -591,10 +588,10 @@ impl OptimizedScanner {
             let ctr_ptr = buffers.philox_counter_buf.contents() as *mut u32;
             std::ptr::copy_nonoverlapping(state.counter.as_ptr(), ctr_ptr, 4);
             
-            // Send base public key (64 bytes: x[32] + y[32])
-            // Skip first byte (0x04 uncompressed prefix)
-            let pubkey_ptr = buffers.base_pubkey_buf.contents() as *mut u8;
-            std::ptr::copy_nonoverlapping(pubkey_bytes.as_ptr().add(1), pubkey_ptr, 64);
+            // Send base PRIVATE key (32 bytes) - GPU computes pubkey!
+            // This is the key optimization: no CPU scalar multiplication
+            let privkey_ptr = buffers.base_privkey_buf.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(base_key.as_ptr(), privkey_ptr, 32);
         }
 
         unsafe {
@@ -619,7 +616,7 @@ impl OptimizedScanner {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline);
                 
-                // OPTIMIZED: Buffer layout (Base Point + Offset Architecture)
+                // OPTIMIZED v2: Buffer layout (GPU computes base pubkey!)
                 // buffer(0) = philox_key (uint2)
                 // buffer(1) = philox_counter (uint4)
                 // buffer(2) = wnaf_table
@@ -630,7 +627,7 @@ impl OptimizedScanner {
                 // buffer(7) = match_data
                 // buffer(8) = match_count
                 // buffer(9) = hash_count
-                // buffer(10) = base_pubkey (64 bytes: x[32] + y[32])
+                // buffer(10) = base_privkey (32 bytes) ← GPU computes pubkey!
                 enc.set_buffer(0, Some(&buffers.philox_key_buf), 0);
                 enc.set_buffer(1, Some(&buffers.philox_counter_buf), 0);
                 enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);
@@ -641,7 +638,7 @@ impl OptimizedScanner {
                 enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
                 enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
                 enc.set_buffer(9, Some(&self.hash_count_buf), 0);
-                enc.set_buffer(10, Some(&buffers.base_pubkey_buf), 0);
+                enc.set_buffer(10, Some(&buffers.base_privkey_buf), 0);
             
             enc.dispatch_threads(grid, group);
             enc.end_encoding();
@@ -838,6 +835,7 @@ mod tests {
         // 7: match_data_buf
         // 8: match_count_buf
         // 9: hash_count_buf
+        // 10: base_privkey_buf (GPU computes pubkey!)
         
         // These must match Metal shader:
         // buffer(0): philox_key
@@ -850,6 +848,7 @@ mod tests {
         // buffer(7): match_data
         // buffer(8): match_count
         // buffer(9): hash_count
+        // buffer(10): base_privkey (GPU computes pubkey internally!)
         
         // If these don't match, GPU will read wrong data!
         // This test documents the expected layout.
