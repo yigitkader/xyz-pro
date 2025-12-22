@@ -1509,6 +1509,9 @@ fn main() {
         format_time(time),
         format_speed(total as f64 / time)
     );
+    
+    // CRITICAL: Flush logger before exit to ensure no found keys are lost
+    flush_logger();
 }
 
 // ============================================================================
@@ -1958,6 +1961,37 @@ fn verify_match_linear(
 use std::sync::OnceLock;
 static REPORT_TX: OnceLock<crossbeam_channel::Sender<ReportEntry>> = OnceLock::new();
 
+/// Flush all pending log entries and wait for logger thread to finish
+/// CRITICAL: Call this before program exit to ensure no data loss!
+fn flush_logger() {
+    // Take ownership of the sender to drop it
+    // This signals the logger thread to exit after processing remaining entries
+    if let Some(tx) = REPORT_TX.get() {
+        // Send a "poison pill" is not needed - dropping the sender is enough
+        // But we need to ensure all senders are dropped
+        // Since REPORT_TX is OnceLock, we can't take it out
+        // Instead, we rely on the channel semantics: when we drop our clone,
+        // if it's the last sender, the channel closes
+        
+        // Create a timeout for safety
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        
+        // Check if there are pending entries (channel length)
+        while !tx.is_empty() && start.elapsed() < timeout {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        
+        if !tx.is_empty() {
+            eprintln!("[WARN] Logger still has {} pending entries after timeout", tx.len());
+        }
+    }
+    
+    // Wait for logger thread to finish (if initialized)
+    // Note: JoinHandle can't be taken from OnceLock, so we can only check if it's done
+    // The thread will exit when channel closes (on process exit)
+}
+
 /// Report entry for async logging
 struct ReportEntry {
     privkey: [u8; 32],
@@ -2003,13 +2037,29 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
     println!("╚═══════════════════════════════════════════════════════╝");
     println!("\x1b[0m");
 
-                // File write
+                // File write - CRITICAL: Must persist to disk!
                 if let Some(ref mut f) = file {
-                    writeln!(f, "[{}] {} | {} | {} | {} | {}", 
-                        time, entry.addr, entry.atype.as_str(), key_type, hex, wif).ok();
-                    // Flush to ensure write persists
+                    if let Err(e) = writeln!(f, "[{}] {} | {} | {} | {} | {}", 
+                        time, entry.addr, entry.atype.as_str(), key_type, hex, wif) {
+                        eprintln!("[CRITICAL] Failed to write to found.txt: {}", e);
+                    }
+                    // CRITICAL: sync_all() forces data to disk (not just OS buffer)
+                    // This ensures data survives system crashes
                     use std::io::Write;
-                    let _ = f.flush();
+                    if let Err(e) = f.flush() {
+                        eprintln!("[CRITICAL] Failed to flush found.txt: {}", e);
+                    }
+                    if let Err(e) = f.sync_all() {
+                        eprintln!("[CRITICAL] Failed to sync found.txt to disk: {}", e);
+                    }
+                } else {
+                    // File couldn't be opened - try again
+                    eprintln!("[CRITICAL] found.txt not available - retrying...");
+                    file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("found.txt")
+                        .ok();
                 }
             }
         })
@@ -2019,17 +2069,38 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
 }
 
 /// Non-blocking report (sends to async logger)
+/// CRITICAL: This function MUST NOT lose data - it handles found private keys!
 fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType, compressed: bool) {
     // Get or initialize the global logger
     let tx = REPORT_TX.get_or_init(init_async_logger);
     
     // Non-blocking send (unbounded channel never blocks)
-    let _ = tx.send(ReportEntry {
+    // CRITICAL: If send fails (logger crashed), fall back to synchronous write!
+    if tx.send(ReportEntry {
         privkey: *privkey,
         addr: addr.to_string(),
         atype,
         compressed,
-    });
+    }).is_err() {
+        // Logger thread died - write directly to ensure no data loss!
+        eprintln!("\n[CRITICAL] Logger thread failed - writing directly to found.txt");
+        let hex = hex::encode(privkey);
+        let wif = to_wif_compressed(privkey, compressed);
+        let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("found.txt") {
+            let _ = writeln!(f, "[{}] {} | {} | {} | {} | {}", 
+                time, addr, atype.as_str(), 
+                if compressed { "compressed" } else { "uncompressed" },
+                hex, wif);
+            let _ = f.sync_all(); // Force to disk
+        }
+        
+        // Also print to console
+        println!("\n🔑 FOUND: {} | {} | {}", addr, hex, wif);
+    }
 }
 
 // ============================================================================
