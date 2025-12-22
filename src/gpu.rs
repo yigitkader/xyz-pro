@@ -140,23 +140,39 @@ impl GpuConfig {
                 match_buffer,
             )
         } else if memory_mb >= 16000 {
-            println!("[GPU] Detected: Base chip with {}GB memory", memory_mb / 1024);
-            // Smaller threadgroup (64) for register-heavy secp256k1 kernel
+            // BASE M1 with 16GB - CONSERVATIVE CONFIG to prevent system freeze!
+            // 
+            // Base M1 specs:
+            //   - 8 GPU cores (7-8 active depending on thermal)
+            //   - 4 P-cores + 4 E-cores (CPU)
+            //   - 16GB unified memory (shared with CPU!)
+            //
+            // CRITICAL: Base M1 has HALF the GPU cores of M1 Pro (8 vs 14-16)
+            // and shares memory bandwidth with CPU more aggressively.
+            // Using Pro-level settings causes system freeze!
+            //
+            // Conservative settings:
+            //   - 32K threads (vs 65K) = less GPU pressure
+            //   - 128 keys/thread = same efficiency
+            //   - 64 threadgroup = good occupancy
+            //   - 256K match buffer = enough for 4M keys
+            println!("[GPU] Detected: Base M1 with 16GB (8 GPU cores)");
+            println!("[GPU] Using conservative config to prevent system freeze");
             (
-                65_536,
-                128,
+                32_768,   // 32K threads (half of previous) - less pressure on 8 GPU cores
+                128,      // Same keys per thread
                 64.min(max_threadgroup),  // 64 for better occupancy
-                524_288,
+                262_144,  // 256K match buffer (reduced from 512K)
             )
         } else {
-            println!("[GPU] Detected: Base chip (7-10 cores)");
-            // Smaller threadgroup (64) for register-heavy secp256k1 kernel
-            // Even on base M1, 64 improves occupancy vs 256
+            // Base M1 with 8GB - MINIMAL CONFIG
+            println!("[GPU] Detected: Base M1 (8GB or less)");
+            println!("[GPU] Using minimal config to preserve system resources");
             (
-                65_536,
+                16_384,   // 16K threads - very conservative for 8GB systems
                 128,
-                64.min(max_threadgroup),  // 64 for better occupancy
-                524_288,
+                64.min(max_threadgroup),
+                131_072,  // 128K match buffer
             )
         }
     }

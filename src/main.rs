@@ -1272,18 +1272,21 @@ fn get_performance_core_count() -> usize {
         if let Some(total) = get_sysctl_int(b"hw.physicalcpu\0") {
             let total = total as usize;
                         // Apple Silicon P-core estimates:
-                        // M1 base:  8 total → 4 P + 4 E → use 4
-                        // M1 Pro:  10 total → 8 P + 2 E → use 8
-                        // M1 Max:  10 total → 8 P + 2 E → use 8
-                        // M1 Ultra: 20 total → 16 P + 4 E → use 12 (leave headroom)
+                        // M1 base:  8 total → 4 P + 4 E → use 2 (leave CPU for system!)
+                        // M1 Pro:  10 total → 8 P + 2 E → use 6 (leave headroom)
+                        // M1 Max:  10 total → 8 P + 2 E → use 6
+                        // M1 Ultra: 20 total → 16 P + 4 E → use 10 (leave headroom)
+                        //
+                        // CRITICAL: Base M1 shares bandwidth between GPU and CPU heavily
+                        // Using all 4 P-cores causes system freeze!
                         let p_cores = if total <= 8 {
-                            total / 2  // Base chips: 50% P-cores
+                            2  // Base M1: use only 2 threads to prevent freeze
                         } else if total <= 12 {
-                            total - 2  // Pro/Max: total - 2 E-cores
+                            total - 4  // Pro/Max: leave 4 cores for system
                         } else {
-                            total - 4  // Ultra: total - 4 E-cores
+                            total - 6  // Ultra: leave 6 cores for system
                         };
-            return p_cores.max(4).min(16);
+            return p_cores.max(2).min(12);
         }
     }
     
@@ -1610,6 +1613,12 @@ fn run_pipelined(
                                 gpu_shutdown.store(true, Ordering::SeqCst);
                             }
                         }
+                        
+                        // CRITICAL: Yield CPU after each batch to prevent system freeze
+                        // Base M1 has 4 P-cores shared between GPU dispatch and CPU tasks
+                        // Without yielding, the main loop can starve other system processes
+                        // A tiny yield (~1us) is enough to let macOS scheduler breathe
+                        std::thread::yield_now();
                     },
                     &gpu_shutdown,
                 );
