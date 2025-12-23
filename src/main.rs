@@ -293,10 +293,15 @@ fn main() {
         }
     }
 
-    let total = counter.load(Ordering::Relaxed);
-    let time = start.elapsed().as_secs_f64();
-    println!("\n\n[Done] {} keys in {} @ {}", 
-        format_num(total), format_time(time), format_speed(total as f64 / time));
+    // Final statistics (skip for Puzzle mode which has its own stats)
+    if !matches!(scan_mode, ScanMode::Puzzle(_)) {
+        let total = counter.load(Ordering::Relaxed);
+        let time = start.elapsed().as_secs_f64();
+        if total > 0 {
+            println!("\n\n[Done] {} keys in {} @ {}", 
+                format_num(total), format_time(time), format_speed(total as f64 / time));
+        }
+    }
     
     flush_logger();
 }

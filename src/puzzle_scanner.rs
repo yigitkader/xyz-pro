@@ -15,9 +15,8 @@
 /// - Multi-GPU distribution support
 
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use std::sync::Arc;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::time::Instant;
 
 use crate::gpu::{OptimizedScanner, PooledBuffer};
@@ -114,8 +113,8 @@ impl PuzzleScanner {
     }
     
     /// Generate next base key for GPU batch
-    /// Returns 32-byte key with proper high bits for puzzle
-    pub fn next_base_key(&self, batch_size: u64) -> Option<[u8; 32]> {
+    /// Returns (32-byte key, batch_start_position) for key reconstruction on match
+    pub fn next_base_key(&self, batch_size: u64) -> Option<([u8; 32], u64)> {
         let pos = self.current.fetch_add(batch_size, Ordering::Relaxed);
         
         if pos >= self.end {
@@ -145,28 +144,28 @@ impl PuzzleScanner {
         key[16..24].copy_from_slice(&high.to_be_bytes());
         key[24..32].copy_from_slice(&low.to_be_bytes());
         
-        Some(key)
+        Some((key, pos))
     }
     
     /// Check if a match was found for our target
-    pub fn check_matches(&self, matches: &PooledBuffer) -> Option<[u8; 32]> {
+    /// `batch_start_pos` is the position when the batch was dispatched
+    pub fn check_matches(&self, matches: &PooledBuffer, batch_start_pos: u64) -> Option<[u8; 32]> {
         for m in matches.as_ref().iter() {
             if m.hash == self.target_hash {
                 // FOUND IT!
-                return Some(self.reconstruct_key(m.key_index));
+                return Some(self.reconstruct_key(batch_start_pos, m.key_index));
             }
         }
         None
     }
     
     /// Reconstruct full private key from match
-    fn reconstruct_key(&self, offset: u32) -> [u8; 32] {
-        let base_pos = self.current.load(Ordering::Relaxed);
-        // GPU batch starts from base_pos, match is at base_pos + offset
-        let full_pos = base_pos.saturating_sub(self.keys_checked.load(Ordering::Relaxed) % 1_000_000) + offset as u64;
-        
+    /// `batch_start_pos` is the position when the batch was dispatched (before fetch_add)
+    /// `offset` is the key_index within the batch
+    fn reconstruct_key(&self, batch_start_pos: u64, offset: u32) -> [u8; 32] {
+        // Private key = 2^(puzzle-1) + batch_start_pos + offset
         let base: u128 = 1u128 << (self.puzzle_number - 1);
-        let full_key = base + full_pos as u128;
+        let full_key = base + batch_start_pos as u128 + offset as u128;
         
         let mut key = [0u8; 32];
         let high = (full_key >> 64) as u64;
@@ -267,8 +266,8 @@ pub fn run_puzzle_scan(
     println!();
     
     while !shutdown.load(Ordering::Relaxed) {
-        // Get next base key
-        let base_key = match scanner.next_base_key(batch_size) {
+        // Get next base key and its starting position
+        let (base_key, batch_start_pos) = match scanner.next_base_key(batch_size) {
             Some(k) => k,
             None => {
                 println!("[Puzzle #{}] Range exhausted - puzzle NOT found", config.puzzle_number);
@@ -279,12 +278,12 @@ pub fn run_puzzle_scan(
         // Scan batch
         match gpu.scan_batch(&base_key) {
             Ok(matches) => {
-                // Check for target match
-                if let Some(found_key) = scanner.check_matches(&matches) {
+                // Check for target match (pass batch_start_pos for correct key reconstruction)
+                if let Some(found_key) = scanner.check_matches(&matches, batch_start_pos) {
                     println!("\n🎉🎉🎉 PUZZLE #{} SOLVED! 🎉🎉🎉", config.puzzle_number);
                     println!("Private Key: {}", hex::encode(&found_key));
                     
-                    // Save to file immediately
+                    // Save to file immediately with sync
                     if let Ok(mut f) = OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -327,18 +326,23 @@ mod tests {
         let config = PuzzleConfig::for_puzzle(66).unwrap();
         let scanner = PuzzleScanner::new(&config);
         
-        let key = scanner.next_base_key(1000).unwrap();
+        let (key, pos) = scanner.next_base_key(1000).unwrap();
         
         // For puzzle 66, range starts at 2^65
-        // 2^65 = 0x0000000000000001_0000000000000000 (128 bits)
-        // In big-endian 32-byte key:
-        // - bytes 0-22 = 0
-        // - byte 23 = 0x01 or higher (depending on puzzle)
-        // - bytes 24-31 = lower 64 bits
+        // Position should be 0 for first batch
+        assert_eq!(pos, 0);
+        
+        // 2^65 as 128-bit:
+        // high = (1u128 << 65) >> 64 = 2
+        // low = 0
+        // So key[23] should be 0x02 (big-endian high 64-bit)
         
         // Key should be non-zero in the puzzle range
         let is_in_range = key.iter().skip(16).any(|&b| b != 0);
         assert!(is_in_range, "Key should be non-zero in puzzle 66 range");
+        
+        // Verify: bytes 16-23 = high.to_be_bytes() = 0x0000000000000002
+        assert_eq!(key[23], 0x02, "byte 23 should be 0x02 for 2^65");
     }
     
     #[test]
@@ -350,8 +354,25 @@ mod tests {
         assert!(scanner.progress() < 0.001);
         
         // After some keys, progress should increase
-        scanner.next_base_key(1_000_000);
+        let _ = scanner.next_base_key(1_000_000);
         assert!(scanner.progress() > 0.0);
+    }
+    
+    #[test]
+    fn test_key_reconstruction() {
+        let config = PuzzleConfig::for_puzzle(66).unwrap();
+        let scanner = PuzzleScanner::new(&config);
+        
+        // Simulate finding a match at position 0, offset 42
+        let reconstructed = scanner.reconstruct_key(0, 42);
+        
+        // Key should be 2^65 + 42
+        // 2^65: high = 2, low = 0
+        // +42: high = 2, low = 42
+        // bytes 16-23 = 0x0000000000000002 (high)
+        // bytes 24-31 = 0x000000000000002A (low = 42)
+        assert_eq!(reconstructed[23], 0x02, "high should be 2");
+        assert_eq!(reconstructed[31], 42, "low should include offset 42");
     }
 }
 
