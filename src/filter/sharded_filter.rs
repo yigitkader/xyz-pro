@@ -512,10 +512,11 @@ impl ShardedXorFilter {
     
     /// GPU data for sharded filter
     /// Returns: (fingerprints, shard_info, num_shards)
-    /// shard_info format: [offset_lo, offset_hi, block_len, seed_lo, seed_hi] × 4096
+    /// shard_info format: [offset_lo, offset_hi, block_len, seed_lo, seed_hi, _pad] × 4096
+    /// 6 u32 per shard = 24 bytes = 8-byte aligned (critical for Metal memory layout)
     pub fn gpu_data_sharded(&self) -> (Vec<u32>, Vec<u32>, u32) {
-        // Build shard_info array: 5 u32 per shard
-        let mut shard_info: Vec<u32> = Vec::with_capacity(NUM_SHARDS * 5);
+        // Build shard_info array: 6 u32 per shard (8-byte aligned)
+        let mut shard_info: Vec<u32> = Vec::with_capacity(NUM_SHARDS * 6);
         
         for (offset, block_len, seed) in &self.shard_offsets {
             // offset is in bytes from fingerprint start, convert to u32 index
@@ -525,6 +526,7 @@ impl ShardedXorFilter {
             shard_info.push(*block_len);                           // block_len
             shard_info.push(*seed as u32);                         // seed_lo
             shard_info.push((*seed >> 32) as u32);                // seed_hi
+            shard_info.push(0);                                    // padding (8-byte alignment)
         }
         
         // Get fingerprints

@@ -34,7 +34,7 @@ use startup_tests::{run_self_test, run_gpu_correctness_test, run_gpu_pipeline_te
 use startup_tests::run_startup_verification;
 use targets::TargetDatabase;
 #[cfg(feature = "philox-rng")]
-use rng::philox::{PhiloxState, philox_to_privkey};
+use rng::philox::PhiloxState;
 
 const TARGETS_FILE: &str = "targets.json";
 
@@ -365,13 +365,13 @@ fn run_pipelined(
         const PARALLEL_THRESHOLD: usize = 32;
         
         while !verify_shutdown.load(Ordering::Relaxed) {
-            let (_, base_state, matches) = match rx.recv_timeout(Duration::from_millis(10)) {
+            let (base_key, _, matches) = match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(batch) => batch,
                 Err(_) => continue,
             };
             
             let process = |pm: &PotentialMatch| {
-                if let Some((addr, atype, privkey)) = verify_match(&base_state, pm, &targets) {
+                if let Some((addr, atype, privkey)) = verify_match(&base_key, pm, &targets) {
                     let comp = pm.match_type != MatchType::Uncompressed 
                         && pm.match_type != MatchType::GlvUncompressed;
                     
@@ -436,12 +436,17 @@ fn run_pipelined(
 }
 
 fn verify_match(
-    base_state: &PhiloxState,
+    base_key: &[u8; 32],
     pm: &PotentialMatch,
     targets: &TargetDatabase,
 ) -> Option<(String, types::AddressType, [u8; 32])> {
-    let thread_state = base_state.for_thread(pm.key_index);
-    let priv_key = philox_to_privkey(&thread_state);
+    // CRITICAL FIX: GPU uses SEQUENTIAL keys (base_key + offset), NOT Philox per thread!
+    // GPU computes: P = base_pubkey + key_index * G
+    // This means: private_key = base_key + key_index (scalar addition mod n)
+    // 
+    // PREVIOUS BUG: Using Philox(counter + key_index) produced DIFFERENT keys
+    // than GPU's sequential scan, causing 100% false positive rejection!
+    let priv_key = scalar_add_offset(base_key, pm.key_index);
 
     let actual_key = if pm.match_type.is_glv() {
         gpu::glv_transform_key(&priv_key)
@@ -474,6 +479,25 @@ fn verify_match(
     }
 
     targets.check_direct(&computed_hash).map(|(addr, atype)| (addr, atype, actual_key))
+}
+
+/// Add offset to private key (scalar addition mod n)
+/// GPU uses: key[i] = base_key + i (sequential scan)
+fn scalar_add_offset(base_key: &[u8; 32], offset: u32) -> [u8; 32] {
+    use k256::Scalar;
+    use k256::elliptic_curve::ops::Reduce;
+    
+    // Convert base_key to scalar (big-endian)
+    let base = <Scalar as Reduce<k256::U256>>::reduce_bytes(base_key.into());
+    
+    // Add offset
+    let offset_scalar = Scalar::from(offset as u64);
+    let result = base + offset_scalar;
+    
+    // Convert back to bytes (handle potential overflow by modular reduction)
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result.to_bytes());
+    key
 }
 
 static REPORT_TX: OnceLock<crossbeam_channel::Sender<ReportEntry>> = OnceLock::new();

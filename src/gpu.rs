@@ -33,9 +33,23 @@ impl BufferPool {
     pub fn new(buffer_capacity: usize, pool_size: usize) -> Self {
         let (return_tx, pool_rx) = bounded(pool_size);
         
-        // Pre-allocate all buffers
+        // Pre-allocate all buffers with RAM touch
+        // Writing zeros forces OS to actually allocate physical pages NOW
+        // This prevents runtime page faults and distinguishes leaks from paging
         for _ in 0..pool_size {
-            let buf = Vec::with_capacity(buffer_capacity);
+            let mut buf: Vec<PotentialMatch> = Vec::with_capacity(buffer_capacity);
+            
+            // RAM TOUCH: Force physical allocation by writing to all pages
+            // PotentialMatch is 52 bytes, page size is 16KB on Apple Silicon
+            // Touch every ~300 elements to hit each page
+            unsafe {
+                let ptr = buf.as_mut_ptr();
+                let page_stride = 16384 / std::mem::size_of::<PotentialMatch>(); // ~315 elements
+                for i in (0..buffer_capacity).step_by(page_stride.max(1)) {
+                    std::ptr::write_volatile(ptr.add(i), std::mem::zeroed());
+                }
+            }
+            
             let _ = return_tx.try_send(buf);
         }
         
@@ -326,8 +340,8 @@ pub struct OptimizedScanner {
     last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchType {
     Compressed = 0,
     Uncompressed = 1,
@@ -382,11 +396,26 @@ pub fn glv_transform_key(key: &[u8; 32]) -> [u8; 32] {
     (key_scalar * *GLV_LAMBDA_SCALAR).to_repr().into()
 }
 
+/// GPU ↔ CPU match data structure (52 bytes, Metal-aligned)
+/// 
+/// Memory layout (must match secp256k1_scanner.metal exactly):
+///   [0-3]   key_index: u32 (little-endian)
+///   [4]     match_type: u8 (enum value 0-5)
+///   [5-31]  _pad: [u8; 27] (zeros, alignment padding)
+///   [32-51] hash: [u8; 20] (Hash160)
+///   TOTAL: 52 bytes
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct PotentialMatch {
     pub key_index: u32,
     pub match_type: MatchType,
+    _pad: [u8; 27],
     pub hash: Hash160,
+}
+
+impl PotentialMatch {
+    /// Size assertion at compile time
+    const _SIZE_CHECK: () = assert!(std::mem::size_of::<Self>() == 52);
 }
 
 impl OptimizedScanner {
@@ -915,6 +944,7 @@ impl OptimizedScanner {
                     matches.push(PotentialMatch {
                         key_index,
                         match_type,
+                        _pad: [0u8; 27],
                         hash: Hash160::from_slice(&hash_array),
                     });
                 }

@@ -197,13 +197,14 @@ inline bool xor_filter_contains(
 // Each shard has its own seed and block_length.
 // Shard ID = (hash[0] << 4) | (hash[1] >> 4)  (12-bit = 4096 shards)
 // 
-// Memory layout:
-// - shard_info: 4096 entries × (offset:u32, block_len:u32, seed:u64) = 16 bytes each
+// Memory layout (8-byte aligned):
+// - shard_info: 4096 entries × 6 u32 = 24 bytes each (offset_lo, offset_hi, block_len, seed_lo, seed_hi, _pad)
 // - fingerprints: all shard fingerprints concatenated
 // ============================================================================
 
 /// Sharded Xor Filter lookup
-/// shard_info format: [offset_lo, offset_hi, block_len, seed_lo, seed_hi] per shard (5 u32)
+/// shard_info format: [offset_lo, offset_hi, block_len, seed_lo, seed_hi, _pad] per shard (6 u32)
+/// 6 u32 = 24 bytes = 8-byte aligned (critical for memory alignment)
 /// CRITICAL: Must match CPU hash_to_positions() exactly!
 ///   CPU: p0 = hash1 % block_len
 ///        p1 = (hash1 >> 32) % block_len + block_len  (SAME hash, upper 32 bits!)
@@ -212,20 +213,21 @@ inline bool xor_filter_contains(
 inline bool xor_filter_contains_sharded(
     thread uchar* hash,
     constant uint* fingerprints,
-    constant uint* shard_info,  // 4096 shards × 5 u32 = 20480 u32s
+    constant uint* shard_info,  // 4096 shards × 6 u32 = 24576 u32s (8-byte aligned)
     uint num_shards             // 4096
 ) {
     // Calculate shard ID from first 12 bits of hash
     uint shard_id = ((uint)hash[0] << 4) | ((uint)hash[1] >> 4);
     if (shard_id >= num_shards) shard_id = num_shards - 1;  // Safety
     
-    // Read shard metadata (5 u32 per shard = 20 bytes)
-    uint base_idx = shard_id * 5;
+    // Read shard metadata (6 u32 per shard = 24 bytes, 8-byte aligned)
+    uint base_idx = shard_id * 6;
     uint offset_lo = shard_info[base_idx];
     uint offset_hi = shard_info[base_idx + 1];
     uint block_len = shard_info[base_idx + 2];
     uint seed_lo = shard_info[base_idx + 3];
     uint seed_hi = shard_info[base_idx + 4];
+    // shard_info[base_idx + 5] is padding for alignment
     
     ulong offset = ((ulong)offset_hi << 32) | (ulong)offset_lo;
     ulong seed = ((ulong)seed_hi << 32) | (ulong)seed_lo;

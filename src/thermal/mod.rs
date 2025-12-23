@@ -5,7 +5,7 @@ pub mod pid_controller;
 pub mod hardware_monitor;
 
 #[cfg(feature = "pid-thermal")]
-pub use pid_controller::{PIDController, PIDTuning, DynamicSpeedController};
+pub use pid_controller::DynamicSpeedController;
 
 #[cfg(feature = "pid-thermal")]
 pub use hardware_monitor::{read_gpu_temperature, estimate_temperature_from_performance};

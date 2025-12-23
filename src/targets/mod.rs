@@ -185,22 +185,36 @@ impl TargetDatabase {
         self.check_direct(hash).map(|(_, t)| t)
     }
 
+    /// Zero-copy hash access via mmap
+    /// Returns slice reference instead of copying 980MB
+    #[inline]
+    #[allow(dead_code)]
+    pub fn hash_at(&self, index: usize) -> Option<&[u8; 20]> {
+        if index >= self.count {
+            return None;
+        }
+        let mmap = self.mmap.as_ref()?;
+        let offset = HEADER_SIZE + index * RECORD_SIZE;
+        let slice = &mmap[offset..offset + 20];
+        Some(slice.try_into().ok()?)
+    }
+    
+    /// Iterator over all hashes (zero-copy via mmap)
+    pub fn iter_hashes(&self) -> impl Iterator<Item = [u8; 20]> + '_ {
+        let mmap = self.mmap.as_ref();
+        (0..self.count).filter_map(move |i| {
+            let m = mmap?;
+            let offset = HEADER_SIZE + i * RECORD_SIZE;
+            let mut hash = [0u8; 20];
+            hash.copy_from_slice(&m[offset..offset + 20]);
+            Some(hash)
+        })
+    }
+    
+    /// Collect all hashes (only when absolutely necessary)
+    /// WARNING: Allocates ~980MB for 49M targets
     pub fn get_all_hashes(&self) -> Vec<[u8; 20]> {
-        let mmap = match &self.mmap {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-        
-        let data = &mmap[HEADER_SIZE..];
-        (0..self.count)
-            .into_par_iter()
-            .map(|i| {
-                let offset = i * RECORD_SIZE;
-                let mut hash = [0u8; 20];
-                hash.copy_from_slice(&data[offset..offset + 20]);
-                hash
-            })
-            .collect()
+        self.iter_hashes().collect()
     }
 
     pub fn memory_stats(&self) -> (usize, usize) {

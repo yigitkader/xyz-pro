@@ -19,6 +19,7 @@ impl PhiloxState {
         }
     }
     
+    #[allow(dead_code)]
     pub fn for_thread(&self, thread_id: u32) -> Self {
         let mut state = *self;
         let sum = (state.counter[0] as u64) + (thread_id as u64);
