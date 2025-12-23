@@ -1,0 +1,99 @@
+//! High-Performance Bitcoin Key Generator
+//! 
+//! Standalone module for generating BTC private keys with addresses.
+//! Target: 1 billion keys per minute with deduplication.
+//! 
+//! Supports:
+//! - P2PKH (Legacy)
+//! - P2SH (Nested SegWit)
+//! - P2WPKH (Native SegWit - Bech32)
+
+mod keygen;
+mod encoder;
+mod writer;
+mod batch;
+mod gpu;
+
+pub use keygen::KeyGenerator;
+pub use encoder::AddressEncoder;
+pub use writer::{OutputWriter, OutputFormat};
+pub use batch::BatchProcessor;
+pub use gpu::GpuKeyGenerator;
+
+use serde::{Deserialize, Serialize};
+
+/// Single key entry with all address types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyEntry {
+    pub private_key: String,
+    #[serde(rename = "P2PKH")]
+    pub p2pkh: String,
+    #[serde(rename = "P2SH")]
+    pub p2sh: String,
+    #[serde(rename = "P2WPKH")]
+    pub p2wpkh: String,
+}
+
+/// Output JSON structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyOutput {
+    pub private_keys: Vec<KeyEntry>,
+}
+
+/// Raw key data for internal processing (minimal allocations)
+#[derive(Clone, Copy)]
+pub struct RawKeyData {
+    pub private_key: [u8; 32],
+    pub pubkey_hash: [u8; 20],
+}
+
+/// Generator configuration
+#[derive(Debug, Clone)]
+pub struct GeneratorConfig {
+    /// Batch size for parallel processing
+    pub batch_size: usize,
+    /// Number of worker threads (0 = auto-detect)
+    pub threads: usize,
+    /// Output format
+    pub output_format: OutputFormat,
+    /// Output directory
+    pub output_dir: String,
+    /// Keys per file (1 billion default)
+    pub keys_per_file: u64,
+}
+
+impl Default for GeneratorConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 100_000,
+            threads: 0,
+            output_format: OutputFormat::Json,
+            output_dir: "./output".to_string(),
+            keys_per_file: 1_000_000_000,
+        }
+    }
+}
+
+/// Statistics for monitoring
+#[derive(Debug, Default)]
+pub struct GeneratorStats {
+    pub total_generated: u64,
+    pub duplicates_skipped: u64,
+    pub files_written: u64,
+    pub elapsed_secs: f64,
+}
+
+impl GeneratorStats {
+    pub fn keys_per_second(&self) -> f64 {
+        if self.elapsed_secs > 0.0 {
+            self.total_generated as f64 / self.elapsed_secs
+        } else {
+            0.0
+        }
+    }
+    
+    pub fn keys_per_minute(&self) -> f64 {
+        self.keys_per_second() * 60.0
+    }
+}
+
