@@ -29,7 +29,7 @@ pub struct BufferPool {
     pool_rx: Receiver<Vec<PotentialMatch>>,
 }
 
-const POOL_SIZE: usize = 16;  // Enough for triple buffering + pipeline depth
+const POOL_SIZE: usize = 4;  // Minimal: triple buffering + 1 spare (saves ~70% RAM)
 
 impl BufferPool {
     pub fn new(buffer_capacity: usize) -> Self {

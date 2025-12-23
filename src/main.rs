@@ -231,7 +231,10 @@ fn setup_rayon_pool(threads: usize) {
                     extern "C" {
                         fn pthread_set_qos_class_self_np(qos: u32, priority: i32) -> i32;
                     }
-                    pthread_set_qos_class_self_np(0x19, 0);
+                    // QOS_CLASS_UTILITY (0x09) - long-running, resource-intensive tasks
+                    // Prevents starving system UI while still getting good performance
+                    // Previous: 0x19 (USER_INTERACTIVE) caused system freeze
+                    pthread_set_qos_class_self_np(0x09, 0);
                 }
                 thread.run();
             })?;
@@ -520,20 +523,8 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
 }
 
 fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType, compressed: bool) {
-    let hex = hex::encode(privkey);
-    let wif = to_wif_compressed(privkey, compressed);
-    
-    // CRITICAL: Immediate sync write - crash-safe, key never lost
-    use std::fs::OpenOptions;
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("found.txt") {
-        use chrono::Local;
-        let time = Local::now().format("%Y-%m-%d %H:%M:%S");
-        let key_type = if compressed { "compressed" } else { "uncompressed" };
-        let _ = writeln!(f, "[{}] {} | {} | {} | {} | {}", time, addr, atype.as_str(), key_type, hex, wif);
-        let _ = f.sync_all();
-    }
-    
-    // Async pretty print (non-critical, can be lost on crash)
+    // Async logger handles both pretty print AND file write with sync_all()
+    // No sync I/O here to avoid blocking the verification pipeline
     let tx = REPORT_TX.get_or_init(init_async_logger);
     let _ = tx.send(ReportEntry {
         privkey: *privkey,
