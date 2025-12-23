@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
-use crate::rng::philox::{PhiloxCounter, philox_to_privkey};
+use crate::rng::philox::{PhiloxCounter, PhiloxState, philox_to_privkey};
 use crate::filter::XorFilter32;
 
 /// GPU-CPU sync constant for batch size
@@ -319,6 +319,12 @@ pub struct OptimizedScanner {
     // Eliminates ~0.1ms dispatch latency (pubkey computation moved to background)
     // Uses UnsafeCell because pubkey is computed/consumed from single thread
     lookahead_pubkey: std::cell::UnsafeCell<Option<(Vec<u8>, Vec<u8>)>>,
+    
+    // PHILOX STATE CACHE: Store state from next_base_key() for dispatch_batch()
+    // CRITICAL FIX: Prevents double next_batch() calls that caused 0 FP bug!
+    // When next_base_key() is called, it stores the state here.
+    // dispatch_batch() uses this cached state instead of calling next_batch() again.
+    last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,6 +730,7 @@ impl OptimizedScanner {
                 (0..6).map(|_| Vec::with_capacity(match_buffer_size)).collect()
             )),
             lookahead_pubkey: std::cell::UnsafeCell::new(None),
+            last_philox_state: std::cell::UnsafeCell::new(None),
         })
     }
 
@@ -762,8 +769,15 @@ impl OptimizedScanner {
         // This hides the ~0.1ms pubkey computation latency completely!
         let batch_size = self.config.keys_per_batch();
         
-        // Get Philox state for this batch
-        let state = self.philox_counter.next_batch(batch_size);
+        // CRITICAL FIX: Use cached state from next_base_key() instead of calling next_batch() again!
+        // Double next_batch() calls caused GPU/CPU state mismatch → 0 FP bug!
+        let state = unsafe {
+            (*self.last_philox_state.get()).take()
+                .unwrap_or_else(|| {
+                    // Fallback for scan_batch() direct calls (tests, etc.)
+                    self.philox_counter.next_batch(batch_size)
+                })
+        };
         
         // LOOK-AHEAD: Try to use pre-computed pubkey
         let (pubkey_x, pubkey_y) = unsafe {
@@ -1056,6 +1070,13 @@ impl OptimizedScanner {
     pub fn next_base_key(&self) -> [u8; 32] {
         let batch_size = self.keys_per_batch();
         let state = self.philox_counter.next_batch(batch_size);
+        
+        // CRITICAL FIX: Cache the state for dispatch_batch() to use!
+        // This prevents double next_batch() calls that caused 0 FP bug.
+        unsafe {
+            *self.last_philox_state.get() = Some(state);
+        }
+        
         philox_to_privkey(&state)
     }
     
