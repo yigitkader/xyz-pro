@@ -16,9 +16,9 @@ use fxhash::FxHasher;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-const CACHE_MAGIC: &[u8; 8] = b"SHXOR_02";
-const NUM_SHARDS: usize = 256;
-// Header: magic(8) + count(8) + prefix_count(8) + shard_table(256 * 20)
+const CACHE_MAGIC: &[u8; 8] = b"SHXOR_03";  // Version bump for 4096 shards
+const NUM_SHARDS: usize = 4096;  // 4096 shards = ~12K entries each (easy to construct)
+// Header: magic(8) + count(8) + prefix_count(8) + shard_table(4096 * 20)
 // Each shard entry: offset(8) + block_len(4) + seed(8) = 20 bytes
 const HEADER_SIZE: usize = 8 + 8 + 8 + (NUM_SHARDS * 20);
 
@@ -94,10 +94,12 @@ impl ShardedXorFilter {
         
         println!("[Shard] Building {} shards for {} targets...", NUM_SHARDS, total);
         
-        // Step 1: Partition targets by hash[0] (first byte)
+        // Step 1: Partition targets by first 12 bits of hash (4096 shards)
+        // shard_idx = (hash[0] << 4) | (hash[1] >> 4)
         let mut buckets: Vec<Vec<[u8; 20]>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
         for target in targets {
-            buckets[target[0] as usize].push(*target);
+            let shard_idx = ((target[0] as usize) << 4) | ((target[1] as usize) >> 4);
+            buckets[shard_idx].push(*target);
         }
         
         let partition_time = start.elapsed();
@@ -164,32 +166,42 @@ impl ShardedXorFilter {
             return Shard { fingerprints: Vec::new(), seed: 0, block_length: 0 };
         }
         
-        // 1.5x capacity for reliable single-attempt construction
-        let capacity = (((size as f64) * 1.5) as usize / 3).max(3) * 3;
+        // 5.0x capacity for reliable construction with non-uniform shard distribution
+        // Some shards may have more entries than average due to hash distribution
+        // Higher multiplier ensures peeling succeeds even for dense shards
+        let capacity = (((size as f64) * 5.0) as usize / 3).max(3) * 3;
         let block_length = capacity / 3;
         
         let mut fingerprints = vec![0u32; capacity];
-        let mut seed = 0x517cc1b727220a95_u64 ^ (shard_idx as u64 * 0x9e3779b97f4a7c15);
+        let mut seed = 0x517cc1b727220a95_u64 ^ (shard_idx as u64).wrapping_mul(0x9e3779b97f4a7c15);
         
-        for attempt in 0..20 {
+        for attempt in 0..100 {
             fingerprints.fill(0);
-            if Self::construct_shard(targets, &mut fingerprints, block_length, seed) {
+            let (success, peeled, singletons) = Self::construct_shard_debug(targets, &mut fingerprints, block_length, seed);
+            if success {
                 return Shard { fingerprints, seed, block_length };
             }
+            
+            // Debug: First failure and every 20th
+            if attempt == 0 || attempt % 20 == 0 {
+                eprintln!("[Shard {}] Attempt {} FAILED: size={} capacity={} block_len={} peeled={}/{} singletons={}",
+                    shard_idx, attempt, size, capacity, block_length, peeled, size, singletons);
+            }
+            
             seed = seed.wrapping_mul(0x5851f42d4c957f2d).wrapping_add(attempt as u64);
         }
         
-        // Should never happen with 1.5x capacity and small shards
-        panic!("[Shard {}] Construction failed after 20 attempts", shard_idx);
+        // Should never happen with 5.0x capacity
+        panic!("[Shard {}] Construction failed after 100 attempts - size={} capacity={}", shard_idx, size, capacity);
     }
     
-    /// XOR-trick peeling for single shard (O(n) algorithm)
-    fn construct_shard(
+    /// XOR-trick peeling for single shard (O(n) algorithm) - debug version
+    fn construct_shard_debug(
         targets: &[[u8; 20]],
         fingerprints: &mut [u32],
         block_length: usize,
         seed: u64,
-    ) -> bool {
+    ) -> (bool, usize, usize) {  // (success, peeled_count, initial_singletons)
         let n = targets.len();
         let m = fingerprints.len();
         
@@ -216,6 +228,7 @@ impl ShardedXorFilter {
         let mut queue: Vec<u32> = (0..m as u32)
             .filter(|&i| count[i as usize] == 1)
             .collect();
+        let initial_singletons = queue.len();
         
         // Peel graph
         let mut stack = Vec::with_capacity(n);
@@ -224,6 +237,13 @@ impl ShardedXorFilter {
             if count[slot as usize] != 1 { continue; }
             
             let key_idx = key_xor[slot as usize] as usize;
+            
+            // BOUNDS CHECK
+            if key_idx >= hashes.len() {
+                eprintln!("[DEBUG] BOUNDS ERROR: key_idx={} >= hashes.len()={}", key_idx, hashes.len());
+                return (false, stack.len(), initial_singletons);
+            }
+            
             let (h0, h1, h2, _) = hashes[key_idx];
             
             stack.push((key_idx, slot));
@@ -238,7 +258,9 @@ impl ShardedXorFilter {
             }
         }
         
-        if stack.len() != n { return false; }
+        if stack.len() != n { 
+            return (false, stack.len(), initial_singletons); 
+        }
         
         // Assign fingerprints
         for (idx, pos) in stack.into_iter().rev() {
@@ -249,7 +271,7 @@ impl ShardedXorFilter {
                 ^ fingerprints[h2 as usize];
         }
         
-        true
+        (true, n, initial_singletons)
     }
     
     #[inline]
@@ -490,7 +512,8 @@ impl ShardedXorFilter {
     
     #[allow(dead_code)]
     pub fn contains(&self, hash: &[u8; 20]) -> bool {
-        let shard_idx = hash[0] as usize;
+        // 12-bit shard index: (hash[0] << 4) | (hash[1] >> 4)
+        let shard_idx = ((hash[0] as usize) << 4) | ((hash[1] as usize) >> 4);
         let (offset, block_len, seed) = self.shard_offsets[shard_idx];
         
         if block_len == 0 {
