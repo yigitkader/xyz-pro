@@ -90,7 +90,24 @@ pub fn philox4x32_10(state: &PhiloxState) -> [u32; 4] {
     ctr
 }
 
+/// Generate 256-bit private key from Philox state
+/// 
+/// DOMAIN SEPARATION:
+///   Lane 0: Philox(counter, key) → lower 128 bits
+///   Lane 1: Philox(counter, key') → upper 128 bits
+///   where key' = key XOR (DOMAIN_SEP_0, DOMAIN_SEP_1)
+/// 
+/// Using KEY modification (not counter) is cryptographically stronger:
+/// - Counter XOR can collide with legitimate counter values
+/// - Key XOR provides true cryptographic domain separation
+/// - Standard practice in Philox-based systems (cuRAND, etc.)
 pub fn philox_to_privkey(state: &PhiloxState) -> [u8; 32] {
+    // Domain separation constants for 256-bit key generation
+    // These are chosen to be: 1) non-zero 2) unlikely to collide 3) asymmetric
+    const DOMAIN_SEP_0: u32 = 0x9E3779B9;  // φ (golden ratio) fractional bits
+    const DOMAIN_SEP_1: u32 = 0x243F6A88;  // π fractional bits
+    
+    // Lane 0: Original key → lower 128 bits
     let random = philox4x32_10(state);
     let mut key = [0u8; 32];
     
@@ -99,8 +116,12 @@ pub fn philox_to_privkey(state: &PhiloxState) -> [u8; 32] {
     key[8..12].copy_from_slice(&random[2].to_be_bytes());
     key[12..16].copy_from_slice(&random[3].to_be_bytes());
     
+    // Lane 1: Modified KEY (not counter!) → upper 128 bits
+    // CRITICAL: Key modification provides stronger domain separation
+    // than counter XOR, avoiding potential counter collisions
     let mut state2 = *state;
-    state2.counter[0] ^= 0xDEADBEEF;
+    state2.key[0] ^= DOMAIN_SEP_0;
+    state2.key[1] ^= DOMAIN_SEP_1;
     let random2 = philox4x32_10(&state2);
     
     key[16..20].copy_from_slice(&random2[0].to_be_bytes());

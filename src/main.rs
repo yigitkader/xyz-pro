@@ -360,15 +360,50 @@ fn run_pipelined(
     let found_keys: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
     let found_keys_clone = found_keys.clone();
     
+    // BACKPRESSURE: Track matches per second for filter anomaly detection
+    let matches_per_sec = Arc::new(AtomicU64::new(0));
+    let matches_per_sec_clone = matches_per_sec.clone();
+    
     let verify_handle = thread::spawn(move || {
         use rayon::prelude::*;
         const PARALLEL_THRESHOLD: usize = 32;
+        
+        // BACKPRESSURE THRESHOLDS:
+        // Normal operation: ~100-1000 FP matches per batch
+        // Filter anomaly: >50,000 FP matches per batch (filter misconfiguration)
+        // Memory bus saturation: >100,000 FP matches per batch
+        const BACKPRESSURE_WARN_THRESHOLD: usize = 10_000;
+        const BACKPRESSURE_CRITICAL_THRESHOLD: usize = 50_000;
+        
+        let mut last_warn = std::time::Instant::now();
+        let mut consecutive_high_batches = 0u32;
         
         while !verify_shutdown.load(Ordering::Relaxed) {
             let (base_key, _, matches) = match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(batch) => batch,
                 Err(_) => continue,
             };
+            
+            // BACKPRESSURE CHECK: Detect filter anomaly or misconfiguration
+            let batch_size = matches.len();
+            matches_per_sec_clone.fetch_add(batch_size as u64, Ordering::Relaxed);
+            
+            if batch_size > BACKPRESSURE_CRITICAL_THRESHOLD {
+                consecutive_high_batches += 1;
+                if consecutive_high_batches >= 3 && last_warn.elapsed() > Duration::from_secs(5) {
+                    eprintln!("\n[⚠️ BACKPRESSURE] CRITICAL: {} matches/batch - possible filter misconfiguration!", batch_size);
+                    eprintln!("[⚠️ BACKPRESSURE] Check: 1) XorFilter cache valid? 2) Prefix table loaded? 3) DEBUG_FILTER_MODE=0?");
+                    last_warn = std::time::Instant::now();
+                }
+            } else if batch_size > BACKPRESSURE_WARN_THRESHOLD {
+                consecutive_high_batches += 1;
+                if consecutive_high_batches >= 5 && last_warn.elapsed() > Duration::from_secs(10) {
+                    eprintln!("\n[⚠️ BACKPRESSURE] High FP rate: {} matches/batch (normal: <1000)", batch_size);
+                    last_warn = std::time::Instant::now();
+                }
+            } else {
+                consecutive_high_batches = 0;
+            }
             
             let process = |pm: &PotentialMatch| {
                 if let Some((addr, atype, privkey)) = verify_match(&base_key, pm, &targets) {

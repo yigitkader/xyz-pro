@@ -248,7 +248,10 @@ pub fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetData
     // Test 4: GLV transform verification
     all_passed &= test_glv_transform();
     
-    // Test 5: Full GPU→CPU verification path
+    // Test 5: GLV Recovery Consistency (CRITICAL for match verification)
+    all_passed &= test_glv_recovery_consistency();
+    
+    // Test 6: Full GPU→CPU verification path
     all_passed &= test_verification_path(scanner, &TEST_KEY_1);
 
     if all_passed {
@@ -323,6 +326,99 @@ fn test_glv_transform() -> bool {
         let glv_y = glv_point.y().unwrap();
         if (orig_y[31] & 1) != (glv_y[31] & 1) {
             // Y parity changed - this can happen with valid GLV, just log it
+        }
+    }
+    
+    println!("PASSED");
+    true
+}
+
+/// GLV Recovery Consistency Test
+/// 
+/// CRITICAL: This verifies that when GPU finds a GLV match, CPU can recover
+/// the EXACT private key that corresponds to the matched address.
+/// 
+/// GPU behavior:
+///   1. Generates point P = (base_key + offset) * G
+///   2. Applies GLV endomorphism: φ(P) = (β·x mod p, y)
+///   3. Hashes φ(P) and checks against target
+/// 
+/// CPU recovery must:
+///   1. Compute k = base_key + offset
+///   2. Apply λ transform: k' = λ·k mod n
+///   3. Derive pubkey from k' and hash to verify
+/// 
+/// If this test fails, GLV matches will be "True Match but False Recovery"!
+fn test_glv_recovery_consistency() -> bool {
+    use k256::{Scalar, ProjectivePoint};
+    use k256::elliptic_curve::ops::Reduce;
+    use k256::elliptic_curve::PrimeField;
+    
+    print!("  [🔍] GLV recovery consistency... ");
+    stdout().flush().ok();
+    
+    // Test keys at various ranges
+    let test_cases: [([u8; 32], u32); 4] = [
+        (TEST_KEY_1, 0),
+        (TEST_KEY_1, 100),
+        (TEST_KEY_5, 1000),
+        (TEST_KEY_ALTERNATING, 50000),
+    ];
+    
+    for (base_key, offset) in &test_cases {
+        // Skip invalid keys
+        if SecretKey::from_slice(base_key).is_err() {
+            continue;
+        }
+        
+        // Step 1: Simulate GPU's sequential key generation
+        // GPU computes: P = (base_key + offset) * G
+        let base_scalar = <Scalar as Reduce<k256::U256>>::reduce_bytes(base_key.into());
+        let offset_scalar = Scalar::from(*offset as u64);
+        let k = base_scalar + offset_scalar;
+        
+        // Step 2: GPU applies GLV endomorphism to point P
+        // φ(P) corresponds to private key λ·k (mod n)
+        let lambda = Scalar::from_repr_vartime(gpu::GLV_LAMBDA.into()).unwrap();
+        let glv_k = k * lambda;
+        
+        // Step 3: CPU recovery path (must match verify_match logic)
+        // add_offset_to_key(base_key, offset) → glv_transform_key()
+        let cpu_key = add_offset_to_key(base_key, *offset);
+        let cpu_glv_key = gpu::glv_transform_key(&cpu_key);
+        
+        // Step 4: Verify CPU and GPU produce the SAME private key
+        let cpu_glv_scalar = <Scalar as Reduce<k256::U256>>::reduce_bytes((&cpu_glv_key).into());
+        
+        if cpu_glv_scalar != glv_k {
+            println!("FAILED");
+            eprintln!("  [✗] GLV recovery mismatch at offset {}!", offset);
+            eprintln!("      GPU would produce: {:?}", glv_k.to_repr());
+            eprintln!("      CPU recovered:     {:?}", cpu_glv_scalar.to_repr());
+            return false;
+        }
+        
+        // Step 5: Verify hash160 matches
+        let glv_secret = match SecretKey::from_slice(&cpu_glv_key) {
+            Ok(s) => s,
+            Err(_) => {
+                println!("FAILED (invalid GLV key)");
+                return false;
+            }
+        };
+        
+        let glv_pubkey = glv_secret.public_key();
+        let glv_hash = crypto::hash160(glv_pubkey.to_encoded_point(true).as_bytes());
+        
+        // Also compute from λ·k directly for comparison
+        let direct_point = ProjectivePoint::GENERATOR * glv_k;
+        let direct_affine = direct_point.to_affine();
+        let direct_pubkey_bytes = direct_affine.to_encoded_point(true);
+        let direct_hash = crypto::hash160(direct_pubkey_bytes.as_bytes());
+        
+        if glv_hash != direct_hash {
+            println!("FAILED (hash mismatch)");
+            return false;
         }
     }
     

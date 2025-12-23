@@ -896,10 +896,31 @@ impl OptimizedScanner {
     fn wait_and_collect(&self, buf_idx: usize) -> Result<PooledBuffer> {
         let buffers = &self.buffer_sets[buf_idx];
         
-        // GPU SYNCHRONIZATION:
-        // Metal command buffers on the same queue execute in FIFO order.
-        // By committing an empty command buffer and waiting for it,
-        // we guarantee all previously committed commands are complete.
+        // ═══════════════════════════════════════════════════════════════════
+        // GPU-CPU SYNCHRONIZATION (Memory Barrier)
+        // ═══════════════════════════════════════════════════════════════════
+        // 
+        // TRIPLE BUFFERING PIPELINE:
+        //   Buffer A: GPU computing current batch
+        //   Buffer B: This function reading previous batch (we are here)
+        //   Buffer C: Rayon threads verifying older batch
+        //
+        // MEMORY BARRIER GUARANTEE:
+        //   Metal's wait_until_completed() provides IMPLICIT memory barrier:
+        //   1. All GPU writes are flushed to Unified Memory
+        //   2. CPU reads see consistent, complete data
+        //   3. No explicit MTLEvent needed for storageModeShared buffers
+        //
+        // RACE CONDITION PREVENTION:
+        //   - Each buffer set has its OWN command queue (3 queues total)
+        //   - We never read a buffer while GPU is writing to it
+        //   - Triple buffering ensures 1 buffer gap between write and read
+        //
+        // Apple Silicon Unified Memory advantage:
+        //   - No CPU-GPU memory copy needed (zero-copy)
+        //   - Coherent view after barrier (both see same data)
+        //
+        // ═══════════════════════════════════════════════════════════════════
         let sync_cmd = buffers.queue.new_command_buffer();
         sync_cmd.commit();
         sync_cmd.wait_until_completed();

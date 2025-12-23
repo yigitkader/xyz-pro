@@ -73,8 +73,21 @@ inline PhiloxState philox_for_thread(constant uint2* base_key,
 }
 
 /// Generate 256-bit private key from Philox output
+/// 
+/// DOMAIN SEPARATION (must match Rust philox.rs):
+///   Lane 0: Philox(counter, key) → lower 128 bits
+///   Lane 1: Philox(counter, key') → upper 128 bits
+///   where key' = key XOR (DOMAIN_SEP_0, DOMAIN_SEP_1)
+/// 
+/// Using KEY modification (not counter) is cryptographically stronger:
+/// - Counter XOR can collide with legitimate counter values
+/// - Key XOR provides true cryptographic domain separation
+/// - Standard practice in Philox-based systems (cuRAND, etc.)
+constant uint PHILOX_DOMAIN_SEP_0 = 0x9E3779B9;  // φ (golden ratio) fractional bits
+constant uint PHILOX_DOMAIN_SEP_1 = 0x243F6A88;  // π fractional bits
+
 inline void philox_to_privkey(PhiloxState state, thread uchar* privkey) {
-    // First 128 bits from primary output
+    // Lane 0: Original key → lower 128 bits
     uint4 random1 = philox4x32_10(state);
     
     // Store as big-endian (Bitcoin standard)
@@ -98,10 +111,11 @@ inline void philox_to_privkey(PhiloxState state, thread uchar* privkey) {
     privkey[14] = random1.w >> 8;
     privkey[15] = random1.w;
     
-    // Second 128 bits: XOR domain separation (MUST MATCH Rust philox.rs!)
-    // CRITICAL: Using XOR 0xDEADBEEF for CPU/GPU synchronization
-    // Previous bug: GPU used += 1, CPU used ^= 0xDEADBEEF → different keys!
-    state.counter.x ^= 0xDEADBEEF;  // Domain separation - synced with Rust
+    // Lane 1: Modified KEY (not counter!) → upper 128 bits
+    // CRITICAL: Key modification provides stronger domain separation
+    // MUST MATCH Rust philox_to_privkey() exactly!
+    state.key.x ^= PHILOX_DOMAIN_SEP_0;
+    state.key.y ^= PHILOX_DOMAIN_SEP_1;
     uint4 random2 = philox4x32_10(state);
     
     privkey[16] = random2.x >> 24;
