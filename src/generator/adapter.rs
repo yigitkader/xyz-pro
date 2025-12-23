@@ -2,8 +2,14 @@
 //!
 //! This module provides the bridge between GpuKeyGenerator and the
 //! KeyGenerator trait, allowing clean integration with the pipeline.
+//!
+//! Pipeline Strategy:
+//! - Use double/triple buffering to overlap GPU compute with CPU processing
+//! - First call: dispatch batch 0, wait, return
+//! - Subsequent: dispatch batch N+1, wait for batch N, return batch N
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
 
 use crate::bridge::KeyGenerator;
@@ -15,10 +21,12 @@ pub struct GpuGeneratorAdapter {
     /// Current batch buffer (for zero-copy access)
     current_batch: UnsafeCell<Vec<u8>>,
     /// Current buffer index for round-robin
-    current_buf_idx: UnsafeCell<usize>,
+    current_buf_idx: AtomicUsize,
+    /// Whether pipeline has been primed
+    pipeline_primed: AtomicBool,
 }
 
-// Safety: We handle synchronization manually through the inner GpuKeyGenerator
+// Safety: We handle synchronization through atomics
 unsafe impl Send for GpuGeneratorAdapter {}
 unsafe impl Sync for GpuGeneratorAdapter {}
 
@@ -31,13 +39,28 @@ impl GpuGeneratorAdapter {
         Self {
             inner: Arc::new(generator),
             current_batch: UnsafeCell::new(vec![0u8; batch_size * output_size]),
-            current_buf_idx: UnsafeCell::new(0),
+            current_buf_idx: AtomicUsize::new(0),
+            pipeline_primed: AtomicBool::new(false),
         }
     }
     
     /// Get inner generator (for direct access if needed)
     pub fn inner(&self) -> &GpuKeyGenerator {
         &self.inner
+    }
+    
+    /// Prime the pipeline by dispatching initial batches
+    fn prime_pipeline(&self) -> Result<(), String> {
+        let depth = self.inner.pipeline_depth();
+        
+        // Dispatch initial batches to fill the pipeline
+        for i in 0..depth {
+            let offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
+            self.inner.dispatch_glv(i, offset)?;
+        }
+        
+        self.pipeline_primed.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -48,30 +71,29 @@ impl KeyGenerator for GpuGeneratorAdapter {
     }
     
     fn generate_batch(&self) -> Result<&[u8], String> {
+        // Prime pipeline on first call
+        if !self.pipeline_primed.load(Ordering::SeqCst) {
+            self.prime_pipeline()?;
+        }
         
         let depth = self.inner.pipeline_depth();
         
-        // Get current buffer index (round-robin)
-        let buf_idx = unsafe {
-            let idx = &mut *self.current_buf_idx.get();
-            let current = *idx;
-            *idx = (current + 1) % depth;
-            current
-        };
+        // Get current buffer index (the one we'll read from)
+        let read_idx = self.current_buf_idx.fetch_add(1, Ordering::SeqCst) % depth;
         
-        // Dispatch next batch with GLV
-        let offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
-        self.inner.dispatch_glv(buf_idx, offset)?;
+        // Get the buffer set for reading
+        let bs = self.inner.buffer_set(read_idx);
         
-        // Wait for completion and get data
-        let bs = self.inner.buffer_set(buf_idx);
-        
-        // Wait for GPU
+        // Wait for this batch to complete
         let cb = bs.queue.new_command_buffer();
         cb.commit();
         cb.wait_until_completed();
         
-        // Zero-copy access to GPU buffer
+        // Dispatch next batch to this buffer (for next iteration)
+        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
+        self.inner.dispatch_glv(read_idx, next_offset)?;
+        
+        // Zero-copy access to GPU buffer via Unified Memory
         let output_ptr = bs.output_buffer.contents() as *const u8;
         let output_size = self.batch_size() * 72;
         

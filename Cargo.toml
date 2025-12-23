@@ -2,6 +2,7 @@
 name = "xyz-pro"
 version = "0.3.0"
 edition = "2021"
+default-run = "btc_keygen"
 
 [dependencies]
 # Crypto

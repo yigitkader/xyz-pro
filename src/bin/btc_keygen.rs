@@ -26,27 +26,40 @@ use xyz_pro::bridge::{IntegratedPipeline, PipelineConfig, CombinedOutput};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     
-    // Check for scan mode first
-    if args.iter().any(|a| a == "--scan") {
-        run_scan_mode(&args);
+    // Check for help
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
         return;
     }
     
-    let config = parse_args(&args);
-    let target = parse_target(&args);
-    let use_gpu = parse_gpu_flag(&args);
+    // Check for generator-only mode (writes to disk)
+    if args.iter().any(|a| a == "--generate" || a == "--gen") {
+        run_generator_mode(&args);
+        return;
+    }
+    
+    // DEFAULT: Integrated Pipeline (Scan Mode)
+    // Bridge connects Generator + Reader
+    // Zero disk I/O until match found
+    run_scan_mode(&args);
+}
+
+fn run_generator_mode(args: &[String]) {
+    let config = parse_args(args);
+    let target = parse_target(args);
+    let use_gpu = parse_gpu_flag(args);
     
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║           🔑 BTC Private Key Generator v1.0                ║");
+    println!("║           🔑 BTC Key Generator (Disk Mode)                 ║");
     println!("║                                                            ║");
-    println!("║   Generates keys with P2PKH, P2SH, and P2WPKH addresses   ║");
+    println!("║   Generates keys → writes to disk                          ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
     
     if use_gpu {
         run_gpu_mode(config, target);
     } else {
-        run_cpu_mode(config, target, &args);
+        run_cpu_mode(config, target, args);
     }
 }
 
@@ -342,16 +355,22 @@ fn parse_gpu_flag(args: &[String]) -> bool {
 }
 
 fn print_help() {
-    println!("BTC Private Key Generator & Scanner");
+    println!("BTC Private Key Scanner & Generator");
     println!();
     println!("USAGE:");
     println!("    btc_keygen [OPTIONS]");
     println!();
     println!("MODES:");
-    println!("    Generator mode (default): Generate keys and write to disk");
-    println!("    Scanner mode (--scan):    Generate & Match in GPU, zero I/O until hit");
+    println!("    Scanner mode (DEFAULT):   Generate & Match via Bridge, zero I/O until hit");
+    println!("    Generator mode (--gen):   Generate keys and write to disk");
     println!();
-    println!("GENERATOR OPTIONS:");
+    println!("SCANNER OPTIONS (DEFAULT MODE):");
+    println!("    --targets FILE           Path to targets.json (default: targets.json)");
+    println!("    --start N                Start key (hex: 0x... or decimal, default: 1)");
+    println!("    --output FILE            Output file for matches (default: matches.txt)");
+    println!();
+    println!("GENERATOR OPTIONS (--gen or --generate):");
+    println!("    --gen, --generate        Switch to generator mode (disk I/O)");
     println!("    -g, --gpu                Use GPU acceleration (Metal)");
     println!("    -o, --output DIR         Output directory (default: ./output)");
     println!("    -f, --format FORMAT      Output format: json, binary, compact, raw, both");
@@ -360,23 +379,17 @@ fn print_help() {
     println!("    -n, --target N           Stop after N keys");
     println!("    --start-offset N         Starting private key offset");
     println!();
-    println!("SCANNER OPTIONS (--scan):");
-    println!("    --scan                   Enable Generate & Match mode");
-    println!("    --targets FILE           Path to targets.json (default: targets.json)");
-    println!("    --start N                Start key (hex: 0x... or decimal)");
-    println!("    --end N                  End key (optional)");
-    println!();
     println!("OTHER:");
     println!("    -t, --threads N          Number of threads (default: auto)");
     println!("    -s, --seed N             Random seed (CPU only)");
     println!("    -h, --help               Print this help");
     println!();
     println!("EXAMPLES:");
-    println!("    # Generate mode");
-    println!("    btc_keygen --gpu --format raw --target 100000000");
+    println!("    # Scanner mode (default) - NASA-grade Bridge architecture");
+    println!("    btc_keygen --targets targets.json --start 0x1");
     println!();
-    println!("    # Scanner mode - NASA-grade");
-    println!("    btc_keygen --scan --targets targets.json --start 0x1");
+    println!("    # Generator mode - writes to disk");
+    println!("    btc_keygen --gen --gpu --format raw --target 100000000");
 }
 
 fn format_number(n: u64) -> String {

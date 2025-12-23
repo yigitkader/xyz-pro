@@ -1,46 +1,22 @@
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              BRIDGE                                      │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────────────────┐ │
-│  │  KeyGenerator  │  │    Matcher     │  │      MatchOutput           │ │
-│  │    (trait)     │  │    (trait)     │  │       (trait)              │ │
-│  └───────┬────────┘  └───────┬────────┘  └────────────┬───────────────┘ │
-│          │                   │                        │                  │
-│  ┌───────┴────────────────────┴────────────────────────┴───────────────┐ │
-│  │                    IntegratedPipeline                                │ │
-│  │  - Orchestrates generator, matcher, output                           │ │
-│  │  - Zero-copy batch transfer                                          │ │
-│  │  - Parallel matching with Rayon                                      │ │
-│  └──────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-▲                         ▲                         ▲
-│                         │                         │
-┌─────────┴──────────┐   ┌─────────┴──────────┐   ┌─────────┴──────────┐
-│     GENERATOR      │   │      READER        │   │      OUTPUT        │
-│                    │   │                    │   │                    │
-│ GpuGeneratorAdapter│   │  ParallelMatcher   │   │  CombinedOutput    │
-│  ↓ impl trait      │   │  ↓ impl trait      │   │  ↓ impl trait      │
-│                    │   │                    │   │                    │
-│ GpuKeyGenerator    │   │  TargetSet         │   │  Console + File    │
-│ - Metal shader     │   │  - HashSet O(1)    │   │                    │
-│ - GLV 2x           │   │  - All addr types  │   │                    │
-└────────────────────┘   └────────────────────┘   └────────────────────┘
+# DEFAULT: Scan Mode (Bridge kullanır)
+cargo run
+# veya
+cargo run -- --targets targets.json --start 0x1
 
-src/
-├── bridge/
-│   ├── mod.rs       # Module exports
-│   ├── types.rs     # RawKeyData, KeyBatch, Match
-│   ├── traits.rs    # KeyGenerator, Matcher, MatchOutput traits
-│   └── pipeline.rs  # IntegratedPipeline orchestrator
-│
-├── generator/
-│   ├── adapter.rs   # GpuGeneratorAdapter (implements KeyGenerator)
-│   ├── gpu.rs       # GpuKeyGenerator (Metal, GLV)
-│   └── ...
-│
-├── reader/
-│   ├── adapter.rs   # TargetMatcher, ParallelMatcher (implements Matcher)
-│   ├── targets.rs   # TargetSet (HashSet)
-│   └── ...
-│
-└── bin/
-└── btc_keygen.rs  # Uses bridge to connect modules
+# Generator Mode (Diske yaz)
+cargo run -- --gen --gpu --format raw
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     DEFAULT: SCAN MODE                          │
+│                                                                 │
+│   cargo run  →  IntegratedPipeline (Bridge)                     │
+│                        │                                        │
+│         ┌──────────────┼──────────────┐                         │
+│         ▼              ▼              ▼                         │
+│   ┌──────────┐   ┌──────────┐   ┌──────────┐                   │
+│   │Generator │   │ Matcher  │   │  Output  │                   │
+│   │  (GPU)   │──▶│(HashSet) │──▶│  (File)  │                   │
+│   └──────────┘   └──────────┘   └──────────┘                   │
+│                                                                 │
+│   Zero Disk I/O  •  GLV 2x  •  O(1) Lookup                     │
+└─────────────────────────────────────────────────────────────────┘

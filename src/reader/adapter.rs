@@ -60,20 +60,30 @@ impl Matcher for TargetMatcher {
     fn check_key(&self, pubkey_hash: &[u8; 20], p2sh_hash: &[u8; 20]) -> Vec<MatchType> {
         let mut matches = Vec::new();
         
-        // Check P2PKH (pubkey_hash is RIPEMD160(SHA256(compressed_pubkey)))
-        if self.targets.contains_hash160(pubkey_hash) {
-            matches.push(MatchType::P2PKH);
+        // P2PKH and P2WPKH use the same hash160 (pubkey_hash)
+        // We need to check which address types are in targets
+        // The TargetSet already separates P2PKH (1...) and P2WPKH (bc1q...) during loading
+        // So we check the hash once - if it matches, it could be either type
+        let hash_match = self.targets.contains_hash160(pubkey_hash);
+        
+        if hash_match {
+            // Could be P2PKH (1...) or P2WPKH (bc1q...) - report both
+            // The target loading already tracks which types were loaded
+            if self.targets.stats.p2pkh > 0 {
+                matches.push(MatchType::P2PKH);
+            }
+            if self.targets.stats.p2wpkh > 0 {
+                matches.push(MatchType::P2WPKH);
+            }
+            // If neither was specifically loaded but hash matches, report P2PKH
+            if matches.is_empty() {
+                matches.push(MatchType::P2PKH);
+            }
         }
         
         // Check P2SH (p2sh_hash is RIPEMD160(SHA256(witness_script)))
         if self.targets.contains_p2sh(p2sh_hash) {
             matches.push(MatchType::P2SH);
-        }
-        
-        // Check P2WPKH (same hash160 as P2PKH, different address encoding)
-        // Only add if not already matched as P2PKH to avoid duplicates
-        if !matches.contains(&MatchType::P2PKH) && self.targets.contains_hash160(pubkey_hash) {
-            matches.push(MatchType::P2WPKH);
         }
         
         matches
