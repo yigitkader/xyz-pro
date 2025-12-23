@@ -610,17 +610,6 @@ impl OptimizedScanner {
             }
         };
         
-        // DEBUG: Log which state source was used
-        static DISPATCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dcount = DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-        if dcount < 5 || dcount % 100 == 0 {
-            eprintln!("[DEBUG] dispatch_batch #{}: {} counter=[{},{},{},{}] buf_idx={}",
-                dcount,
-                if used_cached { "CACHED" } else { "FALLBACK" },
-                state.counter[0], state.counter[1], state.counter[2], state.counter[3],
-                buf_idx);
-        }
-        
         // LOOK-AHEAD: Try to use pre-computed pubkey
         let (pubkey_x, pubkey_y) = unsafe {
             let cached = &mut *self.lookahead_pubkey.get();
@@ -734,14 +723,6 @@ impl OptimizedScanner {
             let ptr = buffers.match_count_buf.contents() as *const u32;
             *ptr
         };
-        
-        // DEBUG: Log match count from GPU
-        static COLLECT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let ccount = COLLECT_COUNT.fetch_add(1, Ordering::Relaxed);
-        if ccount < 10 || raw_match_count > 0 || ccount % 50 == 0 {
-            eprintln!("[DEBUG] wait_and_collect #{}: buf_idx={} raw_match_count={}",
-                ccount, buf_idx, raw_match_count);
-        }
         
         let match_buffer_size = self.config.match_buffer_size;
         if raw_match_count as usize > match_buffer_size {
@@ -875,27 +856,15 @@ impl OptimizedScanner {
         F: FnMut() -> ([u8; 32], PhiloxState),  // Returns both key and state
         G: FnMut([u8; 32], PhiloxState, Vec<PotentialMatch>),  // Callback gets state too
     {
-        // Track 2 previous batches for triple buffering (now with PhiloxState)
         let mut batch_queue: std::collections::VecDeque<([u8; 32], PhiloxState, usize)> = std::collections::VecDeque::with_capacity(2);
         let mut current_buf = 0usize;
-        let mut pipeline_iter = 0u64;
         
-        // LOOK-AHEAD: Generate first key and its pubkey
         let (mut next_key, mut next_state) = key_gen();
         self.precompute_pubkey(&next_key);
         
-        eprintln!("[DEBUG] scan_pipelined: Starting pipeline, first key[0..4]={:02x}{:02x}{:02x}{:02x}",
-            next_key[0], next_key[1], next_key[2], next_key[3]);
-        
         while !shutdown.load(Ordering::Relaxed) {
-            // Use current key (pubkey already pre-computed!)
             let base_key = next_key;
             let base_state = next_state;
-            
-            if pipeline_iter < 5 {
-                eprintln!("[DEBUG] scan_pipelined iter {}: BEFORE dispatch, base_key[0..4]={:02x}{:02x}{:02x}{:02x} buf={}",
-                    pipeline_iter, base_key[0], base_key[1], base_key[2], base_key[3], current_buf);
-            }
             
             self.dispatch_batch(&base_key, current_buf)?;
             
@@ -913,18 +882,13 @@ impl OptimizedScanner {
             //   - batch_queue[0]: being verified by caller (Rayon)
             if batch_queue.len() >= 2 {
                 if let Some((old_key, old_state, old_buf)) = batch_queue.pop_front() {
-                    if pipeline_iter < 10 {
-                        eprintln!("[DEBUG] scan_pipelined iter {}: collecting from buf={} queue_len_before={}",
-                            pipeline_iter, old_buf, batch_queue.len() + 1);
-                    }
                     let matches = self.wait_and_collect(old_buf)?;
                     on_batch(old_key, old_state, matches);
                 }
             }
             
             batch_queue.push_back((base_key, base_state, current_buf));
-            current_buf = (current_buf + 1) % 3;  // Rotate through 3 buffers
-            pipeline_iter += 1;
+            current_buf = (current_buf + 1) % 3;
         }
         
         // Drain remaining batches on shutdown
@@ -950,17 +914,7 @@ impl OptimizedScanner {
         let batch_size = self.keys_per_batch();
         let state = self.philox_counter.next_batch(batch_size);
         
-        // DEBUG: Log state generation
-        static DEBUG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < 5 || count % 100 == 0 {
-            eprintln!("[DEBUG] next_base_key #{}: counter=[{},{},{},{}] key=[{},{}]",
-                count,
-                state.counter[0], state.counter[1], state.counter[2], state.counter[3],
-                state.key[0], state.key[1]);
-        }
-        
-        // CRITICAL FIX: Cache the state for dispatch_batch() to use!
+        // Cache the state for dispatch_batch() to use
         // This prevents double next_batch() calls that caused 0 FP bug.
         unsafe {
             *self.last_philox_state.get() = Some(state);

@@ -720,7 +720,7 @@ inline bool prefix_exists(thread uchar* hash,
 //   0 = Production (XorFilter + Prefix)
 //   1 = XorFilter only (bypass prefix)
 //   2 = Accept every Nth hash (bypass all filters, test hash output)
-#define DEBUG_FILTER_MODE 1  // 0=Production(XorFilter+Prefix), 1=XorFilter only, 2=Debug bypass
+#define DEBUG_FILTER_MODE 0  // 0=Production(XorFilter+Prefix), 1=XorFilter only, 2=Debug bypass
 #define DEBUG_ACCEPT_EVERY_N 1000  // Only used when DEBUG_FILTER_MODE=2
 
 inline bool filter_check_with_prefix_sharded(thread uchar* h,
@@ -1005,10 +1005,10 @@ kernel void scan_keys(
             // FIXED: Overflow protection - if overflow detected, decrement counter and stop
             // This prevents buffer overflow and ensures match_count stays accurate
             #define SAVE_MATCH(hash_arr, type_val) do { \
-                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed); \
+                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_acq_rel); \
                 if (idx >= MAX_MATCHES) { \
                     /* Overflow detected - revert increment and stop scanning */ \
-                    atomic_fetch_sub_explicit(match_count, 1, memory_order_relaxed); \
+                    atomic_fetch_sub_explicit(match_count, 1, memory_order_acq_rel); \
                     break; \
                 } \
                 uint off = idx * 52; \
