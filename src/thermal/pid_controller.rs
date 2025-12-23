@@ -244,6 +244,7 @@ impl DynamicSpeedController {
         Some(new_batch)
     }
     
+    #[allow(dead_code)]
     pub fn current_speed(&self) -> f32 {
         self.current_speed
     }

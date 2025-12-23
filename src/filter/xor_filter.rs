@@ -351,19 +351,23 @@ impl XorFilter32 {
             ^ self.fingerprints[h2 as usize] == fp
     }
     
+    #[allow(dead_code)]
     pub fn gpu_data(&self) -> (&[u32], [u64; 3], u32) {
-        // GPU expects 3 seeds for compatibility
         let seeds = [self.seed, self.seed ^ 0xc3a5c85c97cb3127, 0];
         (&self.fingerprints, seeds, self.block_length as u32)
     }
     
+    #[allow(dead_code)]
     pub fn prefix_table(&self) -> &[u32] { &self.prefix_table }
+    #[allow(dead_code)]
     pub fn prefix_count(&self) -> u32 { self.prefix_table.len() as u32 }
     
+    #[allow(dead_code)]
     pub fn memory_bytes(&self) -> usize {
         self.fingerprints.len() * 4 + 8 + 8 + self.prefix_table.len() * 4
     }
     
+    #[allow(dead_code)]
     pub fn bits_per_element(&self, num_keys: usize) -> f64 {
         (self.memory_bytes() * 8) as f64 / num_keys as f64
     }

@@ -11,6 +11,7 @@
 8. [Pipeline Architecture](#8-pipeline-architecture)
 9. [Memory Layout](#9-memory-layout)
 10. [Performance Characteristics](#10-performance-characteristics)
+11. [Sharded XOR Filter System](#11-sharded-xor-filter-system)
 
 ---
 
@@ -27,26 +28,28 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │   INPUT:                           OUTPUT:                              │
 │   ┌──────────────────┐            ┌──────────────────┐                 │
 │   │ Target Addresses │            │ Matched Keys     │                 │
-│   │ (50M addresses)  │  ──────▶   │ + WIF Format     │                 │
+│   │ (49M addresses)  │  ──────▶   │ + WIF Format     │                 │
 │   └──────────────────┘            └──────────────────┘                 │
 │                                                                         │
 │   PROCESS:                                                              │
 │   1. Generate random 256-bit private keys (Philox RNG)                 │
 │   2. Compute public key (secp256k1 elliptic curve)                     │
 │   3. Hash public key → Hash160 (SHA256 + RIPEMD160)                    │
-│   4. Check if Hash160 exists in target database (Xor Filter)           │
+│   4. Check if Hash160 exists in target database (Sharded Xor Filter)  │
 │   5. If match found → Output private key in WIF format                 │
 │                                                                         │
-│   SPEED: ~6-30 Million keys/second on Apple M1 Pro                     │
+│   SPEED: 4-5 Million keys/second on Apple M1                           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 1.2 Key Features
 - **GPU-Accelerated**: Apple Metal compute shaders for parallel key generation and hashing
-- **Probabilistic Filtering**: Xor Filter32 for O(1) target lookup with <0.15% false positive rate
+- **Sharded Probabilistic Filtering**: 4096-shard XorFilter32 for O(1) target lookup with <0.0015% false positive rate
 - **GLV Endomorphism**: Scan 2 key ranges with 1 point addition (2× throughput)
 - **Triple Buffering**: GPU never waits for CPU verification
 - **Thermal Management**: PID controller prevents GPU throttling
+- **Auto-Deduplication**: Removes duplicate targets for reliable filter construction
+- **mmap Cache**: Zero-copy cache loading with CRC32 integrity check
 
 ---
 
@@ -56,8 +59,8 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                              MAIN THREAD                                │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. Load targets.bin (49M addresses → FxHashMap)                 │   │
-│  │ 2. Build XorFilter32 (probabilistic set membership)             │   │
+│  │ 1. Load targets.bin (49M addresses → deduplicate)               │   │
+│  │ 2. Build ShardedXorFilter (4096 shards, parallel construction)  │   │
 │  │ 3. Initialize GPU (Metal pipeline, buffers)                     │   │
 │  │ 4. Run self-tests (verify CPU/GPU consistency)                  │   │
 │  │ 5. Start GPU thread + Verification thread                       │   │
@@ -71,9 +74,9 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  ┌─────────────────────────┐  │    │  ┌─────────────────────────────┐  │
 │  │ Triple-Buffered Loop:   │  │    │  │ Rayon Parallel Processing:  │  │
 │  │                         │  │    │  │                             │  │
-│  │ while !shutdown {       │  │    │  │ for (base_key, matches) {   │  │
-│  │   base_key = next_key() │──┼────┼──│   matches.par_iter()        │  │
-│  │   dispatch_batch(key)   │  │    │  │     .for_each(|m| {         │  │
+│  │ while !shutdown {       │  │    │  │ for (base_state, matches) { │  │
+│  │   state = next_key()    │──┼────┼──│   matches.par_iter()        │  │
+│  │   dispatch_batch(state) │  │    │  │     .for_each(|m| {         │  │
 │  │   collect_matches()     │──┼────┼─▶│       verify_match(m)       │  │
 │  │ }                       │  │    │  │     });                     │  │
 │  └─────────────────────────┘  │    │  │ }                           │  │
@@ -84,18 +87,18 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         METAL GPU KERNEL                                │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ kernel void scan_keys(thread_id, base_key, philox_state, ...)   │   │
+│  │ kernel void scan_keys(thread_id, philox_state, ...)             │   │
 │  │ {                                                                │   │
 │  │   // Phase 1: Generate starting point using windowed NAF        │   │
 │  │   point = base_pubkey + thread_id × G                           │   │
 │  │                                                                  │   │
-│  │   // Phase 2: Batch point additions (BATCH_SIZE=20)             │   │
-│  │   for (i = 0; i < keys_per_thread; i += 20) {                   │   │
-│  │     batch_X[0..20] = point.x + (0..20) × G.x                    │   │
-│  │     batch_Y[0..20] = point.y + (0..20) × G.y                    │   │
+│  │   // Phase 2: Batch point additions (BATCH_SIZE=16)             │   │
+│  │   for (i = 0; i < keys_per_thread; i += 16) {                   │   │
+│  │     batch_X[0..16] = point.x + (0..16) × G.x                    │   │
+│  │     batch_Y[0..16] = point.y + (0..16) × G.y                    │   │
 │  │                                                                  │   │
-│  │     // Montgomery batch inversion (1 mod_inv per 20 points!)    │   │
-│  │     batch_invert(batch_Z[0..20])                                │   │
+│  │     // Montgomery batch inversion (1 mod_inv per 16 points!)    │   │
+│  │     batch_invert(batch_Z[0..16])                                │   │
 │  │                                                                  │   │
 │  │     // Phase 3: Hash and check                                  │   │
 │  │     for each point in batch {                                   │   │
@@ -105,11 +108,11 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  │                                                                  │   │
 │  │       // GLV: Get second point for FREE!                        │   │
 │  │       glv_point = (β × point.x, point.y)  // λ·k mod n          │   │
-│  │       glv_hash_comp = Hash160(glv_compressed)                   │   │
 │  │       ...                                                        │   │
 │  │                                                                  │   │
-│  │       // Check Xor Filter + Prefix Table                        │   │
-│  │       if (xor_contains(hash) && prefix_exists(hash)) {          │   │
+│  │       // Check SHARDED Xor Filter + Prefix Table                │   │
+│  │       shard_id = (hash[0] << 4) | (hash[1] >> 4)  // 12-bit     │   │
+│  │       if (xor_contains_sharded(hash) && prefix_exists(hash)) {  │   │
 │  │         save_match(key_index, hash, type)                       │   │
 │  │       }                                                          │   │
 │  │     }                                                            │   │
@@ -133,20 +136,27 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  1. LOAD TARGETS                                                        │
 │     ├─ Check if targets.bin exists (binary cache)                      │
 │     ├─ If not, parse targets.json and create binary cache              │
-│     ├─ Load into FxHashMap<Hash160, AddressType>                       │
-│     └─ ~49M entries, ~1.2GB memory                                      │
+│     ├─ Load into memory (~49M entries, ~1.0GB)                         │
+│     └─ Deduplicate targets (removes ~8K duplicates)                    │
 │                                                                         │
-│  2. BUILD XOR FILTER32                                                  │
-│     ├─ Extract all Hash160 values (20 bytes each)                      │
-│     ├─ Construct Xor filter using Dietzfelbinger algorithm             │
-│     ├─ Build prefix table (first 4 bytes, sorted, deduplicated)        │
-│     └─ ~250MB for filter + ~195MB for prefix table                     │
+│  2. BUILD SHARDED XOR FILTER (or load from cache)                      │
+│     ├─ Check for .shxor cache file                                     │
+│     ├─ If cache exists: mmap load with CRC32 verification (~10ms)      │
+│     ├─ If not:                                                          │
+│     │   ├─ Partition 49M targets into 4096 shards (~12K each)          │
+│     │   ├─ Build shards in parallel (Rayon, ~1.4s)                     │
+│     │   ├─ Build prefix table (sorted, deduplicated, ~0.2s)            │
+│     │   └─ Save to .shxor cache with CRC32                             │
+│     └─ Total: 294MB filter + 195MB prefix table                        │
 │                                                                         │
 │  3. INITIALIZE GPU                                                      │
 │     ├─ Detect Metal device and optimal configuration                   │
 │     ├─ Compile Metal shaders (secp256k1_scanner.metal)                 │
 │     ├─ Allocate triple-buffered command queues                         │
-│     ├─ Upload Xor filter, prefix table, wNAF table to GPU              │
+│     ├─ Upload sharded filter data to GPU:                              │
+│     │   ├─ xor_fingerprints_buf: all shard fingerprints concatenated  │
+│     │   ├─ xor_shard_info_buf: 4096 × (offset, block_len, seed)        │
+│     │   └─ prefix_table_buf: sorted 4-byte prefixes                    │
 │     └─ Initialize Philox RNG with random seed                          │
 │                                                                         │
 │  4. SELF-TESTS                                                          │
@@ -154,7 +164,7 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │     ├─ Test GLV endomorphism constants (λ³ ≡ 1 mod n)                  │
 │     ├─ Test WIF encoding (compressed/uncompressed)                     │
 │     ├─ Test GPU hash calculation matches CPU                           │
-│     └─ Test Xor Filter false positive rate                             │
+│     └─ Test GPU sharded filter lookup                                  │
 │                                                                         │
 │  5. START SCANNING                                                      │
 │     ├─ Spawn GPU thread (scan_pipelined)                               │
@@ -177,7 +187,7 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  │ counter: AtomicU64 = 0            // Batch counter               │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
-│  Per-Batch State (sent to GPU):                                        │
+│  Per-Batch State (PhiloxState sent to GPU):                            │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ counter[0..3]: u32[4]  // 128-bit counter                        │  │
 │  │ key[0..1]: u32[2]      // 64-bit key (from seed)                 │  │
@@ -195,6 +205,18 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  │ random[4..7] = philox4x32_10(thread_counter, key)                │  │
 │  │                                                                   │  │
 │  │ private_key[0..31] = concatenate(random[0..7])                   │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  CPU Verification (for_thread method):                                 │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │ // Must EXACTLY match GPU philox_for_thread()                    │  │
+│  │ fn for_thread(&self, thread_id: u32) -> PhiloxState {            │  │
+│  │   let counter0 = self.counter[0].wrapping_add(thread_id);        │  │
+│  │   let counter1 = if counter0 < self.counter[0] {                 │  │
+│  │     self.counter[1].wrapping_add(1)                              │  │
+│  │   } else { self.counter[1] };                                    │  │
+│  │   PhiloxState { counter: [counter0, counter1, ...], key: ... }   │  │
+│  │ }                                                                 │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │  Properties:                                                            │
@@ -261,8 +283,8 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │     ┌──────────────────────────────────────────────────────────────┐   │
 │     │ // Convert from Jacobian (X:Y:Z) to Affine (x,y)             │   │
 │     │ // Need: x = X/Z², y = Y/Z³                                  │   │
-│     │ // Naive: 20 mod_inv operations (EXPENSIVE!)                 │   │
-│     │ // Montgomery: 1 mod_inv + 60 mod_mul (3× per point)         │   │
+│     │ // Naive: 16 mod_inv operations (EXPENSIVE!)                 │   │
+│     │ // Montgomery: 1 mod_inv + 48 mod_mul (3× per point)         │   │
 │     │                                                               │   │
 │     │ products[0] = Z[0]                                           │   │
 │     │ for i in 1..BATCH_SIZE:                                      │   │
@@ -318,10 +340,14 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │                                                                         │
 │  Private Key Recovery (CPU side):                                       │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │ // Use PhiloxState.for_thread() to get exact thread state       │  │
+│  │ let thread_state = base_state.for_thread(match.key_index);      │  │
+│  │ let privkey = philox_to_privkey(&thread_state);                 │  │
+│  │                                                                  │  │
 │  │ if match_type < 3:                                               │  │
-│  │   private_key = base_key + key_index    // Normal                │  │
+│  │   private_key = privkey                    // Normal             │  │
 │  │ else:                                                             │  │
-│  │   private_key = λ × (base_key + key_index) mod n  // GLV         │  │
+│  │   private_key = λ × privkey mod n          // GLV                │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │  Result: 6 hash checks per point addition = 2× throughput!             │
@@ -360,7 +386,7 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │                                                                         │
 │  GPU Optimization:                                                      │
 │  • SHA256: Custom Metal implementation (sha256_33.metal, sha256_65)    │
-│  • RIPEMD160: Custom Metal implementation (ripemd160.metal)            │
+│  • RIPEMD160: Custom Metal implementation (inline in scanner)          │
 │  • P2SH reuses compressed hash (saves 1 SHA256 computation)            │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -381,6 +407,7 @@ xyz-pro/
 │   ├── address.rs                 # WIF encoding, P2SH script hash
 │   ├── error.rs                   # Error types
 │   ├── lib.rs                     # Library exports
+│   ├── startup_tests.rs           # GPU correctness tests
 │   │
 │   ├── crypto/
 │   │   └── mod.rs                 # hash160, is_valid_private_key
@@ -388,12 +415,15 @@ xyz-pro/
 │   ├── rng/
 │   │   ├── mod.rs                 # Philox module exports
 │   │   ├── philox.rs              # Philox4x32-10 CPU implementation
+│   │   │                          # + for_thread() synchronization
 │   │   └── philox.metal           # Philox4x32-10 GPU implementation
 │   │
 │   ├── filter/
 │   │   ├── mod.rs                 # Filter module exports
-│   │   ├── xor_filter.rs          # XorFilter32 construction
-│   │   └── xor_lookup.metal       # GPU Xor filter lookup
+│   │   ├── xor_filter.rs          # XorFilter32 (legacy single filter)
+│   │   ├── sharded_filter.rs      # ShardedXorFilter (4096 shards)
+│   │   │                          # + mmap cache + CRC32 integrity
+│   │   └── xor_lookup.metal       # GPU Xor filter lookup (sharded)
 │   │
 │   ├── targets/
 │   │   └── mod.rs                 # Target database (binary/JSON)
@@ -403,9 +433,7 @@ xyz-pro/
 │   │   ├── pid_controller.rs      # PID thermal controller
 │   │   └── hardware_monitor.rs    # Temperature reading
 │   │
-│   ├── scanner/
-│   │   ├── mod.rs                 # Scanner module exports
-│   │   └── zero_copy.rs           # Zero-copy match reading
+│   ├── scanner/                   # Scanner module (reserved)
 │   │
 │   ├── math/
 │   │   ├── mod.rs                 # Math module exports
@@ -414,19 +442,21 @@ xyz-pro/
 │   │
 │   ├── secp256k1_scanner.metal    # Main GPU kernel
 │   ├── sha256_33.metal            # SHA256 for 33-byte input
-│   ├── sha256_65.metal            # SHA256 for 65-byte input
-│   └── ripemd160.metal            # RIPEMD160 implementation
+│   └── sha256_65.metal            # SHA256 for 65-byte input
 │
 ├── tests/
 │   ├── integration.rs             # Integration test module
+│   ├── unit.rs                    # Unit test module
 │   └── integration/
 │       ├── correctness.rs         # CPU/GPU consistency tests
 │       ├── optimizations.rs       # Performance optimization tests
 │       ├── edge_cases.rs          # Edge case tests
-│       └── cpu_gpu_xor.rs         # Xor filter integration tests
+│       └── ...
 │
 ├── Cargo.toml                     # Dependencies and features
-└── targets.json / targets.bin     # Target address database
+├── ARCHITECTURE.md                # This document
+├── targets.json / targets.bin     # Target address database
+└── targets.shxor                  # Sharded filter cache
 ```
 
 ### 4.2 Module Responsibilities
@@ -434,12 +464,14 @@ xyz-pro/
 | Module | Responsibility |
 |--------|---------------|
 | `main.rs` | Entry point, thread spawning, stats display, self-tests |
-| `gpu.rs` | GPU initialization, buffer management, dispatch/collect |
-| `rng/philox.rs` | Counter-based RNG state management |
-| `filter/xor_filter.rs` | Probabilistic set membership filter |
+| `gpu.rs` | GPU initialization, buffer management, dispatch/collect, PhiloxState sync |
+| `rng/philox.rs` | Counter-based RNG state management, `for_thread()` for CPU sync |
+| `filter/sharded_filter.rs` | 4096-shard probabilistic filter, mmap cache, CRC32 |
+| `filter/xor_lookup.metal` | GPU sharded filter lookup with correct hash computation |
 | `targets/mod.rs` | Address database loading and lookup |
 | `thermal/*` | GPU temperature monitoring and throttling |
 | `secp256k1_scanner.metal` | GPU kernel for key scanning |
+| `startup_tests.rs` | GPU correctness verification at startup |
 
 ---
 
@@ -460,6 +492,22 @@ struct PhiloxState {
     key: [u32; 2],      // 64-bit key (from seed)
 }
 
+impl PhiloxState {
+    // CRITICAL: Derive thread-specific state (must match GPU!)
+    fn for_thread(&self, thread_id: u32) -> Self {
+        let c0 = self.counter[0].wrapping_add(thread_id);
+        let c1 = if c0 < self.counter[0] {
+            self.counter[1].wrapping_add(1)
+        } else {
+            self.counter[1]
+        };
+        PhiloxState {
+            counter: [c0, c1, self.counter[2], self.counter[3]],
+            key: self.key,
+        }
+    }
+}
+
 // Round function
 fn philox_round(ctr: [u32; 4], key: [u32; 2]) -> [u32; 4] {
     let prod0 = (ctr[0] as u64) * (PHILOX_M0 as u64);
@@ -472,46 +520,99 @@ fn philox_round(ctr: [u32; 4], key: [u32; 2]) -> [u32; 4] {
         prod0 as u32,
     ]
 }
-
-// Full Philox4x32-10 (10 rounds)
-fn philox4x32_10(state: &PhiloxState) -> [u32; 4] {
-    let mut ctr = state.counter;
-    let mut key = state.key;
-    
-    for _ in 0..10 {
-        ctr = philox_round(ctr, key);
-        key[0] = key[0].wrapping_add(PHILOX_W0);
-        key[1] = key[1].wrapping_add(PHILOX_W1);
-    }
-    ctr
-}
 ```
 
-### 5.2 Xor Filter32
+### 5.2 Sharded Xor Filter
 
 ```rust
-struct XorFilter32 {
+const NUM_SHARDS: usize = 4096;  // 12-bit shard index
+
+struct ShardedXorFilter {
+    // mmap for zero-copy access (cache mode)
+    mmap: Option<Mmap>,
+    
+    // In-memory mode (construction)
+    shards: Option<Vec<Shard>>,
+    prefix_table: Vec<u32>,
+    
+    // Shard metadata: (byte_offset, block_length, seed)
+    shard_offsets: [(u64, u32, u64); NUM_SHARDS],
+    total_count: usize,
+}
+
+struct Shard {
     fingerprints: Vec<u32>,     // 32-bit fingerprints
-    seeds: [u64; 3],            // Hash seeds for 3 blocks
-    block_length: usize,        // Capacity / 3
-    prefix_table: Vec<u32>,     // Sorted 4-byte prefixes
+    seed: u64,                  // Hash seed for this shard
+    block_length: usize,        // fingerprints.len() / 3
 }
 
 // Membership check: O(1)
 fn contains(&self, hash: &[u8; 20]) -> bool {
-    let fp = compute_fingerprint(hash);
-    let (h0, h1, h2) = hash_triple(hash, &self.seeds, self.block_length);
+    // 12-bit shard index from first 1.5 bytes
+    let shard_idx = ((hash[0] as usize) << 4) | ((hash[1] as usize) >> 4);
+    let (offset, block_len, seed) = self.shard_offsets[shard_idx];
     
-    self.fingerprints[h0] ^ self.fingerprints[h1] ^ self.fingerprints[h2] == fp
+    if block_len == 0 { return false; }
+    
+    let (h0, h1, h2, fp) = hash_to_positions(hash, seed, block_len);
+    fingerprints[h0] ^ fingerprints[h1] ^ fingerprints[h2] == fp
 }
 
-// Properties:
-// - False Positive Rate: ~2^-32 ≈ 0.00000002% per query
-// - Space: ~1.27n × 32 bits = 40.6 bits/element
-// - No false negatives (all inserted elements found)
+// CRITICAL: Hash position computation (must match GPU!)
+fn hash_to_positions(hash: &[u8; 20], seed: u64, block_len: usize) -> (u32, u32, u32, u32) {
+    let hash1 = FxHash(seed, hash);
+    let hash2 = FxHash(seed ^ 0xc3a5c85c97cb3127, hash);
+    
+    let p0 = (hash1 % block_len) as u32;
+    let p1 = ((hash1 >> 32) % block_len + block_len) as u32;  // Upper 32 bits!
+    let p2 = (hash2 % block_len + 2 * block_len) as u32;
+    let fp = (hash2 >> 32) as u32;
+    
+    (p0, p1, p2, fp)
+}
 ```
 
-### 5.3 Address Types
+### 5.3 GPU Sharded Filter Lookup (Metal)
+
+```metal
+inline bool xor_filter_contains_sharded(
+    thread uchar* hash,
+    constant uint* fingerprints,
+    constant uint* shard_info,   // 4096 × 5 u32
+    uint num_shards
+) {
+    // 12-bit shard index
+    uint shard_id = ((uint)hash[0] << 4) | ((uint)hash[1] >> 4);
+    
+    // Read shard metadata (5 u32 per shard)
+    uint base_idx = shard_id * 5;
+    ulong offset = ((ulong)shard_info[base_idx+1] << 32) | shard_info[base_idx];
+    uint block_len = shard_info[base_idx + 2];
+    ulong seed = ((ulong)shard_info[base_idx+4] << 32) | shard_info[base_idx+3];
+    
+    if (block_len == 0) return false;
+    
+    // Hash 1 & 2 (MUST match CPU exactly!)
+    ulong hash1 = fx_hash(seed, hash, 20);
+    ulong hash2 = fx_hash(seed ^ 0xc3a5c85c97cb3127UL, hash, 20);
+    
+    // Positions
+    uint h0 = (uint)(hash1 % block_len);
+    uint h1 = (uint)((hash1 >> 32) % block_len) + block_len;  // Upper 32 bits!
+    uint h2 = (uint)(hash2 % block_len) + 2 * block_len;
+    uint fp = (uint)(hash2 >> 32);
+    
+    // Lookup
+    uint shard_offset = (uint)offset;
+    uint xor_val = fingerprints[shard_offset + h0] ^ 
+                   fingerprints[shard_offset + h1] ^ 
+                   fingerprints[shard_offset + h2];
+    
+    return xor_val == fp;
+}
+```
+
+### 5.4 Address Types
 
 | Type | Format | Prefix | Hash Used |
 |------|--------|--------|-----------|
@@ -552,7 +653,7 @@ Point Addition:
   Extended: 14M + 5S (save 2M at cost of 1S)
   
 Since M ≈ 1.5S, Extended saves ~1.5 multiplications per addition
-For BATCH_SIZE=20: saves 30 multiplications per batch!
+For BATCH_SIZE=16: saves 24 multiplications per batch!
 ```
 
 ### 6.3 Montgomery Batch Inversion
@@ -575,27 +676,24 @@ Algorithm:
 Cost: 1 mod_inv + 3(n-1) mod_mul
 Naive: n mod_inv
 
-For n=20: 1 inversion vs 20 inversions = 20× faster!
+For n=16: 1 inversion vs 16 inversions = 16× faster!
 ```
 
 ### 6.4 Register Pressure Management
 
 ```metal
-#define BATCH_SIZE 20  // Optimal for M1 Pro
+#define BATCH_SIZE 16  // Optimal for M1 (balances register pressure)
 
-// Thread-local arrays (NOT threadgroup!)
-ulong4 batch_X[BATCH_SIZE];     // 20 × 32 bytes = 640 bytes
-ulong4 batch_Y[BATCH_SIZE];     // 20 × 32 bytes = 640 bytes
-ulong4 batch_Z[BATCH_SIZE];     // 20 × 32 bytes = 640 bytes
-ulong4 batch_ZZ[BATCH_SIZE];    // 20 × 32 bytes = 640 bytes
-ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
+// Thread-local arrays
+ulong4 batch_X[BATCH_SIZE];     // 16 × 32 bytes = 512 bytes
+ulong4 batch_Y[BATCH_SIZE];     // 16 × 32 bytes = 512 bytes
+ulong4 batch_Z[BATCH_SIZE];     // 16 × 32 bytes = 512 bytes
+ulong4 batch_ZZ[BATCH_SIZE];    // 16 × 32 bytes = 512 bytes
+ulong4 batch_Zinv[BATCH_SIZE];  // 16 × 32 bytes = 512 bytes
 
-// Total: ~3.2 KB per thread
-// M1 Pro: 32 KB registers per SIMD group (32 threads)
-// 32 threads × 3.2 KB = 102.4 KB > 32 KB → spilling!
-
-// BATCH_SIZE=20 instead of 24 reduces to 85 KB → still spilling but less
-// Smaller threadgroup (64) = more threadgroups = better occupancy
+// Total: ~2.5 KB per thread
+// M1: 32 KB registers per SIMD group (32 threads)
+// Smaller batches = better occupancy
 ```
 
 ---
@@ -616,23 +714,28 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │  │ base_privkey_buf:    32 bytes  (private key)                    │   │
 │  │ base_pubkey_x_buf:   32 bytes  (pre-computed pubkey X)          │   │
 │  │ base_pubkey_y_buf:   32 bytes  (pre-computed pubkey Y)          │   │
-│  │ match_data_buf:      52 × 524K bytes (~27 MB)                   │   │
+│  │ match_data_buf:      52 × 65K bytes (~3.4 MB)                   │   │
 │  │ match_count_buf:     4 bytes   (atomic counter)                 │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
-│  SHARED READ-ONLY BUFFERS:                                              │
+│  SHARED READ-ONLY BUFFERS (Sharded Filter):                            │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │ wnaf_table_buf:      75 × 64 = 4.8 KB (windowed NAF points)     │   │
-│  │ xor_fingerprints:    ~250 MB (Xor filter)                       │   │
-│  │ xor_seeds:           24 bytes (3 × u64)                         │   │
-│  │ xor_block_length:    4 bytes                                    │   │
-│  │ prefix_table:        ~195 MB (sorted prefixes)                  │   │
-│  │ prefix_count:        4 bytes                                    │   │
-│  │ kpt_buf:             4 bytes (keys_per_thread)                  │   │
+│  │                                                                  │   │
+│  │ xor_fingerprints:    ~294 MB (all 4096 shards concatenated)     │   │
+│  │ xor_shard_info:      4096 × 5 × 4 = 80 KB                       │   │
+│  │   Format per shard:  [offset_lo, offset_hi, block_len,          │   │
+│  │                       seed_lo, seed_hi] (5 × u32 = 20 bytes)    │   │
+│  │ xor_num_shards:      4 bytes (4096)                             │   │
+│  │                                                                  │   │
+│  │ prefix_table:        ~195 MB (sorted 4-byte prefixes)           │   │
+│  │ prefix_count:        4 bytes (~48.7M)                           │   │
+│  │                                                                  │   │
+│  │ kpt_buf:             4 bytes (keys_per_thread = 128)            │   │
 │  │ hash_count_buf:      4 bytes (target count)                     │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
-│  TOTAL GPU MEMORY: ~500 MB (mostly Xor filter + prefix table)          │
+│  TOTAL GPU MEMORY: ~500 MB (mostly sharded filter + prefix table)      │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -646,7 +749,7 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │                                                                         │
 │  Offset  Size  Field                                                    │
 │  ──────  ────  ─────────────────────────────────────────────────────   │
-│  0       4     key_index: u32 (offset from base_key)                   │
+│  0       4     key_index: u32 (thread_id for Philox state)             │
 │  4       1     match_type: u8 (0-5, see GLV types)                     │
 │  5       27    padding (reserved for future use)                       │
 │  32      20    hash160: [u8; 20] (the matched hash)                    │
@@ -658,6 +761,48 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │  3 = GLV Compressed (λ × key mod n)                                    │
 │  4 = GLV Uncompressed (λ × key mod n)                                  │
 │  5 = GLV P2SH (λ × key mod n)                                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.3 Sharded Filter Cache Format (.shxor)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SHARDED FILTER CACHE FORMAT                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  HEADER (24 + 4096×20 = 81944 bytes):                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ magic[8]:       "SHXOR_03"                                      │   │
+│  │ total_count[8]: u64 (number of targets)                         │   │
+│  │ prefix_count[8]: u64 (number of unique prefixes)                │   │
+│  │                                                                  │   │
+│  │ shard_table[4096 × 20]:                                         │   │
+│  │   For each shard (20 bytes):                                    │   │
+│  │   - offset[8]: u64 (byte offset from fingerprint start)         │   │
+│  │   - block_length[4]: u32                                        │   │
+│  │   - seed[8]: u64                                                │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  FINGERPRINTS (variable size, ~294 MB):                                │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ [shard_0_fingerprints] [shard_1_fingerprints] ... [shard_4095]  │   │
+│  │ Each shard: block_length × 3 × 4 bytes                          │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  PREFIX TABLE (variable size, ~195 MB):                                │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ [prefix_0] [prefix_1] ... [prefix_N]                            │   │
+│  │ Each prefix: 4 bytes (first 4 bytes of hash, sorted)            │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  CRC32 (4 bytes):                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ checksum: u32 (CRC32 of all preceding data)                     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  TOTAL FILE SIZE: ~490 MB for 49M targets                              │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -707,35 +852,42 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │  │   (CPU)     ├────────────────────────┐                              │
 │  └─────────────┘                        │                              │
 │                                         ▼                              │
-│  ┌─────────────┐    base_key     ┌─────────────┐                       │
+│  ┌─────────────┐   PhiloxState   ┌─────────────┐                       │
 │  │ next_key()  ├────────────────▶│ GPU Kernel  │                       │
 │  │   (CPU)     │    pubkey_xy    │ scan_keys() │                       │
 │  └─────────────┘─────────────────│             │                       │
 │                                  │  • Philox   │                       │
-│  ┌─────────────┐                 │  • EC add   │                       │
-│  │ Xor Filter  │─────────────────│  • Hash160  │                       │
-│  │   (GPU)     │  fingerprints   │  • Filter   │                       │
-│  └─────────────┘                 │  • GLV      │                       │
-│                                  └──────┬──────┘                       │
-│                                         │ matches                      │
+│  ┌─────────────────────┐         │  • EC add   │                       │
+│  │ Sharded Xor Filter  │─────────│  • Hash160  │                       │
+│  │   (GPU buffers)     │         │  • Filter   │                       │
+│  │   • fingerprints    │         │  • GLV      │                       │
+│  │   • shard_info      │         └──────┬──────┘                       │
+│  └─────────────────────┘                │ matches                      │
 │                                         ▼                              │
 │  ┌─────────────┐                 ┌─────────────┐                       │
 │  │ wait_and_   │◀────────────────│ Match Buffer│                       │
-│  │ collect()   │    PotentialMatch (GPU)       │                       │
+│  │ collect()   │   PotentialMatch (GPU)       │                       │
 │  └──────┬──────┘                 └─────────────┘                       │
-│         │                                                               │
+│         │ (base_state, matches)                                        │
 │         ▼                                                               │
-│  ┌─────────────┐                 ┌─────────────┐                       │
-│  │ Verification│                 │ Target DB   │                       │
-│  │   Thread    │────────────────▶│  (FxHash)   │                       │
-│  │   (Rayon)   │    hash lookup  │             │                       │
-│  └──────┬──────┘                 └─────────────┘                       │
-│         │                                                               │
-│         ▼                                                               │
-│  ┌─────────────┐                                                        │
-│  │ Found Keys  │ → WIF encoding → Console output + file                │
-│  │   (Vec)     │                                                        │
-│  └─────────────┘                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ Verification Thread (Rayon Parallel)                            │   │
+│  │                                                                  │   │
+│  │ for match in matches.par_iter() {                               │   │
+│  │   // Reconstruct exact thread state                             │   │
+│  │   let thread_state = base_state.for_thread(match.key_index);    │   │
+│  │   let privkey = philox_to_privkey(&thread_state);               │   │
+│  │                                                                  │   │
+│  │   // Verify hash160                                              │   │
+│  │   let pubkey = privkey_to_pubkey(&privkey);                     │   │
+│  │   let hash = hash160(&pubkey);                                  │   │
+│  │                                                                  │   │
+│  │   // Check target database                                       │   │
+│  │   if targets.contains(&hash) {                                  │   │
+│  │     // TRUE MATCH! Output WIF key                               │   │
+│  │   }                                                              │   │
+│  │ }                                                                │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -753,19 +905,20 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │                                                                         │
 │  Component                           Size                               │
 │  ─────────────────────────────────   ────────────                      │
-│  TargetDatabase (FxHashMap)          ~1.2 GB (49M × ~25 bytes)         │
+│  TargetDatabase (binary load)        ~1.0 GB (49M × 21 bytes)          │
 │    └─ Hash160: 20 bytes                                                 │
 │    └─ AddressType: 1 byte                                               │
-│    └─ HashMap overhead: ~4 bytes                                        │
 │                                                                         │
-│  XorFilter32 (fingerprints)          ~250 MB (49M × 1.27 × 4 bytes)    │
-│  XorFilter32 (prefix_table)          ~195 MB (48.7M × 4 bytes)         │
+│  ShardedXorFilter (mmap)             ~0 MB (memory-mapped, not loaded) │
+│    └─ fingerprints: mmap slice                                         │
+│    └─ shard_offsets: 4096 × 24 = 96 KB (in RAM)                        │
+│    └─ prefix_table: mmap slice                                         │
 │                                                                         │
-│  Match buffers (×6 for pool)         ~3 MB (6 × 524K × 1 byte avg)     │
+│  GPU Buffer Copies                   ~500 MB (unified memory)          │
 │                                                                         │
 │  Rayon thread stacks                 ~64 MB (4 threads × 16 MB)        │
 │                                                                         │
-│  TOTAL ESTIMATED                     ~1.7 GB                            │
+│  TOTAL RESIDENT                      ~1.6 GB (71-72% on 8GB system)    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -779,16 +932,18 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │                                                                         │
 │  Component                           Size                               │
 │  ─────────────────────────────────   ────────────                      │
-│  Xor Filter fingerprints             ~250 MB                           │
+│  Sharded Xor Filter:                                                    │
+│    └─ fingerprints                   ~294 MB                           │
+│    └─ shard_info                     ~80 KB                            │
 │  Prefix table                        ~195 MB                           │
-│  Match buffers (×3)                  ~81 MB (3 × 524K × 52 bytes)      │
+│  Match buffers (×3)                  ~10 MB (3 × 65K × 52 bytes)       │
 │  wNAF table                          ~5 KB                             │
 │  Philox state buffers (×3)           ~180 bytes                        │
 │                                                                         │
 │  TOTAL GPU BUFFERS                   ~500 MB                           │
 │                                                                         │
 │  Note: Apple Silicon uses unified memory, so GPU buffers               │
-│  share physical RAM with CPU. Total system usage ≈ 2.2 GB             │
+│  share physical RAM with CPU.                                          │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -804,65 +959,170 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 20 × 32 bytes = 640 bytes
 │                    THROUGHPUT CALCULATION                               │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  M1 Pro 14-core GPU configuration:                                      │
+│  M1 8-core GPU configuration:                                          │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ Threads: 229,376                                                 │   │
+│  │ Threads: 8,192                                                   │   │
 │  │ Keys/thread: 128                                                 │   │
-│  │ Keys/batch: 29.36 M                                              │   │
+│  │ Keys/batch: 1.0M                                                 │   │
 │  │ GLV factor: 2× (6 hashes per point)                              │   │
-│  │ Effective keys/batch: 58.72 M                                    │   │
+│  │ Effective keys/batch: 2.0M                                       │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
-│  Expected throughput:                                                   │
-│  • Batch time: ~1-3 seconds (depending on thermal state)               │
-│  • Keys/second: ~20-60 Million                                         │
-│  • With GLV: ~40-120 Million effective keys/second                     │
+│  Measured throughput (from logs):                                       │
+│  • Batch time: ~0.25-0.3 seconds                                       │
+│  • Keys/second: ~4-5 Million                                           │
+│  • With GLV: ~8-10 Million effective keys/second                       │
 │                                                                         │
 │  Bottlenecks:                                                           │
 │  1. GPU compute (EC point additions, mod_inv)                          │
-│  2. Memory bandwidth (Xor filter reads)                                │
+│  2. Memory bandwidth (sharded filter reads)                            │
 │  3. Thermal throttling (sustained load)                                │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.2 Optimization Impact
+### 10.2 Sharded Filter Construction Performance
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              SHARDED FILTER CONSTRUCTION (49M targets)                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Step                              Time        Notes                    │
+│  ─────────────────────────────────  ─────────  ──────────────────────  │
+│  Deduplication                     ~0.1s       Removes ~8K duplicates  │
+│  Partition into 4096 shards        ~0.9s       ~12K per shard          │
+│  Build all shards (parallel)       ~1.4s       Rayon 4 threads         │
+│  Build prefix table                ~0.2s       Sort + dedup            │
+│  Save to .shxor cache              ~0.1s       mmap-friendly format    │
+│                                                                         │
+│  TOTAL FIRST BUILD                 ~1.7s       (vs 5+ min old system)  │
+│                                                                         │
+│  Cache reload (mmap)               ~10ms       Zero-copy, CRC32 check  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.3 Optimization Impact
 
 | Optimization | Impact | Notes |
 |--------------|--------|-------|
-| Xor Filter (vs Bloom) | -90% cache misses | O(1) lookup, 3 reads vs 12+ |
+| Sharded Filter (vs single) | -99% build time | 4096 parallel shards, no retries |
+| mmap Cache | ~10ms reload | Zero-copy, CRC32 integrity |
+| Deduplication | 100% success | Removes duplicate keys that break peeling |
 | GLV Endomorphism | 2× throughput | 6 hashes per EC addition |
-| Montgomery Batch | -95% inversions | 1 inv per 20 points |
+| Montgomery Batch | -94% inversions | 1 inv per 16 points |
 | Windowed NAF | -50% init time | 8 adds vs scalar mult |
 | Triple Buffering | -33% GPU idle | GPU never waits for CPU |
 | Prefix Table | -90% CPU verify | Reduces false positives |
 | Extended Jacobian | -10% EC ops | Save 2M per addition |
-| Pre-computed wNAF | -10ms startup | lazy_static table |
 
-### 10.3 False Positive Analysis
+### 10.4 False Positive Analysis
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    FALSE POSITIVE PIPELINE                              │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  Stage 1: Xor Filter32                                                  │
-│  ├─ Input: ~29M hashes per batch                                       │
-│  ├─ FP rate: 0.15%                                                      │
-│  └─ Output: ~43.5K potential matches                                   │
+│  Stage 1: Sharded Xor Filter32                                         │
+│  ├─ Input: ~1M hashes per batch                                        │
+│  ├─ FP rate: ~0.0015% (32-bit fingerprints)                            │
+│  └─ Output: ~15 potential matches per batch                            │
 │                                                                         │
 │  Stage 2: Prefix Table (GPU)                                            │
-│  ├─ Input: ~43.5K Xor Filter positives                                 │
+│  ├─ Input: ~15 Xor Filter positives                                    │
 │  ├─ Reduction: ~93% (only ~7% have matching prefix)                    │
-│  └─ Output: ~3K matches sent to CPU                                    │
+│  └─ Output: ~1 match sent to CPU                                       │
 │                                                                         │
 │  Stage 3: CPU Verification (Rayon)                                      │
-│  ├─ Input: ~3K potential matches                                       │
+│  ├─ Input: ~1 potential match                                          │
+│  ├─ Full Philox key reconstruction                                     │
 │  ├─ Full Hash160 recomputation                                         │
 │  ├─ Target database lookup                                              │
 │  └─ Output: 0-few true matches (depends on targets)                    │
 │                                                                         │
-│  Result: CPU only verifies ~0.01% of scanned keys!                     │
+│  Result: CPU only verifies ~0.0001% of scanned keys!                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 11. Sharded XOR Filter System
+
+### 11.1 Why Sharding?
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SHARDING MOTIVATION                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  PROBLEM with single 49M-entry filter:                                 │
+│  • Construction: O(n²) worst case with retries                         │
+│  • Retries: 10-50 attempts typical for 49M targets                     │
+│  • Time: 5+ minutes for initial build                                  │
+│  • Memory: Peak 2× during construction                                 │
+│                                                                         │
+│  SOLUTION with 4096 shards:                                            │
+│  • Each shard: ~12K entries (trivial to construct)                     │
+│  • Parallel build: 4-8 cores simultaneously                            │
+│  • No retries: Small shards always succeed on first attempt            │
+│  • Time: 1.5 seconds total                                             │
+│                                                                         │
+│  SHARDING SCHEME:                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ shard_id = (hash[0] << 4) | (hash[1] >> 4)   // 12-bit index    │   │
+│  │                                                                  │   │
+│  │ hash[0] = 0xAB, hash[1] = 0xCD                                  │   │
+│  │ shard_id = (0xAB << 4) | (0xCD >> 4) = 0xABC = 2748             │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Distribution: ~12K entries per shard (uniform with good hash)         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 GPU Integration
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                GPU SHARDED FILTER INTEGRATION                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  GPU BUFFERS:                                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ Buffer 3: xor_fingerprints                                      │   │
+│  │   └─ All 4096 shards concatenated                               │   │
+│  │   └─ Total: ~294 MB                                             │   │
+│  │                                                                  │   │
+│  │ Buffer 4: xor_shard_info                                        │   │
+│  │   └─ 4096 entries × 5 u32 each = 80 KB                          │   │
+│  │   └─ Per entry: [offset_lo, offset_hi, block_len,               │   │
+│  │                  seed_lo, seed_hi]                               │   │
+│  │                                                                  │   │
+│  │ Buffer 5: xor_num_shards                                        │   │
+│  │   └─ 4 bytes (value: 4096)                                      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  LOOKUP ALGORITHM:                                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ 1. Compute shard_id from hash[0:2]                              │   │
+│  │ 2. Read shard metadata from shard_info[shard_id]                │   │
+│  │ 3. Compute h0, h1, h2, fp using shard's seed                    │   │
+│  │ 4. Read fingerprints[offset + h0/h1/h2]                         │   │
+│  │ 5. Return (fp0 ^ fp1 ^ fp2) == fp                               │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  CRITICAL: Hash position computation MUST match CPU exactly!           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ hash1 = FxHash(seed, hash)                                      │   │
+│  │ hash2 = FxHash(seed ^ 0xc3a5c85c97cb3127, hash)                 │   │
+│  │                                                                  │   │
+│  │ h0 = hash1 % block_len                      // Lower 64 bits    │   │
+│  │ h1 = (hash1 >> 32) % block_len + block_len  // UPPER 32 bits!   │   │
+│  │ h2 = hash2 % block_len + 2 * block_len                          │   │
+│  │ fp = hash2 >> 32                            // Upper 32 bits    │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -888,9 +1148,12 @@ const W0: u32 = 0x9E3779B9;  // Golden ratio
 const W1: u32 = 0xBB67AE85;  // sqrt(3) - 1
 
 // Configuration
-const BATCH_SIZE: u32 = 20;         // Points per Montgomery batch
+const BATCH_SIZE: u32 = 16;         // Points per Montgomery batch
 const KEYS_PER_THREAD: u32 = 128;   // Keys processed per GPU thread
-const MAX_THREADS: usize = 229_376; // M1 Pro 14-core optimal
+const NUM_SHARDS: usize = 4096;     // Sharded filter shards (12-bit index)
+
+// FxHash constants
+const FX_SEED_OFFSET: u64 = 0xc3a5c85c97cb3127;  // For second hash
 ```
 
 ---
@@ -910,12 +1173,12 @@ FAST_START=1 ./target/release/xyz-pro
 ./target/release/xyz-pro --fast
 
 # Run tests
-cargo test --release
+cargo test --release --lib   # Library tests (faster)
+cargo test --release         # All tests
 
-# Feature flags
-cargo build --release --features "all-features"
-cargo build --release --features "safe-features"  # No experimental SIMD
-cargo build --release --no-default-features       # Legacy mode
+# Clean cache to force filter rebuild
+rm targets.shxor
+./target/release/xyz-pro
 ```
 
 ---
@@ -934,10 +1197,28 @@ cargo build --release --no-default-features       # Legacy mode
 | **Jacobian** | Projective coordinates where x=X/Z², y=Y/Z³ |
 | **Philox** | Counter-based PRNG suitable for parallel generation |
 | **Xor Filter** | Probabilistic set membership with no false negatives |
+| **ShardedXorFilter** | 4096 independent Xor filters for parallel construction |
+| **mmap** | Memory-mapped file I/O for zero-copy access |
+| **CRC32** | Cyclic Redundancy Check for data integrity |
+| **FxHash** | Fast non-cryptographic hash function from Firefox |
 
 ---
 
-*Document Version: 1.0*
-*Last Updated: 2024*
-*Target Platform: Apple Silicon (M1/M2/M3 Pro/Max/Ultra)*
+## Appendix D: Debug Modes
 
+```metal
+// secp256k1_scanner.metal
+#define DEBUG_FILTER_MODE 0  // Production: XorFilter + Prefix
+#define DEBUG_FILTER_MODE 1  // XorFilter only (skip prefix)
+#define DEBUG_FILTER_MODE 2  // Accept every Nth (bypass filters)
+```
+
+**WARNING:** Using DEBUG_FILTER_MODE > 0 in production will cause:
+- Mode 1: Higher FP rate, more CPU verification
+- Mode 2: CPU overload, RAM exhaustion, system freeze
+
+---
+
+*Document Version: 2.0*
+*Last Updated: December 2024*
+*Target Platform: Apple Silicon (M1/M2/M3)*

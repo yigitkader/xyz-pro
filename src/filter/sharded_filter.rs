@@ -442,7 +442,7 @@ impl ShardedXorFilter {
     // PUBLIC API (GPU Compatible)
     // ========================================================================
     
-    /// Get fingerprint data for GPU - returns contiguous slice
+    #[allow(dead_code)]
     pub fn gpu_data(&self) -> (&[u32], Vec<(u64, u32)>, u32) {
         if let Some(ref mmap) = self.mmap {
             // mmap mode: return slice into mmap
@@ -470,8 +470,7 @@ impl ShardedXorFilter {
         }
     }
     
-    /// Legacy compatibility: return combined fingerprints and single seed
-    /// (For existing GPU shader that expects single filter)
+    #[allow(dead_code)]
     pub fn gpu_data_legacy(&self) -> (Vec<u32>, [u64; 3], u32) {
         if let Some(ref shards) = self.shards {
             // Combine all shard fingerprints
@@ -508,6 +507,7 @@ impl ShardedXorFilter {
     
     pub fn prefix_table(&self) -> &[u32] { &self.prefix_table }
     pub fn prefix_count(&self) -> u32 { self.prefix_table.len() as u32 }
+    #[allow(dead_code)]
     pub fn num_shards(&self) -> u32 { NUM_SHARDS as u32 }
     
     /// GPU data for sharded filter
