@@ -18,7 +18,7 @@ pub fn to_wif_compressed(key: &[u8; 32], compressed: bool) -> String {
     data.extend_from_slice(key);
     if compressed { data.push(0x01); }
     
-    let checksum = Sha256::digest(&Sha256::digest(&data));
+    let checksum = Sha256::digest(Sha256::digest(&data));
     data.extend_from_slice(&checksum[..4]);
     bs58::encode(data).into_string()
 }

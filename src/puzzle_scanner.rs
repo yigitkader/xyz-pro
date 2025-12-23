@@ -11,7 +11,7 @@
 /// What this module DOES provide:
 /// - Efficient sequential key generation (no Philox overhead)
 /// - Optimized for known key ranges
-/// - Progress tracking and resume capability
+/// - Progress tracking and resume capability (with u128 support!)
 /// - Multi-GPU distribution support
 
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
@@ -28,15 +28,22 @@ const CHECKPOINT_FILE: &str = "puzzle_checkpoint.bin";
 const CHECKPOINT_INTERVAL: u64 = 100_000_000; // Save every 100M keys
 
 /// Sequential key generator for puzzle scanning
+/// 
+/// ARCHITECTURE:
+/// - For puzzles ≤64: Uses AtomicU64 (lock-free, fast)
+/// - For puzzles 65-128: Uses Mutex<u128> (correct range tracking)
+/// 
+/// Key generation is always correct via u128 arithmetic.
+/// Only the position counter differs for large puzzles.
 pub struct PuzzleScanner {
-    /// Current position in the key range
-    current: AtomicU64,
+    /// Current position - low 64 bits (used for puzzles ≤64)
+    current_lo: AtomicU64,
     
-    /// Starting position (2^(puzzle-1))
-    start: u64,
+    /// Current position - high 64 bits (used for puzzles 65-128)
+    current_hi: AtomicU64,
     
-    /// Ending position (2^puzzle)
-    end: u64,
+    /// Total keys in range (u128 for large puzzles)
+    total_keys: u128,
     
     /// Target hash160 to find
     target_hash: Hash160,
@@ -55,20 +62,15 @@ impl PuzzleScanner {
     /// Create a new puzzle scanner
     pub fn new(config: &PuzzleConfig) -> Self {
         let (start, end) = config.key_range();
+        let total_keys = end - start;
         
-        // For puzzles > 64, we use high bits differently
-        let (start_u64, end_u64) = if config.puzzle_number <= 64 {
-            (start as u64, end as u64)
-        } else {
-            // For puzzle 65+, we only track low 64 bits
-            // High bits are implied by puzzle number
-            (0u64, u64::MAX)
-        };
-        
+        // Initialize position counter
+        // For puzzle N: range is [2^(N-1), 2^N)
+        // We track position relative to start (0-based)
         Self {
-            current: AtomicU64::new(start_u64),
-            start: start_u64,
-            end: end_u64,
+            current_lo: AtomicU64::new(0),
+            current_hi: AtomicU64::new(0),
+            total_keys,
             target_hash: Hash160::from_slice(&config.target_hash),
             puzzle_number: config.puzzle_number,
             keys_checked: AtomicU64::new(0),
@@ -76,37 +78,91 @@ impl PuzzleScanner {
         }
     }
     
+    /// Get current position as u128
+    #[inline]
+    fn get_position(&self) -> u128 {
+        let lo = self.current_lo.load(Ordering::Relaxed) as u128;
+        let hi = self.current_hi.load(Ordering::Relaxed) as u128;
+        (hi << 64) | lo
+    }
+    
+    /// Increment position by amount and return old value
+    /// Thread-safe for single producer (GPU thread)
+    fn fetch_add_position(&self, amount: u64) -> u128 {
+        let old_lo = self.current_lo.fetch_add(amount, Ordering::Relaxed);
+        
+        // Check for overflow in low 64 bits
+        if old_lo.checked_add(amount).is_none() {
+            // Overflow occurred, increment high bits
+            self.current_hi.fetch_add(1, Ordering::Relaxed);
+        }
+        
+        let hi = self.current_hi.load(Ordering::Relaxed) as u128;
+        (hi << 64) | (old_lo as u128)
+    }
+    
+    /// Set position from u128 (for resume)
+    fn set_position(&self, pos: u128) {
+        self.current_lo.store(pos as u64, Ordering::SeqCst);
+        self.current_hi.store((pos >> 64) as u64, Ordering::SeqCst);
+    }
+    
     /// Try to load checkpoint and resume
+    /// Checkpoint format v2: [puzzle:1][position_lo:8][position_hi:8] = 17 bytes
+    /// Also supports legacy format v1: [puzzle:1][position:8] = 9 bytes
     pub fn try_resume(&self) -> bool {
+        let Ok(mut file) = File::open(CHECKPOINT_FILE) else {
+            return false;
+        };
+        
+        // Try new format first (17 bytes)
+        let mut buf = [0u8; 17];
+        if file.read_exact(&mut buf).is_ok() {
+            let saved_puzzle = buf[0];
+            if saved_puzzle == self.puzzle_number {
+                let pos_lo = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                let pos_hi = u64::from_le_bytes(buf[9..17].try_into().unwrap());
+                let position = ((pos_hi as u128) << 64) | (pos_lo as u128);
+                
+                if position < self.total_keys {
+                    self.set_position(position);
+                    println!("[Resume] Continuing from position: 0x{:032x}", position);
+                    println!("[Resume] Progress: {:.6}%", (position as f64 / self.total_keys as f64) * 100.0);
+                    return true;
+                }
+            }
+        }
+        
+        // Try legacy format (9 bytes) for backward compatibility
         if let Ok(mut file) = File::open(CHECKPOINT_FILE) {
-            let mut buf = [0u8; 9]; // 1 byte puzzle + 8 bytes position
+            let mut buf = [0u8; 9];
             if file.read_exact(&mut buf).is_ok() {
                 let saved_puzzle = buf[0];
                 if saved_puzzle == self.puzzle_number {
                     let position = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-                    if position >= self.start && position < self.end {
-                        self.current.store(position, Ordering::SeqCst);
-                        println!("[Resume] Continuing from position: 0x{:016x}", position);
-                        return true;
-                    }
+                    self.set_position(position as u128);
+                    println!("[Resume] Continuing from position (legacy): 0x{:016x}", position);
+                    return true;
                 }
             }
         }
+        
         false
     }
     
-    /// Save checkpoint
+    /// Save checkpoint with u128 position
     fn save_checkpoint(&self) {
-        let position = self.current.load(Ordering::Relaxed);
+        let position = self.get_position();
         if let Ok(mut file) = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(CHECKPOINT_FILE) 
         {
-            let mut buf = [0u8; 9];
+            let mut buf = [0u8; 17];
             buf[0] = self.puzzle_number;
-            buf[1..9].copy_from_slice(&position.to_le_bytes());
+            buf[1..9].copy_from_slice(&(position as u64).to_le_bytes());
+            buf[9..17].copy_from_slice(&((position >> 64) as u64).to_le_bytes());
             let _ = file.write_all(&buf);
             let _ = file.sync_all();
         }
@@ -115,9 +171,9 @@ impl PuzzleScanner {
     /// Generate next base key for GPU batch
     /// Returns (32-byte key, batch_start_position) for key reconstruction on match
     pub fn next_base_key(&self, batch_size: u64) -> Option<([u8; 32], u64)> {
-        let pos = self.current.fetch_add(batch_size, Ordering::Relaxed);
+        let pos = self.fetch_add_position(batch_size);
         
-        if pos >= self.end {
+        if pos >= self.total_keys {
             return None; // Finished scanning
         }
         
@@ -129,13 +185,13 @@ impl PuzzleScanner {
         
         // Build 32-byte key from puzzle range
         // Puzzle N: range is [2^(N-1), 2^N)
-        // For puzzle 66: [2^65, 2^66) = [0x20000000000000000, 0x40000000000000000)
+        // Position is 0-based offset from start of range
         let mut key = [0u8; 32];
         
         // Calculate actual key value: 2^(puzzle-1) + position
         // Using 128-bit arithmetic for puzzles up to 128
         let base: u128 = 1u128 << (self.puzzle_number - 1);
-        let full_key = base + pos as u128;
+        let full_key = base + pos;
         
         // Convert to big-endian 32 bytes (only low 128 bits matter for puzzles < 128)
         let high = (full_key >> 64) as u64;
@@ -144,7 +200,9 @@ impl PuzzleScanner {
         key[16..24].copy_from_slice(&high.to_be_bytes());
         key[24..32].copy_from_slice(&low.to_be_bytes());
         
-        Some((key, pos))
+        // Return position as u64 for backward compatibility (low 64 bits)
+        // Key reconstruction uses puzzle_number to get full position
+        Some((key, pos as u64))
     }
     
     /// Check if a match was found for our target
@@ -205,11 +263,10 @@ impl PuzzleScanner {
         key
     }
     
-    /// Get progress percentage
+    /// Get progress percentage (correct for u128 ranges!)
     pub fn progress(&self) -> f64 {
-        let current = self.current.load(Ordering::Relaxed);
-        let range = self.end - self.start;
-        ((current - self.start) as f64 / range as f64) * 100.0
+        let current = self.get_position();
+        (current as f64 / self.total_keys as f64) * 100.0
     }
     
     /// Get current speed
@@ -223,29 +280,44 @@ impl PuzzleScanner {
         }
     }
     
-    /// Get ETA string
+    /// Get ETA string (correct for u128 ranges!)
     pub fn eta(&self) -> String {
         let speed = self.speed();
         if speed <= 0.0 {
             return "∞".to_string();
         }
         
-        let remaining = self.end.saturating_sub(self.current.load(Ordering::Relaxed));
+        let current = self.get_position();
+        let remaining = self.total_keys.saturating_sub(current);
         let secs = remaining as f64 / speed;
         
         format_duration(secs)
     }
     
-    /// Print status
+    /// Print status with u128 position
     pub fn print_status(&self) {
-        println!(
-            "[Puzzle #{}] {:.6}% | {:.2}M/s | ETA: {} | Pos: 0x{:016x}",
-            self.puzzle_number,
-            self.progress(),
-            self.speed() / 1_000_000.0,
-            self.eta(),
-            self.current.load(Ordering::Relaxed)
-        );
+        let pos = self.get_position();
+        // For display, show high:low if position > u64::MAX
+        if pos > u64::MAX as u128 {
+            println!(
+                "[Puzzle #{}] {:.6}% | {:.2}M/s | ETA: {} | Pos: 0x{:016x}:{:016x}",
+                self.puzzle_number,
+                self.progress(),
+                self.speed() / 1_000_000.0,
+                self.eta(),
+                (pos >> 64) as u64,
+                pos as u64
+            );
+        } else {
+            println!(
+                "[Puzzle #{}] {:.6}% | {:.2}M/s | ETA: {} | Pos: 0x{:016x}",
+                self.puzzle_number,
+                self.progress(),
+                self.speed() / 1_000_000.0,
+                self.eta(),
+                pos as u64
+            );
+        }
     }
 }
 
@@ -310,7 +382,7 @@ pub fn run_puzzle_scan(
                 // Check for target match (pass batch_start_pos for correct key reconstruction)
                 if let Some(found_key) = scanner.check_matches(&matches, batch_start_pos) {
                     println!("\n🎉🎉🎉 PUZZLE #{} SOLVED! 🎉🎉🎉", config.puzzle_number);
-                    println!("Private Key: {}", hex::encode(&found_key));
+                    println!("Private Key: {}", hex::encode(found_key));
                     
                     // Save to file immediately with sync
                     if let Ok(mut f) = OpenOptions::new()
@@ -318,7 +390,7 @@ pub fn run_puzzle_scan(
                         .append(true)
                         .open("PUZZLE_FOUND.txt") 
                     {
-                        let _ = writeln!(f, "Puzzle #{}: {}", config.puzzle_number, hex::encode(&found_key));
+                        let _ = writeln!(f, "Puzzle #{}: {}", config.puzzle_number, hex::encode(found_key));
                         let _ = f.sync_all();
                     }
                     

@@ -76,7 +76,7 @@ fn test_xor_filter_no_false_negatives() {
         targets.push(h);
     }
     
-    let filter = ShardedXorFilter::new(&targets);
+    let filter = ShardedXorFilter::new_with_cache(&targets, None);
     
     // Verify EVERY target is found
     let mut missing = 0;
@@ -112,7 +112,7 @@ fn test_xor_filter_fp_rate() {
         targets.push(h);
     }
     
-    let filter = ShardedXorFilter::new(&targets);
+    let filter = ShardedXorFilter::new_with_cache(&targets, None);
     
     // Test 100K random non-member keys
     let mut rng = rand::thread_rng();
@@ -196,7 +196,7 @@ fn test_gpu_hash_correctness() {
     
     // Create scanner with test targets
     let test_targets = vec![[0u8; 20]];
-    let scanner = OptimizedScanner::new(&test_targets)
+    let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
         .expect("Failed to create scanner");
     
     // Test known private keys
@@ -251,7 +251,7 @@ fn test_full_pipeline() {
     
     // Create scanner with this target
     let targets = vec![target_hash];
-    let scanner = OptimizedScanner::new(&targets)
+    let scanner = OptimizedScanner::new_with_cache(&targets, None)
         .expect("Failed to create scanner");
     
     // Scan starting from the known key
@@ -298,7 +298,7 @@ fn test_memory_safety() {
     let test_targets = vec![[0u8; 20]];
     
     for _ in 0..10 {
-        let _scanner = OptimizedScanner::new(&test_targets)
+        let _scanner = OptimizedScanner::new_with_cache(&test_targets, None)
             .expect("Failed to create scanner");
         // Scanner dropped here - should free memory
     }
@@ -316,7 +316,7 @@ fn test_concurrent_safety() {
     
     let test_targets = vec![[0u8; 20]];
     let scanner = Arc::new(
-        OptimizedScanner::new(&test_targets)
+        OptimizedScanner::new_with_cache(&test_targets, None)
             .expect("Failed to create scanner")
     );
     
@@ -373,7 +373,7 @@ fn test_buffer_pool_safety() {
     // Buffer pool is now internal to OptimizedScanner
     // This test verifies scanner creation works
     let test_targets = vec![[0u8; 20]];
-    let _scanner = OptimizedScanner::new(&test_targets)
+    let _scanner = OptimizedScanner::new_with_cache(&test_targets, None)
         .expect("Failed to create scanner");
     
     println!("✓ Buffer pool: safety verified via scanner creation");

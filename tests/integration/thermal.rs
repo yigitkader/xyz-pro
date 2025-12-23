@@ -237,12 +237,12 @@ fn test_temperature_estimation() {
     let baseline_ms = 50;  // 50ms baseline
     
     // Normal performance (same as baseline)
-    let normal_temp = estimate_temperature_from_performance(50, baseline_ms, false);
+    let normal_temp = estimate_temperature_from_performance(50, baseline_ms);
     println!("  Normal (50ms): {:.1}°C", normal_temp);
     
-    // Fast mode returns different defaults
-    let fast_temp = estimate_temperature_from_performance(50, baseline_ms, true);
-    println!("  Fast mode (50ms): {:.1}°C", fast_temp);
+    // Fast mode - use faster batch
+    let fast_temp = estimate_temperature_from_performance(30, baseline_ms);
+    println!("  Fast (30ms): {:.1}°C", fast_temp);
     
     // Verify we get valid temperature values
     assert!(normal_temp > 50.0 && normal_temp < 100.0, "Normal temp should be reasonable");

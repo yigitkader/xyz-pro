@@ -12,7 +12,7 @@
 9. [Memory Layout](#9-memory-layout)
 10. [Performance Characteristics](#10-performance-characteristics)
 11. [Sharded XOR Filter System](#11-sharded-xor-filter-system)
-12. [Baby-Step Giant-Step (BSGS)](#12-baby-step-giant-step-bsgs-algorithm)
+12. [Why BSGS Cannot Be Used](#12-why-bsgs-cannot-be-used)
 13. [Scan Modes](#13-scan-modes)
 14. [Unused Code & Reserved Modules](#14-unused-code--reserved-modules)
 
@@ -389,7 +389,7 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 │  GPU Optimization:                                                      │
-│  • SHA256: Custom Metal implementation (sha256_33.metal, sha256_65)    │
+│  • SHA256: Custom Metal implementation (inline in secp256k1_scanner)  │
 │  • RIPEMD160: Custom Metal implementation (inline in scanner)          │
 │  • P2SH reuses compressed hash (saves 1 SHA256 computation)            │
 │                                                                         │
@@ -450,9 +450,7 @@ xyz-pro/
 │   ├── weak_key_generator.rs      # Brain wallets & weak patterns
 │   │
 │   │   # METAL SHADERS (DO NOT DELETE)
-│   ├── secp256k1_scanner.metal    # Main GPU kernel (BATCH_SIZE injected)
-│   ├── sha256_33.metal            # SHA256 for 33-byte input
-│   └── sha256_65.metal            # SHA256 for 65-byte input
+│   ├── secp256k1_scanner.metal    # Main GPU kernel (includes inline sha256_33/sha256_65)
 │
 ├── tests/
 │   ├── integration.rs             # Integration test module
@@ -1253,79 +1251,31 @@ PUZZLE=66 ./target/release/xyz-pro  # Reads puzzle_checkpoint.bin
 
 ---
 
-## 12. Baby-Step Giant-Step (BSGS) Algorithm
+## 12. Why BSGS Cannot Be Used
 
-### 12.1 Overview
+### 12.1 What is BSGS?
 
-BSGS is a mathematical algorithm that solves the Discrete Logarithm Problem (DLP) in **O(√n)** time instead of O(n). For Bitcoin puzzles with known ranges, this transforms search time from billions of years to minutes.
+Baby-Step Giant-Step (BSGS) solves the Discrete Logarithm Problem in **O(√n)** time instead of O(n).
+Sounds great, but it has critical limitations for Bitcoin Puzzle hunting:
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    BSGS ALGORITHM - √n OPTIMIZATION                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  PROBLEM: Find k where Q = k*G (G = generator, Q = public key)         │
-│                                                                         │
-│  BRUTE FORCE: O(n)          BSGS: O(√n)                                │
-│  ──────────────────          ──────────────                             │
-│  Puzzle 40: 2^40 keys        Puzzle 40: 2^20 steps                     │
-│  = 1 trillion operations     = 1 million operations                    │
-│  = ~13 years                 = ~4 seconds                              │
-│                                                                         │
-│  ALGORITHM:                                                             │
-│  1. Baby-Step: Precompute table of i*G for i in [0, √n)                │
-│  2. Giant-Step: For j = 0,1,2,...: compute Q - j*m*G                   │
-│  3. If Q - j*m*G matches table entry i: k = j*m + i                    │
-│                                                                         │
-│  TRADE-OFF: Time ←→ Space                                              │
-│  ├─ More RAM = faster search                                           │
-│  └─ √n entries × 40 bytes ≈ memory requirement                        │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### 12.2 Memory Requirements Make It Impossible
 
-### 12.2 Memory Requirements
+| Puzzle | √n (entries) | RAM Required | Feasible? |
+|--------|--------------|--------------|-----------|
+| 40     | 741K         | 41 MB        | ✅ Yes    |
+| 50     | 24M          | ~1.3 GB      | ⚠️ Tight  |
+| 52     | 67M          | ~2.5 GB      | ⚠️ Max    |
+| 66     | 6B           | ~340 GB      | ❌ No     |
+| 80     | 1T           | ~56 TB       | ❌ No     |
 
-| Puzzle | Range Size | √n (entries) | RAM Required | Build Time | Search Time |
-|--------|------------|--------------|--------------|------------|-------------|
-| 20     | 2^19       | 725          | ~30 KB       | 0.01s      | 0.001s      |
-| 30     | 2^29       | 23K          | 0.9 MB       | 0.14s      | 0.003s      |
-| 40     | 2^39       | 741K         | 41 MB        | 3.9s       | 0.007s      |
-| 45     | 2^44       | 4.2M         | ~240 MB      | ~20s       | ~0.02s      |
-| 50     | 2^49       | 24M          | ~1.3 GB      | ~2min      | ~0.1s       |
-| 55     | 2^54       | 134M         | ~7.5 GB      | ❌ Too large | ❌         |
-| 66     | 2^65       | 6B           | ~340 GB      | ❌ Impossible | ❌        |
+### 12.3 Why It's Not In This Codebase
 
-### 12.3 Usage
+1. **Puzzles 1-65 are already SOLVED** - No need for BSGS
+2. **Puzzle 66+ requires 340+ GB RAM** - Consumer hardware can't handle it
+3. **Requires PUBLIC KEY** - We only have Hash160 addresses
 
-```rust
-use xyz_pro::BSGS;
-
-// Create solver for a specific puzzle
-let bsgs = BSGS::new(40)?;  // Puzzle 40
-
-// Solve: find private key for known public key
-if let Some(privkey) = bsgs.solve(&target_pubkey) {
-    println!("Found: {}", hex::encode(privkey));
-}
-```
-
-### 12.4 Limitations
-
-- **Puzzle 50+**: Requires >1 GB RAM, tight for 8 GB M1 Macs
-- **Puzzle 66**: Would require ~340 GB RAM - IMPOSSIBLE on consumer hardware
-- **Requires known public key**: Cannot work with Hash160 only (address)
-
-### 12.5 When to Use BSGS
-
-✅ **Good for:**
-- Bitcoin Puzzles with known public keys
-- Small ranges (< 2^52)
-- Educational purposes
-
-❌ **Not suitable for:**
-- Puzzle 66+ (too large)
-- Random address scanning (no known public key)
-- Addresses without exposed public keys
+BSGS would only help if a new puzzle appears in the 40-52 range.
+For now, GPU brute-force is the only viable approach for puzzles 66+.
 
 ---
 
@@ -1429,9 +1379,7 @@ src/scanner/           # Empty - reserved for future scanner implementations
 ```
 ⚠️ WARNING: Metal shaders are CRITICAL for GPU operations!
 
-src/secp256k1_scanner.metal  - Main kernel (EC ops, hash160, GLV)
-src/sha256_33.metal          - Optimized for compressed pubkey
-src/sha256_65.metal          - Optimized for uncompressed pubkey
+src/secp256k1_scanner.metal  - Main kernel (EC ops, hash160, GLV, inline SHA256)
 src/rng/philox.metal         - RNG (included in main kernel)
 src/filter/xor_lookup.metal  - Filter lookup (included in main kernel)
 src/math/field_ops.metal     - Modular arithmetic (included)

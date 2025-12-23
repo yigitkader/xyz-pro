@@ -15,9 +15,6 @@ mod rng;
 #[cfg(feature = "xor-filter")]
 mod filter;
 
-#[cfg(feature = "simd-math")]
-mod math;
-
 #[cfg(feature = "pid-thermal")]
 mod thermal;
 
@@ -263,7 +260,7 @@ fn main() {
             if let Some(config) = puzzle_mode::PuzzleConfig::for_puzzle(puzzle_num) {
                 if let Some(found_key) = puzzle_scanner::run_puzzle_scan(&gpu, &config, &shutdown) {
                     println!("\n🎉 PUZZLE #{} SOLVED!", puzzle_num);
-                    println!("Private Key: {}", hex::encode(&found_key));
+                    println!("Private Key: {}", hex::encode(found_key));
                     found.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
@@ -390,11 +387,10 @@ fn run_pipelined(
                         
                         gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
                         
-                        if !matches.is_empty() {
-                            if tx.send((base_key, base_state, matches)).is_err() {
+                        if !matches.is_empty()
+                            && tx.send((base_key, base_state, matches)).is_err() {
                                 gpu_shutdown.store(true, Ordering::SeqCst);
                             }
-                        }
                     },
                     &gpu_shutdown,
                 );
@@ -664,7 +660,7 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
             let mut file = OpenOptions::new().create(true).append(true).open("found.txt").ok();
             
             for entry in rx {
-                let hex = hex::encode(&entry.privkey);
+                let hex = hex::encode(entry.privkey);
                 let wif = to_wif_compressed(&entry.privkey, entry.compressed);
                 let key_type = if entry.compressed { "compressed" } else { "uncompressed" };
     let time = Local::now().format("%Y-%m-%d %H:%M:%S");

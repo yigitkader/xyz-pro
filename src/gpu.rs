@@ -108,7 +108,7 @@ impl Deref for PooledBuffer {
     type Target = [PotentialMatch];
     
     fn deref(&self) -> &Self::Target {
-        self.inner.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
+        self.inner.as_deref().unwrap_or(&[])
     }
 }
 
@@ -313,7 +313,7 @@ fn compute_wnaf_step_table(keys_per_thread: u32) -> [[u8; 64]; 75] {
             table[idx][..32].copy_from_slice(&bytes[1..33]);
             table[idx][32..64].copy_from_slice(&bytes[33..65]);
             
-            current = current + window_base;
+            current += window_base;
         }
     }
 
@@ -529,14 +529,7 @@ impl OptimizedScanner {
         Ok(combined)
     }
     
-    /// Create scanner with optional XorFilter cache path
-    /// Cache significantly speeds up startup (5 min → ~10ms for 49M targets)
-    #[allow(dead_code)]
-    pub fn new(target_hashes: &[[u8; 20]]) -> Result<Self> {
-        Self::new_with_cache(target_hashes, None)
-    }
-    
-    /// Create scanner with XorFilter cache support
+    /// Create scanner with cache support (for tests and simple usage)
     pub fn new_with_cache(target_hashes: &[[u8; 20]], xor_cache_path: Option<&str>) -> Result<Self> {
         let xor_filter = ShardedXorFilter::new_with_cache(target_hashes, xor_cache_path);
         Self::new_with_filter_internal(xor_filter, target_hashes.len())
@@ -955,7 +948,7 @@ impl OptimizedScanner {
         
         if match_count > 10_000 {
             eprintln!("[MEM] Batch #{}: {} matches (VERY HIGH! Check filter)", batch, match_count);
-        } else if match_count > 1_000 && batch % 100 == 0 {
+        } else if match_count > 1_000 && batch.is_multiple_of(100) {
             eprintln!("[MEM] Batch #{}: {} matches (high)", batch, match_count);
         }
         

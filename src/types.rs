@@ -80,7 +80,7 @@ fn encode_base58_check(version: u8, hash: &[u8; 20]) -> String {
     data.push(version);
     data.extend_from_slice(hash);
 
-    let checksum = Sha256::digest(&Sha256::digest(&data));
+    let checksum = Sha256::digest(Sha256::digest(&data));
     data.extend_from_slice(&checksum[..4]);
 
     bs58::encode(data).into_string()

@@ -14,7 +14,7 @@ fn test_simd_feature_enabled() {
     println!("\n=== SIMD Feature Flag Test ===");
     
     let test_targets = vec![[0u8; 20]];
-    let scanner = OptimizedScanner::new(&test_targets)
+    let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
         .expect("Failed to create scanner");
     
     let test_key: [u8; 32] = [0x42; 32];
@@ -60,7 +60,7 @@ fn test_simd_bitcoin_vectors() {
         
         // GPU with SIMD (placeholder - uses scalar)
         let targets = vec![cpu_hash];
-        let scanner = OptimizedScanner::new(&targets)
+        let scanner = OptimizedScanner::new_with_cache(&targets, None)
             .expect("Failed to create scanner");
         
         let matches = scanner.scan_batch(&privkey)
@@ -84,7 +84,7 @@ fn test_simd_large_batch() {
     println!("\n=== SIMD Large Batch Test ===");
     
     let test_targets = vec![[0u8; 20]; 10_000];
-    let scanner = OptimizedScanner::new(&test_targets)
+    let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
         .expect("Failed to create scanner");
     
     let test_key: [u8; 32] = [0x42; 32];
@@ -148,7 +148,7 @@ fn test_simd_edge_cases() {
     
     // Test with minimal targets
     let minimal_targets = vec![[0u8; 20]];
-    let scanner_min = OptimizedScanner::new(&minimal_targets)
+    let scanner_min = OptimizedScanner::new_with_cache(&minimal_targets, None)
         .expect("Failed to create scanner");
     
     let test_key: [u8; 32] = [0x42; 32];
@@ -180,7 +180,7 @@ fn test_simd_thread_safety() {
     
     let test_targets = vec![[0u8; 20]; 1000];
     let scanner = Arc::new(
-        OptimizedScanner::new(&test_targets)
+        OptimizedScanner::new_with_cache(&test_targets, None)
             .expect("Failed to create scanner")
     );
     
@@ -219,7 +219,7 @@ fn test_simd_memory_safety() {
     
     // Create and destroy scanner multiple times
     for i in 0..5 {
-        let scanner = OptimizedScanner::new(&test_targets)
+        let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
             .expect("Failed to create scanner");
         
         let test_key: [u8; 32] = [0x42; 32];

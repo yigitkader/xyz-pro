@@ -123,7 +123,7 @@ mod xor_filter_integration_tests {
             })
             .collect();
         
-        let filter = ShardedXorFilter::new(&targets);
+        let filter = ShardedXorFilter::new_with_cache(&targets, None);
         
         // All targets should be found
         let mut found = 0;
@@ -154,7 +154,7 @@ mod xor_filter_integration_tests {
             known_hashes.push(h);
         }
         
-        let filter = ShardedXorFilter::new(&known_hashes);
+        let filter = ShardedXorFilter::new_with_cache(&known_hashes, None);
         
         // First 2 known hashes should be found
         for (i, hash) in known_hashes.iter().take(2).enumerate() {
@@ -177,7 +177,7 @@ mod xor_filter_integration_tests {
             })
             .collect();
         
-        let filter = ShardedXorFilter::new(&targets);
+        let filter = ShardedXorFilter::new_with_cache(&targets, None);
         
         // Test with random non-member hashes
         use rand::Rng;
@@ -213,7 +213,7 @@ mod gpu_scanner_tests {
         println!("\n[TEST] GPU scanner creation...");
         
         let targets = vec![[0u8; 20]];
-        match OptimizedScanner::new(&targets) {
+        match OptimizedScanner::new_with_cache(&targets, None) {
             Ok(_scanner) => {
                 println!("  [✓] GPU scanner created successfully");
             }
@@ -228,7 +228,7 @@ mod gpu_scanner_tests {
         println!("\n[TEST] GPU basic scan...");
         
         let targets = vec![[0u8; 20]];
-        match OptimizedScanner::new(&targets) {
+        match OptimizedScanner::new_with_cache(&targets, None) {
             Ok(scanner) => {
                 let test_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
                     .unwrap().try_into().unwrap();
@@ -287,7 +287,7 @@ fn test_cpu_gpu_xor_integration() {
             .collect();
         targets.push([1u8; 20]);
         targets.push([2u8; 20]);
-        let filter = ShardedXorFilter::new(&targets);
+        let filter = ShardedXorFilter::new_with_cache(&targets, None);
         if filter.contains(&[1u8; 20]) && filter.contains(&[2u8; 20]) {
             checks_passed += 1;
             println!("  [✓] Xor Filter lookup");
@@ -303,7 +303,7 @@ fn test_cpu_gpu_xor_integration() {
     {
         use xyz_pro::gpu::OptimizedScanner;
         let targets = vec![[0u8; 20]];
-        match OptimizedScanner::new(&targets) {
+        match OptimizedScanner::new_with_cache(&targets, None) {
             Ok(_) => {
                 checks_passed += 1;
                 println!("  [✓] GPU scanner available");

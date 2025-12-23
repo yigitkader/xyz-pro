@@ -174,7 +174,7 @@ impl ShardedXorFilter {
         };
         
         // Use sorted data if available, otherwise original
-        let data: &[[u8; 20]] = unique_targets.as_ref().map(|v| v.as_slice()).unwrap_or(targets);
+        let data: &[[u8; 20]] = unique_targets.as_deref().unwrap_or(targets);
         let total = data.len();
         
         println!("[Shard] Building {} shards for {} targets...", NUM_SHARDS, total);
@@ -397,7 +397,7 @@ impl ShardedXorFilter {
         // Shard table: (offset, block_length, seed) for each shard
         for (offset, block_len, seed) in &self.shard_offsets {
             writer.write_all(&offset.to_le_bytes())?;
-            writer.write_all(&(*block_len as u32).to_le_bytes())?;
+            writer.write_all(&(*block_len).to_le_bytes())?;
             writer.write_all(&seed.to_le_bytes())?;
         }
         
@@ -452,11 +452,7 @@ impl ShardedXorFilter {
         
         // Allow for dedup tolerance: cache stores unique count, expected may include duplicates
         // Accept if within 1% tolerance (typical dedup removes <0.1%)
-        let diff = if total_count > expected_count {
-            total_count - expected_count
-        } else {
-            expected_count - total_count
-        };
+        let diff = total_count.abs_diff(expected_count);
         let tolerance = expected_count / 100; // 1% tolerance
         
         if diff > tolerance && total_count != expected_count {
@@ -526,73 +522,8 @@ impl ShardedXorFilter {
     // PUBLIC API (GPU Compatible)
     // ========================================================================
     
-    #[allow(dead_code)]
-    pub fn gpu_data(&self) -> (&[u32], Vec<(u64, u32)>, u32) {
-        if let Some(ref mmap) = self.mmap {
-            // mmap mode: return slice into mmap
-            let fp_start = HEADER_SIZE;
-            let last = self.shard_offsets[NUM_SHARDS - 1];
-            let last_size = if last.1 > 0 { (last.1 as usize * 3) * 4 } else { 0 };
-            let fp_end = fp_start + last.0 as usize + last_size;
-            
-            let fp_bytes = &mmap[fp_start..fp_end];
-            let fp_slice: &[u32] = unsafe {
-                std::slice::from_raw_parts(
-                    fp_bytes.as_ptr() as *const u32,
-                    fp_bytes.len() / 4,
-                )
-            };
-            
-            let shard_info: Vec<(u64, u32)> = self.shard_offsets.iter()
-                .map(|(_, bl, seed)| (*seed, *bl))
-                .collect();
-            
-            (fp_slice, shard_info, NUM_SHARDS as u32)
-        } else {
-            // In-memory mode
-            panic!("gpu_data() on non-mmap filter not yet implemented");
-        }
-    }
-    
-    #[allow(dead_code)]
-    pub fn gpu_data_legacy(&self) -> (Vec<u32>, [u64; 3], u32) {
-        if let Some(ref shards) = self.shards {
-            // Combine all shard fingerprints
-            let combined: Vec<u32> = shards.iter()
-                .flat_map(|s| s.fingerprints.iter().copied())
-                .collect();
-            
-            // Use first shard's seed (GPU will need modification for full sharding)
-            let seed = shards.first().map(|s| s.seed).unwrap_or(0);
-            let block_length = shards.iter().map(|s| s.fingerprints.len()).sum::<usize>() / 3;
-            
-            let seeds = [seed, seed ^ 0xc3a5c85c97cb3127, 0];
-            (combined, seeds, block_length as u32)
-        } else if let Some(ref mmap) = self.mmap {
-            // From mmap
-            let fp_start = HEADER_SIZE;
-            let last = self.shard_offsets[NUM_SHARDS - 1];
-            let last_size = if last.1 > 0 { (last.1 as usize * 3) * 4 } else { 0 };
-            let fp_end = fp_start + last.0 as usize + last_size;
-            
-            let fp_bytes = &mmap[fp_start..fp_end];
-            let combined: Vec<u32> = (0..fp_bytes.len()/4)
-                .map(|i| u32::from_le_bytes(fp_bytes[i*4..(i+1)*4].try_into().unwrap()))
-                .collect();
-            
-            let seed = self.shard_offsets[0].2;
-            let block_length = combined.len() / 3;
-            let seeds = [seed, seed ^ 0xc3a5c85c97cb3127, 0];
-            (combined, seeds, block_length as u32)
-        } else {
-            panic!("No data available");
-        }
-    }
-    
     pub fn prefix_table(&self) -> &[u32] { &self.prefix_table }
     pub fn prefix_count(&self) -> u32 { self.prefix_table.len() as u32 }
-    #[allow(dead_code)]
-    pub fn num_shards(&self) -> u32 { NUM_SHARDS as u32 }
     
     /// GPU data for sharded filter
     /// Returns: (fingerprints, shard_info, num_shards)

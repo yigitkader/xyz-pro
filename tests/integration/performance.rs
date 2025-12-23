@@ -12,7 +12,7 @@ fn bench_gpu_throughput() {
     println!("\n=== GPU Throughput Benchmark ===");
     
     let test_targets = vec![[0u8; 20]; 1000];
-    let scanner = OptimizedScanner::new(&test_targets)
+    let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
         .expect("Failed to create scanner");
     
     let test_key: [u8; 32] = [0x42; 32];
@@ -70,7 +70,7 @@ fn test_memory_usage() {
     
     for size in sizes {
         let test_targets = vec![[0u8; 20]; size];
-        let scanner = OptimizedScanner::new(&test_targets)
+        let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
             .expect("Failed to create scanner");
         
         // Memory usage is logged during scanner creation
@@ -90,7 +90,7 @@ fn bench_batch_latency() {
     println!("\n=== Batch Latency Benchmark ===");
     
     let test_targets = vec![[0u8; 20]; 10_000];
-    let scanner = OptimizedScanner::new(&test_targets)
+    let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
         .expect("Failed to create scanner");
     
     let test_key: [u8; 32] = [0x42; 32];
@@ -149,7 +149,7 @@ fn bench_scaling_with_targets() {
     
     for count in target_counts {
         let test_targets = vec![[0u8; 20]; count];
-        let scanner = OptimizedScanner::new(&test_targets)
+        let scanner = OptimizedScanner::new_with_cache(&test_targets, None)
             .expect("Failed to create scanner");
         
         // Warmup

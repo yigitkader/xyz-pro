@@ -40,7 +40,7 @@ mod xor_filter_tests {
             .collect();
         
         let start = Instant::now();
-        let filter = ShardedXorFilter::new(&targets);
+        let filter = ShardedXorFilter::new_with_cache(&targets, None);
         let elapsed = start.elapsed();
         
         println!("  Built filter for {} targets in {:?}", num_targets, elapsed);
@@ -78,7 +78,7 @@ mod xor_filter_tests {
             })
             .collect();
         
-        let filter = ShardedXorFilter::new(&targets);
+        let filter = ShardedXorFilter::new_with_cache(&targets, None);
         
         // Check ALL targets are found
         for (i, hash) in targets.iter().enumerate() {
@@ -105,7 +105,7 @@ mod xor_filter_tests {
             })
             .collect();
         
-        let filter = ShardedXorFilter::new(&targets);
+        let filter = ShardedXorFilter::new_with_cache(&targets, None);
         
         // Test with non-target hashes (offset by large amount)
         let mut false_positives = 0;
@@ -481,7 +481,7 @@ mod integration_tests {
                 .collect();
             
             let start = Instant::now();
-            let _filter = xyz_pro::filter::ShardedXorFilter::new(&targets);
+            let _filter = xyz_pro::filter::ShardedXorFilter::new_with_cache(&targets, None);
             let elapsed = start.elapsed();
             
             if elapsed < Duration::from_secs(1) {

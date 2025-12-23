@@ -8,7 +8,6 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::address::p2sh_script_hash;
 use crate::error::{Result, ScannerError};
 use crate::types::{hash160_to_address, AddressType, Hash160};
 
@@ -184,35 +183,6 @@ impl TargetDatabase {
         None
     }
 
-    #[allow(dead_code)]
-    pub fn check(&self, pubkey_hash: &Hash160) -> Option<(String, AddressType)> {
-        if let Some(result) = self.check_direct(pubkey_hash) {
-            return Some(result);
-        }
-        let script_hash = Hash160::from_slice(&p2sh_script_hash(pubkey_hash.as_bytes()));
-        self.check_direct(&script_hash)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn check_type(&self, hash: &Hash160) -> Option<AddressType> {
-        self.check_direct(hash).map(|(_, t)| t)
-    }
-
-    /// Zero-copy hash access via mmap
-    /// Returns slice reference instead of copying 980MB
-    #[inline]
-    #[allow(dead_code)]
-    pub fn hash_at(&self, index: usize) -> Option<&[u8; 20]> {
-        if index >= self.count {
-            return None;
-        }
-        let mmap = self.mmap.as_ref()?;
-        let offset = HEADER_SIZE + index * RECORD_SIZE;
-        let slice = &mmap[offset..offset + 20];
-        Some(slice.try_into().ok()?)
-    }
-    
     /// Iterator over all hashes (zero-copy via mmap)
     pub fn iter_hashes(&self) -> impl Iterator<Item = [u8; 20]> + '_ {
         let mmap = self.mmap.as_ref();
@@ -223,15 +193,6 @@ impl TargetDatabase {
             hash.copy_from_slice(&m[offset..offset + 20]);
             Some(hash)
         })
-    }
-    
-    /// Collect all hashes (only when absolutely necessary)
-    /// WARNING: Allocates ~980MB for 49M targets
-    /// Get all hashes as a Vec (for backward compatibility)
-    /// Prefer `iter_hashes()` for zero-copy iteration
-    #[allow(dead_code)]
-    pub fn get_all_hashes(&self) -> Vec<[u8; 20]> {
-        self.iter_hashes().collect()
     }
 
     pub fn memory_stats(&self) -> (usize, usize) {
