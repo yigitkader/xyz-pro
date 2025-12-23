@@ -78,6 +78,10 @@ k256 = { version = "0.13", features = ["ecdsa"] }  # For pubkey tests
 name = "btc_keygen"
 path = "src/bin/btc_keygen.rs"
 
+[[bin]]
+name = "btc_reader"
+path = "src/bin/btc_reader.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

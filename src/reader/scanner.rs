@@ -1,0 +1,324 @@
+//! RAW file scanner - reads generator output and matches against targets
+//!
+//! Optimizations:
+//! - Memory-mapped file reading (zero-copy)
+//! - Parallel chunk processing with rayon
+//! - Direct hash comparison (no string conversion)
+
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use rayon::prelude::*;
+
+use super::{TargetSet, AddressEncoder};
+
+/// RAW file format constants (must match generator)
+const MAGIC: &[u8; 4] = b"BTCR";
+const HEADER_SIZE: usize = 12; // magic(4) + count(8)
+const ENTRY_SIZE: usize = 72; // privkey(32) + hash160(20) + p2sh_hash(20)
+
+/// A match found during scanning
+#[derive(Debug, Clone)]
+pub struct Match {
+    pub private_key: String,
+    pub address: String,
+    pub address_type: String, // "P2PKH", "P2SH", "P2WPKH"
+    pub file: String,
+    pub offset: u64,
+}
+
+/// Result of scanning operation
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    pub files_scanned: usize,
+    pub keys_scanned: u64,
+    pub matches: Vec<Match>,
+    pub elapsed_secs: f64,
+}
+
+impl ScanResult {
+    pub fn keys_per_second(&self) -> f64 {
+        if self.elapsed_secs > 0.0 {
+            self.keys_scanned as f64 / self.elapsed_secs
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Scanner for RAW files
+pub struct RawFileScanner {
+    targets: Arc<TargetSet>,
+    threads: usize,
+}
+
+impl RawFileScanner {
+    /// Create new scanner with loaded targets
+    pub fn new(targets: TargetSet, threads: usize) -> Self {
+        let threads = if threads == 0 {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+        } else {
+            threads
+        };
+        
+        // Configure rayon thread pool
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .ok();
+        
+        println!("🔍 Scanner initialized with {} threads", threads);
+        
+        Self {
+            targets: Arc::new(targets),
+            threads,
+        }
+    }
+    
+    /// Scan all .raw files in directory
+    pub fn scan_directory<P: AsRef<Path>>(&self, dir: P) -> Result<ScanResult, String> {
+        let start = Instant::now();
+        
+        // Find all .raw files
+        let files: Vec<PathBuf> = fs::read_dir(dir.as_ref())
+            .map_err(|e| format!("Failed to read directory: {}", e))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().map(|e| e == "raw").unwrap_or(false))
+            .collect();
+        
+        if files.is_empty() {
+            return Err("No .raw files found in directory".to_string());
+        }
+        
+        println!("📁 Found {} .raw files to scan", files.len());
+        
+        let total_keys = AtomicU64::new(0);
+        let all_matches: Vec<Match> = files
+            .par_iter()
+            .flat_map(|file| {
+                match self.scan_file(file) {
+                    Ok((count, matches)) => {
+                        total_keys.fetch_add(count, Ordering::Relaxed);
+                        matches
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Error scanning {:?}: {}", file, e);
+                        vec![]
+                    }
+                }
+            })
+            .collect();
+        
+        let elapsed = start.elapsed().as_secs_f64();
+        
+        Ok(ScanResult {
+            files_scanned: files.len(),
+            keys_scanned: total_keys.load(Ordering::Relaxed),
+            matches: all_matches,
+            elapsed_secs: elapsed,
+        })
+    }
+    
+    /// Scan a single .raw file
+    pub fn scan_file<P: AsRef<Path>>(&self, path: P) -> Result<(u64, Vec<Match>), String> {
+        let path = path.as_ref();
+        let file = File::open(path)
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+        
+        // Memory-map the file
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .map_err(|e| format!("Failed to mmap: {}", e))?
+        };
+        
+        // Verify header
+        if mmap.len() < HEADER_SIZE {
+            return Err("File too small".to_string());
+        }
+        
+        if &mmap[0..4] != MAGIC {
+            return Err("Invalid magic bytes".to_string());
+        }
+        
+        let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
+        let expected_size = HEADER_SIZE + (count as usize * ENTRY_SIZE);
+        
+        if mmap.len() < expected_size {
+            return Err(format!("File truncated: expected {}, got {}", expected_size, mmap.len()));
+        }
+        
+        let filename = path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        // Parallel scan of entries
+        let data = &mmap[HEADER_SIZE..];
+        let chunk_size = 10_000; // Process 10K keys per chunk
+        let num_chunks = (count as usize + chunk_size - 1) / chunk_size;
+        
+        let matches: Vec<Match> = (0..num_chunks)
+            .into_par_iter()
+            .flat_map(|chunk_idx| {
+                let start_key = chunk_idx * chunk_size;
+                let end_key = ((chunk_idx + 1) * chunk_size).min(count as usize);
+                let mut chunk_matches = Vec::new();
+                
+                for key_idx in start_key..end_key {
+                    let offset = key_idx * ENTRY_SIZE;
+                    if offset + ENTRY_SIZE > data.len() {
+                        break;
+                    }
+                    
+                    let entry = &data[offset..offset + ENTRY_SIZE];
+                    let privkey = &entry[0..32];
+                    let pubkey_hash: [u8; 20] = entry[32..52].try_into().unwrap();
+                    let p2sh_hash: [u8; 20] = entry[52..72].try_into().unwrap();
+                    
+                    // Skip zero keys
+                    if privkey.iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    
+                    // Check against targets
+                    let (p2pkh_match, p2sh_match, p2wpkh_match) = 
+                        self.targets.check_raw(&pubkey_hash, &p2sh_hash);
+                    
+                    if p2pkh_match || p2sh_match || p2wpkh_match {
+                        let privkey_hex = hex::encode(privkey);
+                        
+                        // Create encoder for address generation
+                        thread_local! {
+                            static ENCODER: std::cell::RefCell<AddressEncoder> = 
+                                std::cell::RefCell::new(AddressEncoder::new());
+                        }
+                        
+                        if p2pkh_match {
+                            chunk_matches.push(Match {
+                                private_key: privkey_hex.clone(),
+                                address: ENCODER.with(|enc| {
+                                    enc.borrow().encode_p2pkh(&pubkey_hash)
+                                }),
+                                address_type: "P2PKH".to_string(),
+                                file: filename.clone(),
+                                offset: key_idx as u64,
+                            });
+                        }
+                        
+                        if p2sh_match {
+                            chunk_matches.push(Match {
+                                private_key: privkey_hex.clone(),
+                                address: ENCODER.with(|enc| {
+                                    enc.borrow().encode_p2sh(&p2sh_hash)
+                                }),
+                                address_type: "P2SH".to_string(),
+                                file: filename.clone(),
+                                offset: key_idx as u64,
+                            });
+                        }
+                        
+                        if p2wpkh_match {
+                            chunk_matches.push(Match {
+                                private_key: privkey_hex.clone(),
+                                address: ENCODER.with(|enc| {
+                                    enc.borrow().encode_p2wpkh(&pubkey_hash)
+                                }),
+                                address_type: "P2WPKH".to_string(),
+                                file: filename.clone(),
+                                offset: key_idx as u64,
+                            });
+                        }
+                    }
+                }
+                
+                chunk_matches
+            })
+            .collect();
+        
+        if !matches.is_empty() {
+            println!("🎯 Found {} matches in {}", matches.len(), filename);
+        }
+        
+        Ok((count, matches))
+    }
+    
+    /// Watch directory for new files and scan them
+    pub fn watch_and_scan<P: AsRef<Path>>(&self, dir: P, interval_secs: u64) -> Result<(), String> {
+        use std::collections::HashSet;
+        use std::thread;
+        use std::time::Duration;
+        
+        let dir = dir.as_ref().to_path_buf();
+        let mut scanned_files: HashSet<PathBuf> = HashSet::new();
+        
+        println!("👀 Watching {} for new .raw files...", dir.display());
+        println!("   Press Ctrl+C to stop");
+        
+        loop {
+            // Find new files
+            let current_files: Vec<PathBuf> = fs::read_dir(&dir)
+                .map_err(|e| format!("Failed to read directory: {}", e))?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().map(|e| e == "raw").unwrap_or(false))
+                .filter(|path| !scanned_files.contains(path))
+                .collect();
+            
+            for file in current_files {
+                println!("📄 New file: {:?}", file);
+                
+                match self.scan_file(&file) {
+                    Ok((count, matches)) => {
+                        println!("   Scanned {} keys", count);
+                        if !matches.is_empty() {
+                            println!("   🎯 MATCHES FOUND: {}", matches.len());
+                            for m in &matches {
+                                println!("      {} = {} ({})", m.address, m.private_key, m.address_type);
+                            }
+                        }
+                        scanned_files.insert(file);
+                    }
+                    Err(e) => {
+                        eprintln!("   Error: {}", e);
+                    }
+                }
+            }
+            
+            thread::sleep(Duration::from_secs(interval_secs));
+        }
+    }
+}
+
+/// Save matches to JSON file
+pub fn save_matches<P: AsRef<Path>>(matches: &[Match], path: P) -> std::io::Result<()> {
+    use std::io::Write;
+    
+    let file = File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    
+    writeln!(writer, "{{")?;
+    writeln!(writer, "  \"matches\": [")?;
+    
+    for (i, m) in matches.iter().enumerate() {
+        let comma = if i < matches.len() - 1 { "," } else { "" };
+        writeln!(writer, "    {{")?;
+        writeln!(writer, "      \"private_key\": \"{}\",", m.private_key)?;
+        writeln!(writer, "      \"address\": \"{}\",", m.address)?;
+        writeln!(writer, "      \"type\": \"{}\",", m.address_type)?;
+        writeln!(writer, "      \"file\": \"{}\",", m.file)?;
+        writeln!(writer, "      \"offset\": {}", m.offset)?;
+        writeln!(writer, "    }}{}", comma)?;
+    }
+    
+    writeln!(writer, "  ]")?;
+    writeln!(writer, "}}")?;
+    
+    Ok(())
+}
+

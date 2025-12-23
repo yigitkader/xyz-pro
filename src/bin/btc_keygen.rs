@@ -125,6 +125,8 @@ fn parse_args(args: &[String]) -> GeneratorConfig {
                     config.output_format = match args[i + 1].to_lowercase().as_str() {
                         "binary" | "bin" => OutputFormat::Binary,
                         "both" => OutputFormat::Both,
+                        "compact" | "cbin" => OutputFormat::Compact,
+                        "raw" => OutputFormat::Raw,
                         _ => OutputFormat::Json,
                     };
                     i += 1;
@@ -150,6 +152,14 @@ fn parse_args(args: &[String]) -> GeneratorConfig {
                 if i + 1 < args.len() {
                     if let Ok(n) = args[i + 1].parse() {
                         config.threads = n;
+                    }
+                    i += 1;
+                }
+            }
+            "--start-offset" => {
+                if i + 1 < args.len() {
+                    if let Ok(n) = args[i + 1].parse() {
+                        config.start_offset = n;
                     }
                     i += 1;
                 }
@@ -197,12 +207,14 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -g, --gpu                Use GPU acceleration (Metal)");
     println!("    -o, --output DIR         Output directory (default: ./output)");
-    println!("    -f, --format FORMAT      Output format: json, binary, both (default: json)");
+    println!("    -f, --format FORMAT      Output format: json, binary, compact, raw, both (default: json)");
+    println!("                             raw = NASA-grade: direct GPU buffer dump, max throughput");
     println!("    -b, --batch SIZE         Batch size for parallel processing (default: 100000)");
     println!("    -k, --keys-per-file N    Keys per file (default: 1000000000)");
     println!("    -n, --target N           Stop after generating N keys (default: infinite)");
     println!("    -t, --threads N          Number of threads (default: auto)");
     println!("    -s, --seed N             Random seed for reproducibility (CPU only)");
+    println!("    --start-offset N         Starting private key offset (GPU only)");
     println!("    -h, --help               Print this help message");
     println!();
     println!("EXAMPLES:");

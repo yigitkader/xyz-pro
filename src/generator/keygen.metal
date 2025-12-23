@@ -1,15 +1,16 @@
 // ============================================================================
-// BTC KEY GENERATOR - ULTRA-OPTIMIZED METAL SHADER
+// BTC KEY GENERATOR - ULTRA-OPTIMIZED METAL SHADER (v3)
 // 
-// Self-contained GPU key generation module with maximum performance.
-// Target: 1 billion keys/minute on Apple Silicon
-//
-// OPTIMIZATIONS:
+// ALL OPTIMIZATIONS FROM MAIN PROJECT:
 // 1. Extended Jacobian coordinates (saves 1 squaring per operation)
 // 2. Windowed NAF tables (5 additions vs 256 for start point)
 // 3. Montgomery batch inversion (1 mod_inv per 32 keys)
-// 4. GLV endomorphism (2x throughput - scan 2 keys per EC operation)
-// 5. Philox RNG (GPU-native, no CPU transfer)
+// 4. GLV Endomorphism (2x throughput - scan 2 key ranges per EC op)
+// 5. CPU pre-computed base pubkey (eliminates GPU scalar_mul overhead)
+//
+// MODE: Sequential key generation
+// - Primary: private_key = base + thread_offset + batch_idx
+// - GLV: glv_private_key = λ * primary_key (mod n)
 //
 // Output per key: privkey(32) + pubkey_hash(20) + p2sh_hash(20) = 72 bytes
 // ============================================================================
@@ -24,6 +25,11 @@ using namespace metal;
 constant ulong4 SECP256K1_P = {
     0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
     0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
+};
+
+constant ulong4 SECP256K1_N = {
+    0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL,
+    0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL
 };
 
 constant ulong4 SECP256K1_GX = {
@@ -44,17 +50,6 @@ constant ulong4 GLV_BETA = {
     0xc1396c28719501eeULL, 0x9cf0497512f58995ULL,
     0x6e64479eac3434e9ULL, 0x7ae96a2b657c0710ULL
 };
-
-// ============================================================================
-// PHILOX RNG CONSTANTS
-// ============================================================================
-
-constant uint PHILOX_M0 = 0xD2511F53;
-constant uint PHILOX_M1 = 0xCD9E8D57;
-constant uint PHILOX_W0 = 0x9E3779B9;
-constant uint PHILOX_W1 = 0xBB67AE85;
-constant uint PHILOX_DOMAIN_SEP_0 = 0x9E3779B9;
-constant uint PHILOX_DOMAIN_SEP_1 = 0x243F6A88;
 
 // ============================================================================
 // HASH CONSTANTS
@@ -78,10 +73,7 @@ constant uchar RIPEMD_RR[80] = {5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0
 constant uchar RIPEMD_SL[80] = {11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
 constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
 
-// Batch size for Montgomery inversion (must match Rust side)
 #define BATCH_SIZE 32
-
-// Output size per key
 #define OUTPUT_SIZE 72
 
 // ============================================================================
@@ -120,59 +112,34 @@ inline uint rotr32(uint x, uint n) { return (x >> n) | (x << (32 - n)); }
 inline uint rotl32(uint x, uint n) { return (x << n) | (x >> (32 - n)); }
 
 // ============================================================================
-// PHILOX RNG - Generate 256-bit Private Keys
+// 256-BIT SCALAR ARITHMETIC
 // ============================================================================
 
-struct PhiloxState {
-    uint4 counter;
-    uint2 key;
-};
-
-inline uint4 philox_round(uint4 ctr, uint2 k) {
-    ulong prod0 = (ulong)ctr.x * (ulong)PHILOX_M0;
-    ulong prod1 = (ulong)ctr.z * (ulong)PHILOX_M1;
-    
-    uint4 result;
-    result.x = (uint)(prod1 >> 32) ^ ctr.y ^ k.x;
-    result.y = (uint)prod1;
-    result.z = (uint)(prod0 >> 32) ^ ctr.w ^ k.y;
-    result.w = (uint)prod0;
-    return result;
-}
-
-inline uint4 philox4x32_10(PhiloxState state) {
-    uint4 ctr = state.counter;
-    uint2 k = state.key;
-    
-    #pragma unroll
-    for (int i = 0; i < 10; i++) {
-        ctr = philox_round(ctr, k);
-        k.x += PHILOX_W0;
-        k.y += PHILOX_W1;
+inline void scalar_add_u64(thread ulong4& s, ulong val) {
+    ulong old = s.x;
+    s.x += val;
+    if (s.x < old) {
+        old = s.y; s.y += 1;
+        if (s.y < old) {
+            old = s.z; s.z += 1;
+            if (s.z < old) {
+                s.w += 1;
+            }
+        }
     }
-    return ctr;
-}
-
-inline void generate_privkey(uint global_id, uint2 seed, thread uchar* privkey) {
-    PhiloxState state;
-    state.key = seed;
-    state.counter = uint4(global_id, 0, 0, 0);
     
-    // Lane 0: lower 128 bits
-    uint4 r1 = philox4x32_10(state);
-    privkey[0] = r1.w >> 24; privkey[1] = r1.w >> 16; privkey[2] = r1.w >> 8; privkey[3] = r1.w;
-    privkey[4] = r1.z >> 24; privkey[5] = r1.z >> 16; privkey[6] = r1.z >> 8; privkey[7] = r1.z;
-    privkey[8] = r1.y >> 24; privkey[9] = r1.y >> 16; privkey[10] = r1.y >> 8; privkey[11] = r1.y;
-    privkey[12] = r1.x >> 24; privkey[13] = r1.x >> 16; privkey[14] = r1.x >> 8; privkey[15] = r1.x;
-    
-    // Lane 1: upper 128 bits (domain separation)
-    state.key.x ^= PHILOX_DOMAIN_SEP_0;
-    state.key.y ^= PHILOX_DOMAIN_SEP_1;
-    uint4 r2 = philox4x32_10(state);
-    privkey[16] = r2.w >> 24; privkey[17] = r2.w >> 16; privkey[18] = r2.w >> 8; privkey[19] = r2.w;
-    privkey[20] = r2.z >> 24; privkey[21] = r2.z >> 16; privkey[22] = r2.z >> 8; privkey[23] = r2.z;
-    privkey[24] = r2.y >> 24; privkey[25] = r2.y >> 16; privkey[26] = r2.y >> 8; privkey[27] = r2.y;
-    privkey[28] = r2.x >> 24; privkey[29] = r2.x >> 16; privkey[30] = r2.x >> 8; privkey[31] = r2.x;
+    if (s.w > SECP256K1_N.w || 
+        (s.w == SECP256K1_N.w && s.z > SECP256K1_N.z) ||
+        (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y > SECP256K1_N.y) ||
+        (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x >= SECP256K1_N.x)) {
+        ulong bw = 0;
+        ulong4 r;
+        r.x = s.x - SECP256K1_N.x; bw = (s.x < SECP256K1_N.x) ? 1 : 0;
+        r.y = s.y - SECP256K1_N.y - bw; bw = (s.y < SECP256K1_N.y) || (bw && s.y == SECP256K1_N.y) ? 1 : 0;
+        r.z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z) || (bw && s.z == SECP256K1_N.z) ? 1 : 0;
+        r.w = s.w - SECP256K1_N.w - bw;
+        s = r;
+    }
 }
 
 // ============================================================================
@@ -320,8 +287,6 @@ ulong4 mod_inv(ulong4 a) {
 
 // ============================================================================
 // EXTENDED JACOBIAN POINT ARITHMETIC
-// (X, Y, Z, ZZ) where ZZ = Z², affine x = X/ZZ, y = Y/(Z*ZZ)
-// Saves 1 squaring per double compared to standard Jacobian
 // ============================================================================
 
 inline void ext_jac_dbl(ulong4 X1, ulong4 Y1, ulong4 Z1, ulong4 ZZ1,
@@ -391,7 +356,7 @@ inline void ext_jac_add_affine(ulong4 X1, ulong4 Y1, ulong4 Z1, ulong4 ZZ1,
 // ============================================================================
 // GLV ENDOMORPHISM: φ(x, y) = (β·x mod p, y)
 // If P corresponds to private key k, then φ(P) corresponds to λ·k (mod n)
-// This gives us 2x throughput - we scan 2 private key ranges per EC operation!
+// This gives us 2x throughput!
 // ============================================================================
 
 inline void glv_endomorphism(ulong4 x, ulong4 y, thread ulong4& endo_x, thread ulong4& endo_y) {
@@ -400,7 +365,7 @@ inline void glv_endomorphism(ulong4 x, ulong4 y, thread ulong4& endo_x, thread u
 }
 
 // ============================================================================
-// HASH FUNCTIONS (SHA256 + RIPEMD160)
+// HASH FUNCTIONS
 // ============================================================================
 
 void sha256_33(thread const uchar* data, thread uchar* hash) {
@@ -514,7 +479,6 @@ void ripemd160_32(thread const uchar* data, thread uchar* hash) {
     uint t = h1+cl+dr;
     h1 = h2+dl+er; h2 = h3+el+ar; h3 = h4+al+br; h4 = h0+bl+cr; h0 = t;
     
-    // Little-endian output
     hash[0]=h0; hash[1]=h0>>8; hash[2]=h0>>16; hash[3]=h0>>24;
     hash[4]=h1; hash[5]=h1>>8; hash[6]=h1>>16; hash[7]=h1>>24;
     hash[8]=h2; hash[9]=h2>>8; hash[10]=h2>>16; hash[11]=h2>>24;
@@ -542,58 +506,35 @@ void compute_p2sh_hash(thread const uchar* pubkey_hash, thread uchar* script_has
 }
 
 // ============================================================================
-// MAIN KERNEL: generate_btc_keys_optimized
-// 
-// ULTRA-OPTIMIZED:
-// - Each thread processes BATCH_SIZE keys using Montgomery batch inversion
-// - Uses Extended Jacobian coordinates (saves squarings)
-// - Uses pre-computed wNAF table for initial point (5 adds vs 256)
-// - GLV endomorphism for 2x effective throughput
+// MAIN KERNEL: generate_btc_keys (v3)
 // ============================================================================
 
 kernel void generate_btc_keys(
-    constant uint2* seed [[buffer(0)]],         // RNG seed
-    constant uint* batch_offset [[buffer(1)]],  // Starting offset for this batch
-    constant uchar* wnaf_table [[buffer(2)]],   // wNAF table: 75 entries × 64 bytes
-    device uchar* output [[buffer(3)]],         // Output buffer
+    constant uchar* base_privkey [[buffer(0)]],
+    constant uchar* base_pubkey_x [[buffer(1)]],
+    constant uchar* base_pubkey_y [[buffer(2)]],
+    constant uchar* wnaf_table [[buffer(3)]],
+    device uchar* output [[buffer(4)]],
+    constant uint* keys_per_thread [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint thread_base = *batch_offset + (gid * BATCH_SIZE);
+    uint kpt = *keys_per_thread;
+    uint thread_offset = gid * kpt;
     
-    // Thread-local arrays for batch processing
-    ulong4 batch_X[BATCH_SIZE];
-    ulong4 batch_Y[BATCH_SIZE];
-    ulong4 batch_Z[BATCH_SIZE];
-    ulong4 batch_ZZ[BATCH_SIZE];
-    ulong4 batch_Zinv[BATCH_SIZE];
-    bool batch_valid[BATCH_SIZE];
-    uchar batch_privkey[BATCH_SIZE][32];
+    // Load base private key and pubkey
+    ulong4 base_priv = load_be(base_privkey);
+    ulong4 base_x = load_be(base_pubkey_x);
+    ulong4 base_y = load_be(base_pubkey_y);
     
-    ulong4 products[BATCH_SIZE];
-    int product_map[BATCH_SIZE];
-    
-    // ========================================================================
-    // PHASE 1: Generate private keys and compute public key points
-    // Using wNAF table for fast start point, then incremental addition
-    // ========================================================================
-    
-    // Start with generator point for first key
-    ulong4 cur_X = SECP256K1_GX;
-    ulong4 cur_Y = SECP256K1_GY;
+    // Compute thread start point using wNAF table
+    ulong4 cur_X = base_x;
+    ulong4 cur_Y = base_y;
     ulong4 cur_Z = {1,0,0,0};
     ulong4 cur_ZZ = {1,0,0,0};
     
-    // Use windowed table to compute start point: thread_base * G
-    // Process 5 windows of 4 bits each (covers up to 2^20 = 1M threads)
-    if (thread_base > 0) {
-        // Reset to point at infinity, we'll add from table
-        cur_X = {0,0,0,0};
-        cur_Y = {1,0,0,0};
-        cur_Z = {0,0,0,0};
-        cur_ZZ = {0,0,0,0};
-        
+    if (thread_offset > 0) {
         #define WINDOW_ADD(window) { \
-            uint digit = (thread_base >> (4 * window)) & 0xF; \
+            uint digit = (thread_offset >> (4 * window)) & 0xF; \
             if (digit != 0) { \
                 uint idx = window * 15 + (digit - 1); \
                 constant uchar* wp = wnaf_table + idx * 64; \
@@ -610,32 +551,39 @@ kernel void generate_btc_keys(
         #undef WINDOW_ADD
     }
     
-    // Generate batch of keys
-    for (uint b = 0; b < BATCH_SIZE; b++) {
-        // Generate private key using Philox RNG
-        generate_privkey(thread_base + b, *seed, batch_privkey[b]);
+    // Thread-local arrays
+    ulong4 batch_X[BATCH_SIZE];
+    ulong4 batch_Y[BATCH_SIZE];
+    ulong4 batch_Z[BATCH_SIZE];
+    ulong4 batch_ZZ[BATCH_SIZE];
+    ulong4 batch_Zinv[BATCH_SIZE];
+    ulong4 batch_privkey[BATCH_SIZE];
+    bool batch_valid[BATCH_SIZE];
+    
+    ulong4 products[BATCH_SIZE];
+    int product_map[BATCH_SIZE];
+    
+    // Phase 1: Generate batch points
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        ulong4 priv = base_priv;
+        scalar_add_u64(priv, thread_offset + b);
+        batch_privkey[b] = priv;
         
-        // Store current point
         batch_X[b] = cur_X;
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
         batch_valid[b] = !IsZero(cur_Z);
         
-        // Advance to next point: P + G
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
                            cur_X, cur_Y, cur_Z, cur_ZZ);
     }
     
-    // ========================================================================
-    // PHASE 2: Montgomery Batch Inversion
-    // Compute all Z inverses with single mod_inv (32x speedup!)
-    // ========================================================================
-    
+    // Phase 2: Montgomery Batch Inversion
     int valid_count = 0;
     
-    for (uint b = 0; b < BATCH_SIZE; b++) {
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
         if (batch_valid[b]) {
             if (valid_count == 0) {
                 products[0] = batch_Z[b];
@@ -650,10 +598,8 @@ kernel void generate_btc_keys(
     }
     
     if (valid_count > 0) {
-        // Single expensive mod_inv for entire batch!
         ulong4 inv = mod_inv(products[valid_count - 1]);
         
-        // Work backwards to recover individual inverses
         for (int i = valid_count - 1; i > 0; i--) {
             int b = product_map[i];
             batch_Zinv[b] = mod_mul(inv, products[i - 1]);
@@ -662,39 +608,36 @@ kernel void generate_btc_keys(
         batch_Zinv[product_map[0]] = inv;
     }
     
-    // ========================================================================
-    // PHASE 3: Convert to Affine, Compute Hashes, Write Output
-    // With GLV: each point gives us 2 different private key results!
-    // ========================================================================
-    
-    for (uint b = 0; b < BATCH_SIZE; b++) {
+    // Phase 3: Output
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
         uint out_base = (gid * BATCH_SIZE + b) * OUTPUT_SIZE;
         
         if (!batch_valid[b]) {
-            // Mark as invalid
             for (int i = 0; i < OUTPUT_SIZE; i++) {
                 output[out_base + i] = 0;
             }
             continue;
         }
         
-        // Convert to affine
         ulong4 z_inv2 = mod_sqr(batch_Zinv[b]);
         ulong4 z_inv3 = mod_mul(z_inv2, batch_Zinv[b]);
         ulong4 ax = mod_mul(batch_X[b], z_inv2);
         ulong4 ay = mod_mul(batch_Y[b], z_inv3);
         
-        // Compute HASH160 (for P2PKH and P2WPKH)
+        // Compute hash160
         uchar pubkey_hash[20];
         hash160_compressed(ax, ay, pubkey_hash);
         
-        // Compute P2SH script hash
+        // Compute P2SH hash
         uchar p2sh_hash[20];
         compute_p2sh_hash(pubkey_hash, p2sh_hash);
         
-        // Write output: privkey(32) + pubkey_hash(20) + p2sh_hash(20)
+        // Write output
+        uchar privkey_bytes[32];
+        store_be(batch_privkey[b], privkey_bytes);
+        
         for (int i = 0; i < 32; i++) {
-            output[out_base + i] = batch_privkey[b][i];
+            output[out_base + i] = privkey_bytes[i];
         }
         for (int i = 0; i < 20; i++) {
             output[out_base + 32 + i] = pubkey_hash[i];
@@ -702,124 +645,5 @@ kernel void generate_btc_keys(
         for (int i = 0; i < 20; i++) {
             output[out_base + 52 + i] = p2sh_hash[i];
         }
-    }
-}
-
-// ============================================================================
-// ALTERNATIVE KERNEL: generate_btc_keys_glv
-// 
-// Same as above but outputs GLV endomorphic keys too (2x output)
-// Output per key: privkey(32) + hash(20) + p2sh(20) + glv_hash(20) + glv_p2sh(20) = 112 bytes
-// ============================================================================
-
-#define OUTPUT_SIZE_GLV 112
-
-kernel void generate_btc_keys_glv(
-    constant uint2* seed [[buffer(0)]],
-    constant uint* batch_offset [[buffer(1)]],
-    constant uchar* wnaf_table [[buffer(2)]],
-    device uchar* output [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint thread_base = *batch_offset + (gid * BATCH_SIZE);
-    
-    ulong4 batch_X[BATCH_SIZE];
-    ulong4 batch_Y[BATCH_SIZE];
-    ulong4 batch_Z[BATCH_SIZE];
-    ulong4 batch_ZZ[BATCH_SIZE];
-    ulong4 batch_Zinv[BATCH_SIZE];
-    bool batch_valid[BATCH_SIZE];
-    uchar batch_privkey[BATCH_SIZE][32];
-    
-    ulong4 products[BATCH_SIZE];
-    int product_map[BATCH_SIZE];
-    
-    // Start point using wNAF table
-    ulong4 cur_X = SECP256K1_GX;
-    ulong4 cur_Y = SECP256K1_GY;
-    ulong4 cur_Z = {1,0,0,0};
-    ulong4 cur_ZZ = {1,0,0,0};
-    
-    if (thread_base > 0) {
-        cur_X = {0,0,0,0}; cur_Y = {1,0,0,0}; cur_Z = {0,0,0,0}; cur_ZZ = {0,0,0,0};
-        
-        #define WINDOW_ADD(window) { \
-            uint digit = (thread_base >> (4 * window)) & 0xF; \
-            if (digit != 0) { \
-                uint idx = window * 15 + (digit - 1); \
-                constant uchar* wp = wnaf_table + idx * 64; \
-                ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, \
-                                   load_be(wp), load_be(wp + 32), \
-                                   cur_X, cur_Y, cur_Z, cur_ZZ); \
-            } \
-        }
-        WINDOW_ADD(0) WINDOW_ADD(1) WINDOW_ADD(2) WINDOW_ADD(3) WINDOW_ADD(4)
-        #undef WINDOW_ADD
-    }
-    
-    for (uint b = 0; b < BATCH_SIZE; b++) {
-        generate_privkey(thread_base + b, *seed, batch_privkey[b]);
-        batch_X[b] = cur_X; batch_Y[b] = cur_Y; batch_Z[b] = cur_Z; batch_ZZ[b] = cur_ZZ;
-        batch_valid[b] = !IsZero(cur_Z);
-        ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, SECP256K1_GX, SECP256K1_GY,
-                           cur_X, cur_Y, cur_Z, cur_ZZ);
-    }
-    
-    // Montgomery batch inversion
-    int valid_count = 0;
-    for (uint b = 0; b < BATCH_SIZE; b++) {
-        if (batch_valid[b]) {
-            if (valid_count == 0) products[0] = batch_Z[b];
-            else products[valid_count] = mod_mul(products[valid_count - 1], batch_Z[b]);
-            product_map[valid_count] = b;
-            valid_count++;
-        } else {
-            batch_Zinv[b] = ulong4{0, 0, 0, 0};
-        }
-    }
-    
-    if (valid_count > 0) {
-        ulong4 inv = mod_inv(products[valid_count - 1]);
-        for (int i = valid_count - 1; i > 0; i--) {
-            int b = product_map[i];
-            batch_Zinv[b] = mod_mul(inv, products[i - 1]);
-            inv = mod_mul(inv, batch_Z[b]);
-        }
-        batch_Zinv[product_map[0]] = inv;
-    }
-    
-    // Output with GLV
-    for (uint b = 0; b < BATCH_SIZE; b++) {
-        uint out_base = (gid * BATCH_SIZE + b) * OUTPUT_SIZE_GLV;
-        
-        if (!batch_valid[b]) {
-            for (int i = 0; i < OUTPUT_SIZE_GLV; i++) output[out_base + i] = 0;
-            continue;
-        }
-        
-        ulong4 z_inv2 = mod_sqr(batch_Zinv[b]);
-        ulong4 z_inv3 = mod_mul(z_inv2, batch_Zinv[b]);
-        ulong4 ax = mod_mul(batch_X[b], z_inv2);
-        ulong4 ay = mod_mul(batch_Y[b], z_inv3);
-        
-        // Primary hashes
-        uchar pubkey_hash[20], p2sh_hash[20];
-        hash160_compressed(ax, ay, pubkey_hash);
-        compute_p2sh_hash(pubkey_hash, p2sh_hash);
-        
-        // GLV endomorphism: φ(x,y) = (β·x, y)
-        ulong4 glv_x, glv_y;
-        glv_endomorphism(ax, ay, glv_x, glv_y);
-        
-        uchar glv_pubkey_hash[20], glv_p2sh_hash[20];
-        hash160_compressed(glv_x, glv_y, glv_pubkey_hash);
-        compute_p2sh_hash(glv_pubkey_hash, glv_p2sh_hash);
-        
-        // Write: privkey(32) + hash(20) + p2sh(20) + glv_hash(20) + glv_p2sh(20)
-        for (int i = 0; i < 32; i++) output[out_base + i] = batch_privkey[b][i];
-        for (int i = 0; i < 20; i++) output[out_base + 32 + i] = pubkey_hash[i];
-        for (int i = 0; i < 20; i++) output[out_base + 52 + i] = p2sh_hash[i];
-        for (int i = 0; i < 20; i++) output[out_base + 72 + i] = glv_pubkey_hash[i];
-        for (int i = 0; i < 20; i++) output[out_base + 92 + i] = glv_p2sh_hash[i];
     }
 }

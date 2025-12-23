@@ -16,7 +16,7 @@ mod gpu;
 
 pub use keygen::KeyGenerator;
 pub use encoder::AddressEncoder;
-pub use writer::{OutputWriter, OutputFormat};
+pub use writer::{OutputWriter, OutputFormat, AsyncRawWriter};
 pub use batch::BatchProcessor;
 pub use gpu::GpuKeyGenerator;
 
@@ -60,6 +60,8 @@ pub struct GeneratorConfig {
     pub output_dir: String,
     /// Keys per file (1 billion default)
     pub keys_per_file: u64,
+    /// Starting offset for private keys (optional)
+    pub start_offset: u64,
 }
 
 impl Default for GeneratorConfig {
@@ -70,6 +72,7 @@ impl Default for GeneratorConfig {
             output_format: OutputFormat::Json,
             output_dir: "./output".to_string(),
             keys_per_file: 1_000_000_000,
+            start_offset: 1, // Start from 1 (0 is invalid private key)
         }
     }
 }
