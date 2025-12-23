@@ -5,6 +5,9 @@ mod gpu;
 mod startup_tests;
 mod targets;
 mod types;
+mod weak_key_generator;
+mod puzzle_mode;
+mod puzzle_scanner;
 
 #[cfg(feature = "philox-rng")]
 mod rng;
@@ -120,6 +123,52 @@ fn get_performance_core_count() -> usize {
     6
 }
 
+/// Scan mode selection
+#[derive(Clone, Copy, PartialEq)]
+enum ScanMode {
+    /// Random key generation using Philox RNG (default)
+    Random,
+    /// Sequential scanning for Bitcoin Puzzle (e.g., PUZZLE=66)
+    Puzzle(u8),
+    /// Brain wallet / weak key patterns
+    WeakKeys,
+}
+
+impl ScanMode {
+    fn from_env() -> Self {
+        // Check for puzzle mode: PUZZLE=66
+        if let Ok(puzzle_str) = std::env::var("PUZZLE") {
+            if let Ok(num) = puzzle_str.parse::<u8>() {
+                if (40..=160).contains(&num) {
+                    return ScanMode::Puzzle(num);
+                }
+            }
+        }
+        
+        // Check for weak key mode: WEAK_KEYS=1
+        if std::env::var("WEAK_KEYS").is_ok() {
+            return ScanMode::WeakKeys;
+        }
+        
+        // Default: random (Philox RNG)
+        ScanMode::Random
+    }
+    
+    fn print_info(&self, keys_per_sec: f64) {
+        match self {
+            ScanMode::Random => {
+                println!("[Mode] Random (Philox RNG)");
+            }
+            ScanMode::Puzzle(num) => {
+                puzzle_mode::print_puzzle_info(*num, keys_per_sec);
+            }
+            ScanMode::WeakKeys => {
+                println!("[Mode] Weak Key Patterns (brain wallets, sequential, etc.)");
+            }
+        }
+    }
+}
+
 fn main() {
     println!("\n\x1b[1;36m╔═══════════════════════════════════════════════════════╗");
     println!("║     XYZ-PRO  •  Bitcoin Key Scanner  •  Metal GPU      ║");
@@ -128,7 +177,11 @@ fn main() {
     let p_cores = get_performance_core_count();
     setup_rayon_pool(p_cores);
 
+    // Scan mode selection from environment
+    let scan_mode = ScanMode::from_env();
+    
     let fast_start = std::env::var("FAST_START").is_ok() 
+        || std::env::var("FAST_MODE").is_ok()
         || std::env::args().any(|a| a == "--fast" || a == "-f");
     
     if fast_start {
@@ -209,8 +262,36 @@ fn main() {
     }).ok();
 
     println!("[▶] Scanning... (Ctrl+C to stop)\n");
+    
+    // Print scan mode info
+    scan_mode.print_info(2_500_000.0); // Estimate based on typical M1 speed
+    println!();
 
-    run_pipelined(gpu.clone(), targets.clone(), counter.clone(), found.clone(), shutdown.clone(), start);
+    // Route to appropriate scanner based on mode
+    match scan_mode {
+        ScanMode::Puzzle(puzzle_num) => {
+            // Puzzle mode: Sequential scanning with checkpoint support
+            if let Some(config) = puzzle_mode::PuzzleConfig::for_puzzle(puzzle_num) {
+                if let Some(found_key) = puzzle_scanner::run_puzzle_scan(&gpu, &config, &shutdown) {
+                    println!("\n🎉 PUZZLE #{} SOLVED!", puzzle_num);
+                    println!("Private Key: {}", hex::encode(&found_key));
+                    found.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                eprintln!("[!] Unknown puzzle #{}, use PUZZLE=66 to PUZZLE=160", puzzle_num);
+            }
+        }
+        ScanMode::WeakKeys => {
+            // Weak keys mode: Brain wallets and patterns
+            println!("[WeakKeys] Not yet fully integrated - falling back to random mode");
+            println!("[WeakKeys] Use brain_wallet() from weak_key_generator for custom searches");
+            run_pipelined(gpu.clone(), targets.clone(), counter.clone(), found.clone(), shutdown.clone(), start, scan_mode);
+        }
+        ScanMode::Random => {
+            // Default: Philox RNG random scanning
+            run_pipelined(gpu.clone(), targets.clone(), counter.clone(), found.clone(), shutdown.clone(), start, scan_mode);
+        }
+    }
 
     let total = counter.load(Ordering::Relaxed);
     let time = start.elapsed().as_secs_f64();
@@ -260,7 +341,11 @@ fn run_pipelined(
     found: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     start: Instant,
+    scan_mode: ScanMode,
 ) {
+    // Note: scan_mode is now handled in main() before calling run_pipelined
+    // This function is only called for Random and WeakKeys (fallback) modes
+    let _ = scan_mode; // Silence unused warning
     // Get config-driven values from GPU
     let config = gpu.config();
     let pipeline_depth = config.pipeline_depth;
@@ -602,8 +687,22 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
 }
 
 fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType, compressed: bool) {
-    // Async logger handles both pretty print AND file write with sync_all()
-    // No sync I/O here to avoid blocking the verification pipeline
+    use std::fs::OpenOptions;
+    
+    // CRITICAL: Immediate sync write BEFORE async logging
+    // This ensures we NEVER lose a found key, even if program crashes
+    let hex = hex::encode(privkey);
+    let wif = to_wif_compressed(privkey, compressed);
+    let key_type = if compressed { "compressed" } else { "uncompressed" };
+    
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("found.txt") {
+        use chrono::Local;
+        let time = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(f, "[{}] {} | {} | {} | {} | {}", time, addr, atype.as_str(), key_type, hex, wif);
+        let _ = f.sync_all(); // CRITICAL: Force to disk immediately
+    }
+    
+    // Then send to async logger for pretty console output
     let tx = REPORT_TX.get_or_init(init_async_logger);
     let _ = tx.send(ReportEntry {
         privkey: *privkey,

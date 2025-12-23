@@ -5,6 +5,9 @@ pub mod gpu;
 pub mod startup_tests;
 pub mod targets;
 pub mod types;
+pub mod weak_key_generator;
+pub mod puzzle_mode;
+pub mod puzzle_scanner;
 
 #[cfg(feature = "philox-rng")]
 pub mod rng;
