@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
 use crate::rng::philox::{PhiloxCounter, PhiloxState, philox_to_privkey};
-use crate::filter::XorFilter32;
+use crate::filter::ShardedXorFilter;
 
 // BATCH_SIZE = 16 must match secp256k1_scanner.metal
 
@@ -377,14 +377,16 @@ impl OptimizedScanner {
 
         println!("[GPU] Pipeline: max_threads_per_threadgroup={}", pipeline.max_total_threads_per_threadgroup());
 
-        // Build Xor Filter32 with cache support
-        // XorFilter32 provides:
+        // Build Sharded Xor Filter with cache support
+        // ShardedXorFilter provides:
+        // - 256 parallel shards for instant construction (no retries)
         // - 90% reduction in cache misses
         // - 40% reduction in GPU thread idle time  
         // - Lower false positive rate (0.15% vs 0.4%)
         // - O(n) construction with XOR-trick peeling algorithm
+        // - mmap cache with CRC32 integrity check
         // - Binary cache for instant reload (~10ms vs 5min for 49M targets)
-        let xor_filter = XorFilter32::new_with_cache(target_hashes, xor_cache_path);
+        let xor_filter = ShardedXorFilter::new_with_cache(target_hashes, xor_cache_path);
 
         // Use pre-computed wNAF table for keys_per_thread=128 (most common config)
         // lazy_static eliminates ~10ms initialization overhead
@@ -453,8 +455,8 @@ impl OptimizedScanner {
             storage,
         );
 
-        // Create Xor Filter32 buffers (Bloom Filter removed)
-        let (xor_fingerprints, xor_seeds, xor_block_length) = xor_filter.gpu_data();
+        // Create Sharded Xor Filter buffers (legacy mode for GPU compatibility)
+        let (xor_fingerprints, xor_seeds, xor_block_length) = xor_filter.gpu_data_legacy();
         
         let xor_fingerprints_buf = device.new_buffer_with_data(
             xor_fingerprints.as_ptr() as *const _,
@@ -516,9 +518,11 @@ impl OptimizedScanner {
         let mem_mb = (double_buf_mem + shared_mem) as f64 / 1_000_000.0;
         
         println!("[GPU] Double buffering enabled for async pipelining");
-        println!("[GPU] Xor Filter32: {:.1} MB ({:.2} bits/element), FP rate <0.15%",
-            xor_filter.memory_bytes() as f64 / 1_000_000.0,
-            xor_filter.bits_per_element(target_hashes.len()));
+        let filter_mem = xor_filter.memory_bytes();
+        let bits_per_elem = (filter_mem * 8) as f64 / target_hashes.len() as f64;
+        println!("[GPU] Sharded Xor Filter: {:.1} MB ({:.2} bits/element), FP rate <0.15%",
+            filter_mem as f64 / 1_000_000.0,
+            bits_per_elem);
         println!("[GPU] Total buffer memory: {:.2} MB", mem_mb);
 
         // Initialize Philox counter

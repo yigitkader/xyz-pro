@@ -56,8 +56,10 @@ impl XorFilter32 {
     /// Build filter from targets (no cache)
     fn build_new(targets: &[[u8; 20]]) -> Self {
         let size = targets.len();
-        // 1.35x capacity for reliable construction (1.23 is theoretical minimum)
-        let capacity = (((size as f64) * 1.35) as usize / 3) * 3;
+        // 1.5x capacity for reliable construction with large datasets (49M+ targets)
+        // 1.23 is theoretical minimum, 1.35 causes retries on 49M targets
+        // 1.5x ensures single-attempt success while only adding ~15% more memory
+        let capacity = (((size as f64) * 1.5) as usize / 3) * 3;
         let block_length = capacity / 3;
         
         println!("[Xor] Building filter for {} targets...", size);
@@ -69,7 +71,7 @@ impl XorFilter32 {
         let mut seed = 0x517cc1b727220a95_u64;
         let mut success = false;
         
-        for attempt in 0..20 {
+        for attempt in 0..50 {
             fingerprints.fill(0);
             if Self::construct_optimized(targets, &mut fingerprints, block_length, seed) {
                 success = true;
@@ -84,7 +86,7 @@ impl XorFilter32 {
         }
         
         if !success {
-            panic!("[Xor] Construction failed after 20 attempts");
+            panic!("[Xor] Construction failed after 50 attempts - this should not happen with 1.5x capacity");
         }
         
         // Build sorted prefix table (parallel)
@@ -285,8 +287,8 @@ impl XorFilter32 {
         let prefix_count = u64::from_le_bytes(buf8) as usize;
         
         // Validate expected capacity
-        // capacity = ((target_count * 1.35) / 3) * 3
-        let expected_capacity = (((expected_target_count as f64) * 1.35) as usize / 3) * 3;
+        // capacity = ((target_count * 1.5) / 3) * 3
+        let expected_capacity = (((expected_target_count as f64) * 1.5) as usize / 3) * 3;
         if fingerprint_count != expected_capacity {
             eprintln!("[Xor] Cache capacity mismatch (expected {}, got {}), rebuilding...", 
                 expected_capacity, fingerprint_count);
