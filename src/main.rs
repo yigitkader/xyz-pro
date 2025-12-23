@@ -37,7 +37,6 @@ use targets::TargetDatabase;
 use rng::philox::{PhiloxState, philox_to_privkey};
 
 const TARGETS_FILE: &str = "targets.json";
-const PIPELINE_DEPTH: usize = 2;  // Minimal: prevents memory bus saturation
 
 type VerifyBatch = ([u8; 32], PhiloxState, PooledBuffer);
 
@@ -256,7 +255,13 @@ fn run_pipelined(
     shutdown: Arc<AtomicBool>,
     start: Instant,
 ) {
-    let (tx, rx): (Sender<VerifyBatch>, Receiver<VerifyBatch>) = bounded(PIPELINE_DEPTH);
+    // Get config-driven values from GPU
+    let config = gpu.config();
+    let pipeline_depth = config.pipeline_depth;
+    let gpu_breath_ms = config.gpu_breath_ms;
+    let throttle_multiplier = config.throttle_multiplier;
+    
+    let (tx, rx): (Sender<VerifyBatch>, Receiver<VerifyBatch>) = bounded(pipeline_depth);
 
     let gpu_shutdown = shutdown.clone();
     let verify_shutdown = shutdown.clone();
@@ -300,20 +305,13 @@ fn run_pipelined(
                         
                         // CRITICAL: Apply PID throttling + GPU breathing room
                         // This prevents: 1) Thermal runaway 2) UI starvation 3) Memory bus saturation
-                        let speed = if let Some(_) = pid.update(temp) {
-                            pid.current_speed()
-                        } else {
-                            pid.current_speed()
-                        };
+                        let speed = pid.update(temp).map(|_| pid.current_speed()).unwrap_or_else(|| pid.current_speed());
                         
-                        // ALWAYS give GPU breathing room for macOS WindowServer
-                        // Base: 1ms minimum (prevents UI freeze)
-                        // + PID throttle when hot (up to 10ms at 50% speed)
-                        let base_breath_ms = 1u64;
+                        // GPU breathing room (config-driven)
                         let throttle_ms = if speed < 0.95 {
-                            ((1.0 - speed) * 20.0) as u64  // 0.5 speed → 10ms extra
+                            ((1.0 - speed) * throttle_multiplier) as u64
                         } else { 0 };
-                        std::thread::sleep(Duration::from_millis(base_breath_ms + throttle_ms));
+                        std::thread::sleep(Duration::from_millis(gpu_breath_ms + throttle_ms));
                         
                         gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
                         
@@ -343,8 +341,8 @@ fn run_pipelined(
                                 gpu_shutdown.store(true, Ordering::SeqCst);
                             }
                         }
-                        // GPU breathing room - prevents UI starvation
-                        std::thread::sleep(Duration::from_millis(1));
+                        // GPU breathing room (config-driven)
+                        std::thread::sleep(Duration::from_millis(gpu_breath_ms));
                     },
                     &gpu_shutdown,
                 );

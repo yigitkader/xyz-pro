@@ -29,14 +29,12 @@ pub struct BufferPool {
     pool_rx: Receiver<Vec<PotentialMatch>>,
 }
 
-const POOL_SIZE: usize = 4;  // Minimal: triple buffering + 1 spare (saves ~70% RAM)
-
 impl BufferPool {
-    pub fn new(buffer_capacity: usize) -> Self {
-        let (return_tx, pool_rx) = bounded(POOL_SIZE);
+    pub fn new(buffer_capacity: usize, pool_size: usize) -> Self {
+        let (return_tx, pool_rx) = bounded(pool_size);
         
         // Pre-allocate all buffers
-        for _ in 0..POOL_SIZE {
+        for _ in 0..pool_size {
             let buf = Vec::with_capacity(buffer_capacity);
             let _ = return_tx.try_send(buf);
         }
@@ -117,13 +115,17 @@ unsafe impl Sync for PooledBuffer {}
 
 #[derive(Debug, Clone)]
 pub struct GpuConfig {
-    #[allow(dead_code)]
     pub name: String,
     pub max_threads: usize,
     pub keys_per_thread: u32,
     pub threadgroup_size: usize,
     pub match_buffer_size: usize,
     pub gpu_memory_mb: u64,
+    // System stability settings (auto-detected based on hardware)
+    pub pipeline_depth: usize,      // Channel buffer depth
+    pub pool_size: usize,           // Buffer pool size  
+    pub gpu_breath_ms: u64,         // Min sleep between batches (UI responsiveness)
+    pub throttle_multiplier: f32,   // PID throttle strength
 }
 
 impl GpuConfig {
@@ -134,8 +136,49 @@ impl GpuConfig {
         let (max_threads, keys_per_thread, tg_size, match_buf) = 
             Self::config_for_gpu(&name, max_tg, mem_mb);
         
-        GpuConfig { name, max_threads, keys_per_thread, threadgroup_size: tg_size, 
-                   match_buffer_size: match_buf, gpu_memory_mb: mem_mb }
+        // System stability settings based on hardware tier
+        let (pipeline_depth, pool_size, gpu_breath_ms, throttle_multiplier) = 
+            Self::stability_config(&name, mem_mb);
+        
+        GpuConfig { 
+            name, 
+            max_threads, 
+            keys_per_thread, 
+            threadgroup_size: tg_size, 
+            match_buffer_size: match_buf, 
+            gpu_memory_mb: mem_mb,
+            pipeline_depth,
+            pool_size,
+            gpu_breath_ms,
+            throttle_multiplier,
+        }
+    }
+    
+    /// Determine stability settings based on hardware
+    fn stability_config(name: &str, mem_mb: u64) -> (usize, usize, u64, f32) {
+        let name_lower = name.to_lowercase();
+        
+        // ULTRA: High-end, more aggressive
+        if name_lower.contains("ultra") || mem_mb >= 96000 {
+            println!("[Config] ULTRA tier: aggressive settings");
+            return (4, 6, 1, 15.0);  // pipeline=4, pool=6, breath=1ms, throttle=15x
+        }
+        
+        // MAX: Still powerful
+        if name_lower.contains("max") || mem_mb >= 48000 {
+            println!("[Config] MAX tier: balanced settings");
+            return (3, 5, 1, 18.0);  // pipeline=3, pool=5, breath=1ms, throttle=18x
+        }
+        
+        // PRO: Balanced
+        if name_lower.contains("pro") || mem_mb >= 16000 {
+            println!("[Config] PRO tier: conservative settings");
+            return (2, 4, 2, 20.0);  // pipeline=2, pool=4, breath=2ms, throttle=20x
+        }
+        
+        // BASE: Most conservative
+        println!("[Config] BASE tier: safe settings");
+        (2, 4, 3, 25.0)  // pipeline=2, pool=4, breath=3ms, throttle=25x
     }
     
     #[cfg(target_os = "macos")]
@@ -203,6 +246,8 @@ impl GpuConfig {
     pub fn print_summary(&self) {
         println!("[GPU] {} | {}K threads | {:.1}M keys/batch | {}MB", 
             self.name, self.max_threads / 1000, self.keys_per_batch() as f64 / 1e6, self.gpu_memory_mb);
+        println!("[GPU] Stability: pipeline={}, pool={}, breath={}ms, throttle={:.0}x",
+            self.pipeline_depth, self.pool_size, self.gpu_breath_ms, self.throttle_multiplier);
     }
 }
 
@@ -639,9 +684,9 @@ impl OptimizedScanner {
 
         // BUFFER POOL: Pre-allocated buffers with automatic return
         // Zero allocation after init, zero copy on transfer
-        let buffer_pool = Arc::new(BufferPool::new(match_buffer_size));
+        let buffer_pool = Arc::new(BufferPool::new(match_buffer_size, config.pool_size));
         println!("[GPU] Buffer pool: {} pre-allocated buffers ({:.1} MB total)",
-            POOL_SIZE, (POOL_SIZE * match_buffer_size * std::mem::size_of::<PotentialMatch>()) as f64 / 1_000_000.0);
+            config.pool_size, (config.pool_size * match_buffer_size * std::mem::size_of::<PotentialMatch>()) as f64 / 1_000_000.0);
         
         Ok(Self {
             pipeline,
