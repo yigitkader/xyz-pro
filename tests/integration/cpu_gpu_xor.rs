@@ -108,7 +108,7 @@ mod cpu_hash_tests {
 /// Test Xor Filter correctness
 #[cfg(feature = "xor-filter")]
 mod xor_filter_integration_tests {
-    use xyz_pro::filter::XorFilter32;
+    use xyz_pro::filter::ShardedXorFilter;
     
     #[test]
     fn test_xor_filter_true_positives() {
@@ -123,7 +123,7 @@ mod xor_filter_integration_tests {
             })
             .collect();
         
-        let filter = XorFilter32::new(&targets);
+        let filter = ShardedXorFilter::new(&targets);
         
         // All targets should be found
         let mut found = 0;
@@ -154,7 +154,7 @@ mod xor_filter_integration_tests {
             known_hashes.push(h);
         }
         
-        let filter = XorFilter32::new(&known_hashes);
+        let filter = ShardedXorFilter::new(&known_hashes);
         
         // First 2 known hashes should be found
         for (i, hash) in known_hashes.iter().take(2).enumerate() {
@@ -177,7 +177,7 @@ mod xor_filter_integration_tests {
             })
             .collect();
         
-        let filter = XorFilter32::new(&targets);
+        let filter = ShardedXorFilter::new(&targets);
         
         // Test with random non-member hashes
         use rand::Rng;
@@ -276,7 +276,7 @@ fn test_cpu_gpu_xor_integration() {
     // Check 2: Xor Filter works
     #[cfg(feature = "xor-filter")]
     {
-        use xyz_pro::filter::XorFilter32;
+        use xyz_pro::filter::ShardedXorFilter;
         // XorFilter needs at least ~100 elements for reliable construction
         let mut targets: Vec<[u8; 20]> = (0..100)
             .map(|i| {
@@ -287,7 +287,7 @@ fn test_cpu_gpu_xor_integration() {
             .collect();
         targets.push([1u8; 20]);
         targets.push([2u8; 20]);
-        let filter = XorFilter32::new(&targets);
+        let filter = ShardedXorFilter::new(&targets);
         if filter.contains(&[1u8; 20]) && filter.contains(&[2u8; 20]) {
             checks_passed += 1;
             println!("  [✓] Xor Filter lookup");

@@ -115,8 +115,13 @@ impl Deref for PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if let Some(mut buf) = self.inner.take() {
+            let cap = buf.capacity();
             buf.clear();  // Clear data but keep capacity
-            let _ = self.return_tx.try_send(buf);  // Return to pool
+            if self.return_tx.try_send(buf).is_ok() {
+                // Successfully returned to pool
+            } else {
+                eprintln!("[MEM] WARNING: BufferPool full, dropped buffer (cap={})", cap);
+            }
         }
     }
 }
@@ -343,7 +348,7 @@ pub struct OptimizedScanner {
     total_matches: AtomicU64,
     philox_counter: PhiloxCounter,
     buffer_pool: Arc<BufferPool>,  // Zero-allocation buffer pool
-    lookahead_pubkey: std::cell::UnsafeCell<Option<(Vec<u8>, Vec<u8>)>>,
+    lookahead_pubkey: std::cell::UnsafeCell<Option<([u8; 32], [u8; 32])>>,
     last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,
 }
 
@@ -750,7 +755,8 @@ impl OptimizedScanner {
     }
 
     /// Compute public key from private key (helper for look-ahead)
-    fn compute_pubkey(base_key: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// Returns fixed-size arrays to avoid allocation
+    fn compute_pubkey(base_key: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
         use k256::SecretKey;
         let secret = SecretKey::from_slice(base_key)
             .map_err(|e| ScannerError::Gpu(format!("Invalid base key: {}", e)))?;
@@ -758,7 +764,14 @@ impl OptimizedScanner {
         let point = pubkey.to_encoded_point(false);
         let x = point.x().expect("pubkey must have x");
         let y = point.y().expect("pubkey must have y");
-        Ok((x.to_vec(), y.to_vec()))
+        
+        // Copy to fixed arrays - NO HEAP ALLOCATION
+        let mut x_arr = [0u8; 32];
+        let mut y_arr = [0u8; 32];
+        x_arr.copy_from_slice(&x[..]);
+        y_arr.copy_from_slice(&y[..]);
+        
+        Ok((x_arr, y_arr))
     }
     
     /// Pre-compute pubkey for next batch (called while GPU is busy)
@@ -899,28 +912,6 @@ impl OptimizedScanner {
         // ═══════════════════════════════════════════════════════════════════
         // GPU-CPU SYNCHRONIZATION (Memory Barrier)
         // ═══════════════════════════════════════════════════════════════════
-        // 
-        // TRIPLE BUFFERING PIPELINE:
-        //   Buffer A: GPU computing current batch
-        //   Buffer B: This function reading previous batch (we are here)
-        //   Buffer C: Rayon threads verifying older batch
-        //
-        // MEMORY BARRIER GUARANTEE:
-        //   Metal's wait_until_completed() provides IMPLICIT memory barrier:
-        //   1. All GPU writes are flushed to Unified Memory
-        //   2. CPU reads see consistent, complete data
-        //   3. No explicit MTLEvent needed for storageModeShared buffers
-        //
-        // RACE CONDITION PREVENTION:
-        //   - Each buffer set has its OWN command queue (3 queues total)
-        //   - We never read a buffer while GPU is writing to it
-        //   - Triple buffering ensures 1 buffer gap between write and read
-        //
-        // Apple Silicon Unified Memory advantage:
-        //   - No CPU-GPU memory copy needed (zero-copy)
-        //   - Coherent view after barrier (both see same data)
-        //
-        // ═══════════════════════════════════════════════════════════════════
         let sync_cmd = buffers.queue.new_command_buffer();
         sync_cmd.commit();
         sync_cmd.wait_until_completed();
@@ -946,10 +937,23 @@ impl OptimizedScanner {
         let mut pooled = self.buffer_pool.wrap(self.buffer_pool.acquire());
         let matches = pooled.as_mut();
         
+        // LOG: Match count per batch (detect filter anomaly)
+        static BATCH_NUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let batch = BATCH_NUM.fetch_add(1, Ordering::Relaxed);
+        
+        if match_count > 10_000 {
+            eprintln!("[MEM] Batch #{}: {} matches (VERY HIGH! Check filter)", batch, match_count);
+        } else if match_count > 1_000 && batch % 100 == 0 {
+            eprintln!("[MEM] Batch #{}: {} matches (high)", batch, match_count);
+        }
+        
         if match_count > 0 {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
             
-            // Direct read from unified memory into pooled buffer
+            // Ensure capacity without allocation (should already be pre-allocated)
+            let cap_before = matches.capacity();
+            
+            // Direct read from unified memory into pooled buffer - NO CLONE!
             unsafe {
                 let data_ptr = buffers.match_data_buf.contents() as *const u8;
                 for i in 0..match_count {
@@ -979,6 +983,12 @@ impl OptimizedScanner {
                         hash: Hash160::from_slice(&hash_array),
                     });
                 }
+            }
+            
+            // Check if capacity changed (indicates allocation!)
+            if matches.capacity() != cap_before {
+                eprintln!("[MEM] WARNING: Vec reallocated in wait_and_collect! cap: {} -> {} (matches: {})",
+                    cap_before, matches.capacity(), match_count);
             }
         }
 

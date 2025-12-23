@@ -93,6 +93,13 @@ impl ShardedXorFilter {
         
         // Step 0: Deduplicate targets - duplicates cause peeling to fail!
         // XOR filter requires unique keys because duplicates map to same slots
+        // 
+        // MEMORY NOTE: This copies all targets (~20 bytes × N)
+        // For 49M targets: ~980 MB temporary allocation
+        // This is unavoidable for dedup but only happens once at startup.
+        let alloc_mb = (targets.len() * 20) as f64 / 1e6;
+        eprintln!("[MEM] ShardedXorFilter: allocating {:.1} MB for dedup", alloc_mb);
+        
         let mut unique_targets = targets.to_vec();
         unique_targets.par_sort_unstable();
         unique_targets.dedup();

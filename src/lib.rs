@@ -1,4 +1,5 @@
 pub mod address;
+pub mod bsgs;
 pub mod crypto;
 pub mod error;
 pub mod gpu;
@@ -19,6 +20,8 @@ pub mod math;
 
 #[cfg(feature = "pid-thermal")]
 pub mod thermal;
+
+pub use bsgs::BSGS;
 
 pub use error::{Result, ScannerError};
 pub use types::{AddressType, Hash160};

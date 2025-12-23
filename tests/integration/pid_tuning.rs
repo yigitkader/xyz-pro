@@ -2,7 +2,9 @@
 // PID Thermal Controller tuning and validation tests
 
 #[cfg(feature = "pid-thermal")]
-use xyz_pro::thermal::{PIDController, PIDTuning, DynamicSpeedController};
+use xyz_pro::thermal::pid_controller::{PIDController, PIDTuning};
+#[cfg(feature = "pid-thermal")]
+use xyz_pro::thermal::DynamicSpeedController;
 use std::time::Duration;
 use std::thread;
 

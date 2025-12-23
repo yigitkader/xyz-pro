@@ -2,6 +2,7 @@ mod address;
 mod crypto;
 mod error;
 mod gpu;
+mod memory_log;
 mod startup_tests;
 mod targets;
 mod types;
@@ -184,16 +185,35 @@ fn main() {
         }
     };
 
+    // MEMORY LOG: Track hash collection
+    let mem_before = memory_log::get_process_memory_mb();
+    eprintln!("[MEM] Before get_all_hashes: {:.1} MB", mem_before);
+    
     let hashes = targets.get_all_hashes();
+    let hash_mem = (hashes.len() * 20) as f64 / 1e6;
+    
+    let mem_after = memory_log::get_process_memory_mb();
+    eprintln!("[MEM] After get_all_hashes: {:.1} MB (Δ{:+.1} MB, hashes={:.1} MB)", 
+        mem_after, mem_after - mem_before, hash_mem);
+    memory_log::log_alloc("get_all_hashes", hashes.len() * 20);
+    
     let xor_cache = TARGETS_FILE.replace(".json", ".shxor");
 
+    eprintln!("[MEM] Before GPU scanner: {:.1} MB", memory_log::get_process_memory_mb());
     let gpu = match OptimizedScanner::new_with_cache(&hashes, Some(&xor_cache)) {
-        Ok(g) => Arc::new(g),
+        Ok(g) => {
+            eprintln!("[MEM] After GPU scanner: {:.1} MB", memory_log::get_process_memory_mb());
+            Arc::new(g)
+        }
         Err(e) => {
             eprintln!("[✗] GPU: {}", e);
             return;
         }
     };
+    
+    // Drop hashes Vec immediately after GPU scanner creation to free ~980 MB
+    drop(hashes);
+    eprintln!("[MEM] After drop(hashes): {:.1} MB", memory_log::get_process_memory_mb());
 
     if !fast_start {
         if !run_gpu_correctness_test(&gpu, &targets) {
@@ -497,6 +517,8 @@ fn run_pipelined(
     let mut last_count = 0u64;
     let mut last_fp = 0u64;
     let mut rolling_speed = 0.0f64;
+    let mut last_process_mem = memory_log::get_process_memory_mb();
+    let mut mem_growth_warnings = 0u32;
 
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
@@ -515,18 +537,38 @@ fn run_pipelined(
             } else { 0.0 };
             let mem = 100.0 - check_memory_pressure();
             
+            // MEMORY TRACKING: Process memory (RSS)
+            let process_mem = memory_log::get_process_memory_mb();
+            let mem_delta = process_mem - last_process_mem;
+            
             print!("\r\x1b[K");
-            println!("[⚡] {} keys | {} (avg {}) | {} found | {} FP ({:.4}%) | RAM: {:.1}% | {}",
+            println!("[⚡] {} keys | {} (avg {}) | {} found | {} FP ({:.4}%) | RSS: {:.0}MB (Δ{:+.1}) | {}",
                 format_num(count), format_speed(rolling_speed), format_speed(count as f64 / elapsed),
-                found.load(Ordering::Relaxed), format_num(fp), fp_rate, mem, format_time(elapsed));
+                found.load(Ordering::Relaxed), format_num(fp), fp_rate, process_mem, mem_delta, format_time(elapsed));
+            
+            // MEMORY LEAK DETECTION: Warn if RSS grows consistently
+            if mem_delta > 10.0 {
+                mem_growth_warnings += 1;
+                if mem_growth_warnings >= 3 {
+                    eprintln!("[⚠️ MEM] RSS growing: {:.0}MB → {:.0}MB (Δ{:+.1}MB in {}s) - possible leak!",
+                        last_process_mem, process_mem, mem_delta, interval);
+                }
+            } else {
+                mem_growth_warnings = 0;
+            }
             
             if mem > 90.0 {
-                println!("  [!] CRITICAL: RAM at {:.1}%!", mem);
+                eprintln!("[!] CRITICAL: System RAM at {:.1}%!", mem);
+            }
+            
+            if process_mem > 4000.0 {
+                eprintln!("[!] CRITICAL: Process using {:.0}MB RAM!", process_mem);
             }
 
             last_stat = Instant::now();
             last_count = count;
             last_fp = fp;
+            last_process_mem = process_mem;
         }
     }
 

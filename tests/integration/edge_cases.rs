@@ -9,7 +9,7 @@ use xyz_pro::gpu;
 /// Test Philox RNG private key generation edge cases
 #[cfg(feature = "philox-rng")]
 mod philox_edge_tests {
-    use xyz_pro::rng::{PhiloxCounter, PhiloxState, philox4x32_10};
+    use xyz_pro::rng::philox::{PhiloxCounter, PhiloxState, philox4x32_10};
     
     #[test]
     fn test_philox_zero_seed() {

@@ -17,7 +17,7 @@
 #[cfg(feature = "xor-filter")]
 mod xor_filter_tests {
     use std::time::{Duration, Instant};
-    use xyz_pro::filter::XorFilter32;
+    use xyz_pro::filter::ShardedXorFilter;
     
     /// Test XorFilter construction time is O(n), not O(n²)
     /// For 1M targets, should complete in < 5 seconds
@@ -40,7 +40,7 @@ mod xor_filter_tests {
             .collect();
         
         let start = Instant::now();
-        let filter = XorFilter32::new(&targets);
+        let filter = ShardedXorFilter::new(&targets);
         let elapsed = start.elapsed();
         
         println!("  Built filter for {} targets in {:?}", num_targets, elapsed);
@@ -78,7 +78,7 @@ mod xor_filter_tests {
             })
             .collect();
         
-        let filter = XorFilter32::new(&targets);
+        let filter = ShardedXorFilter::new(&targets);
         
         // Check ALL targets are found
         for (i, hash) in targets.iter().enumerate() {
@@ -105,7 +105,7 @@ mod xor_filter_tests {
             })
             .collect();
         
-        let filter = XorFilter32::new(&targets);
+        let filter = ShardedXorFilter::new(&targets);
         
         // Test with non-target hashes (offset by large amount)
         let mut false_positives = 0;
@@ -481,7 +481,7 @@ mod integration_tests {
                 .collect();
             
             let start = Instant::now();
-            let _filter = xyz_pro::filter::XorFilter32::new(&targets);
+            let _filter = xyz_pro::filter::ShardedXorFilter::new(&targets);
             let elapsed = start.elapsed();
             
             if elapsed < Duration::from_secs(1) {

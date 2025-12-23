@@ -12,8 +12,9 @@
 9. [Memory Layout](#9-memory-layout)
 10. [Performance Characteristics](#10-performance-characteristics)
 11. [Sharded XOR Filter System](#11-sharded-xor-filter-system)
-12. [Scan Modes](#12-scan-modes)
-13. [Unused Code & Reserved Modules](#13-unused-code--reserved-modules)
+12. [Baby-Step Giant-Step (BSGS)](#12-baby-step-giant-step-bsgs-algorithm)
+13. [Scan Modes](#13-scan-modes)
+14. [Unused Code & Reserved Modules](#14-unused-code--reserved-modules)
 
 ---
 
@@ -1252,9 +1253,83 @@ PUZZLE=66 ./target/release/xyz-pro  # Reads puzzle_checkpoint.bin
 
 ---
 
+## 12. Baby-Step Giant-Step (BSGS) Algorithm
+
+### 12.1 Overview
+
+BSGS is a mathematical algorithm that solves the Discrete Logarithm Problem (DLP) in **O(√n)** time instead of O(n). For Bitcoin puzzles with known ranges, this transforms search time from billions of years to minutes.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    BSGS ALGORITHM - √n OPTIMIZATION                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  PROBLEM: Find k where Q = k*G (G = generator, Q = public key)         │
+│                                                                         │
+│  BRUTE FORCE: O(n)          BSGS: O(√n)                                │
+│  ──────────────────          ──────────────                             │
+│  Puzzle 40: 2^40 keys        Puzzle 40: 2^20 steps                     │
+│  = 1 trillion operations     = 1 million operations                    │
+│  = ~13 years                 = ~4 seconds                              │
+│                                                                         │
+│  ALGORITHM:                                                             │
+│  1. Baby-Step: Precompute table of i*G for i in [0, √n)                │
+│  2. Giant-Step: For j = 0,1,2,...: compute Q - j*m*G                   │
+│  3. If Q - j*m*G matches table entry i: k = j*m + i                    │
+│                                                                         │
+│  TRADE-OFF: Time ←→ Space                                              │
+│  ├─ More RAM = faster search                                           │
+│  └─ √n entries × 40 bytes ≈ memory requirement                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 Memory Requirements
+
+| Puzzle | Range Size | √n (entries) | RAM Required | Build Time | Search Time |
+|--------|------------|--------------|--------------|------------|-------------|
+| 20     | 2^19       | 725          | ~30 KB       | 0.01s      | 0.001s      |
+| 30     | 2^29       | 23K          | 0.9 MB       | 0.14s      | 0.003s      |
+| 40     | 2^39       | 741K         | 41 MB        | 3.9s       | 0.007s      |
+| 45     | 2^44       | 4.2M         | ~240 MB      | ~20s       | ~0.02s      |
+| 50     | 2^49       | 24M          | ~1.3 GB      | ~2min      | ~0.1s       |
+| 55     | 2^54       | 134M         | ~7.5 GB      | ❌ Too large | ❌         |
+| 66     | 2^65       | 6B           | ~340 GB      | ❌ Impossible | ❌        |
+
+### 12.3 Usage
+
+```rust
+use xyz_pro::BSGS;
+
+// Create solver for a specific puzzle
+let bsgs = BSGS::new(40)?;  // Puzzle 40
+
+// Solve: find private key for known public key
+if let Some(privkey) = bsgs.solve(&target_pubkey) {
+    println!("Found: {}", hex::encode(privkey));
+}
+```
+
+### 12.4 Limitations
+
+- **Puzzle 50+**: Requires >1 GB RAM, tight for 8 GB M1 Macs
+- **Puzzle 66**: Would require ~340 GB RAM - IMPOSSIBLE on consumer hardware
+- **Requires known public key**: Cannot work with Hash160 only (address)
+
+### 12.5 When to Use BSGS
+
+✅ **Good for:**
+- Bitcoin Puzzles with known public keys
+- Small ranges (< 2^52)
+- Educational purposes
+
+❌ **Not suitable for:**
+- Puzzle 66+ (too large)
+- Random address scanning (no known public key)
+- Addresses without exposed public keys
+
 ---
 
-## 12. Scan Modes
+## 13. Scan Modes
 
 ### 12.1 ScanMode Enum
 
@@ -1314,7 +1389,7 @@ WEAK_KEYS=1 ./target/release/xyz-pro
 
 ---
 
-## 13. Unused Code & Reserved Modules
+## 14. Unused Code & Reserved Modules
 
 ### 13.1 `#[allow(dead_code)]` Annotations
 
