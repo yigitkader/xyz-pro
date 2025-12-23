@@ -906,10 +906,13 @@ kernel void scan_keys(
     //   BATCH_SIZE = 24 → 24 × 197 = 4.7KB/thread → 54 threads/core
     //   - Can afford more due to higher core count
     //
-    // CURRENT: BATCH_SIZE = 16 (M1 Base optimized - most conservative)
-    // For M1 Pro/Max, change to 20/24 respectively for +10-20% throughput
+    // BATCH_SIZE is now CONFIG-DRIVEN from Rust side:
+    //   Base: 16, Pro: 20, Max: 24, Ultra: 32
+    // Defined via #define BATCH_SIZE in combine_metal_shaders()
     // ═══════════════════════════════════════════════════════════════════════════
-    #define BATCH_SIZE 16  // Optimized for M1 Base: no register spilling
+    #ifndef BATCH_SIZE
+    #define BATCH_SIZE 16  // Fallback for standalone compilation
+    #endif
     
     // Thread-local arrays (each thread has its own copy in registers)
     ulong4 batch_X[BATCH_SIZE];

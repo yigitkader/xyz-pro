@@ -140,6 +140,7 @@ pub struct GpuConfig {
     pub pool_size: usize,           // Buffer pool size  
     pub gpu_breath_ms: u64,         // Min sleep between batches (UI responsiveness)
     pub throttle_multiplier: f32,   // PID throttle strength
+    pub batch_size: u32,            // Montgomery batch size (register pressure optimization)
 }
 
 impl GpuConfig {
@@ -151,7 +152,7 @@ impl GpuConfig {
             Self::config_for_gpu(&name, max_tg, mem_mb);
         
         // System stability settings based on hardware tier
-        let (pipeline_depth, pool_size, gpu_breath_ms, throttle_multiplier) = 
+        let (pipeline_depth, pool_size, gpu_breath_ms, throttle_multiplier, batch_size) = 
             Self::stability_config(&name, mem_mb);
         
         GpuConfig { 
@@ -165,34 +166,40 @@ impl GpuConfig {
             pool_size,
             gpu_breath_ms,
             throttle_multiplier,
+            batch_size,
         }
     }
     
     /// Determine stability settings based on hardware
-    fn stability_config(name: &str, mem_mb: u64) -> (usize, usize, u64, f32) {
+    /// Returns: (pipeline_depth, pool_size, gpu_breath_ms, throttle_multiplier, batch_size)
+    fn stability_config(name: &str, mem_mb: u64) -> (usize, usize, u64, f32, u32) {
         let name_lower = name.to_lowercase();
         
-        // ULTRA: High-end, more aggressive
+        // ULTRA: 48+ GPU cores, 96GB+ RAM
+        // BATCH_SIZE=32 → 32 × 197 = 6.3KB/thread → 40 threads/core (still good with 64 cores)
         if name_lower.contains("ultra") || mem_mb >= 96000 {
-            println!("[Config] ULTRA tier: aggressive settings");
-            return (4, 6, 1, 15.0);  // pipeline=4, pool=6, breath=1ms, throttle=15x
+            println!("[Config] ULTRA tier: aggressive settings (batch=32)");
+            return (4, 6, 1, 15.0, 32);
         }
         
-        // MAX: Still powerful
+        // MAX: 24-47 GPU cores, 48GB+ RAM
+        // BATCH_SIZE=24 → 24 × 197 = 4.7KB/thread → 54 threads/core
         if name_lower.contains("max") || mem_mb >= 48000 {
-            println!("[Config] MAX tier: balanced settings");
-            return (3, 5, 1, 18.0);  // pipeline=3, pool=5, breath=1ms, throttle=18x
+            println!("[Config] MAX tier: balanced settings (batch=24)");
+            return (3, 5, 1, 18.0, 24);
         }
         
-        // PRO: Balanced
+        // PRO: 14-23 GPU cores, 16GB+ RAM
+        // BATCH_SIZE=20 → 20 × 197 = 3.9KB/thread → 65 threads/core
         if name_lower.contains("pro") || mem_mb >= 16000 {
-            println!("[Config] PRO tier: conservative settings");
-            return (2, 4, 2, 20.0);  // pipeline=2, pool=4, breath=2ms, throttle=20x
+            println!("[Config] PRO tier: conservative settings (batch=20)");
+            return (2, 4, 2, 20.0, 20);
         }
         
-        // BASE: Most conservative
-        println!("[Config] BASE tier: safe settings");
-        (2, 4, 3, 25.0)  // pipeline=2, pool=4, breath=3ms, throttle=25x
+        // BASE: 7-13 GPU cores, <16GB RAM
+        // BATCH_SIZE=16 → 16 × 197 = 3.2KB/thread → 80 threads/core (no spilling)
+        println!("[Config] BASE tier: safe settings (batch=16)");
+        (2, 4, 3, 25.0, 16)
     }
     
     #[cfg(target_os = "macos")]
@@ -260,8 +267,8 @@ impl GpuConfig {
     pub fn print_summary(&self) {
         println!("[GPU] {} | {}K threads | {:.1}M keys/batch | {}MB", 
             self.name, self.max_threads / 1000, self.keys_per_batch() as f64 / 1e6, self.gpu_memory_mb);
-        println!("[GPU] Stability: pipeline={}, pool={}, breath={}ms, throttle={:.0}x",
-            self.pipeline_depth, self.pool_size, self.gpu_breath_ms, self.throttle_multiplier);
+        println!("[GPU] Stability: pipeline={}, pool={}, breath={}ms, throttle={:.0}x, batch={}",
+            self.pipeline_depth, self.pool_size, self.gpu_breath_ms, self.throttle_multiplier, self.batch_size);
     }
 }
 
@@ -419,10 +426,13 @@ impl PotentialMatch {
 }
 
 impl OptimizedScanner {
-    fn combine_metal_shaders(base_shader: &str) -> Result<String> {
+    fn combine_metal_shaders(base_shader: &str, batch_size: u32) -> Result<String> {
         let mut combined = String::new();
         combined.push_str("#define USE_PHILOX_RNG\n");
         combined.push_str("#define USE_XOR_FILTER\n");
+        
+        // BATCH_SIZE from config (prevents register spilling on different GPUs)
+        combined.push_str(&format!("#define BATCH_SIZE {}\n", batch_size));
         
         #[cfg(feature = "simd-math")]
         combined.push_str("#define USE_SIMD_MATH\n");
@@ -542,8 +552,8 @@ impl OptimizedScanner {
                 shader_path, e
             )))?;
 
-        // Combine with feature-specific shaders
-        let src = Self::combine_metal_shaders(&base_shader)?;
+        // Combine with feature-specific shaders (batch_size from config)
+        let src = Self::combine_metal_shaders(&base_shader, config.batch_size)?;
 
         let lib = device.new_library_with_source(&src, &opts)
             .map_err(|e| ScannerError::Gpu(format!("shader compile: {}", e)))?;
