@@ -185,22 +185,17 @@ fn main() {
         }
     };
 
-    // MEMORY LOG: Track hash collection
-    let mem_before = memory_log::get_process_memory_mb();
-    eprintln!("[MEM] Before get_all_hashes: {:.1} MB", mem_before);
-    
-    let hashes = targets.get_all_hashes();
-    let hash_mem = (hashes.len() * 20) as f64 / 1e6;
-    
-    let mem_after = memory_log::get_process_memory_mb();
-    eprintln!("[MEM] After get_all_hashes: {:.1} MB (Δ{:+.1} MB, hashes={:.1} MB)", 
-        mem_after, mem_after - mem_before, hash_mem);
-    memory_log::log_alloc("get_all_hashes", hashes.len() * 20);
-    
     let xor_cache = TARGETS_FILE.replace(".json", ".shxor");
-
+    
+    // MEMORY OPTIMIZATION: Use iterator-based scanner creation
+    // This avoids the 980MB get_all_hashes() copy when cache hits
     eprintln!("[MEM] Before GPU scanner: {:.1} MB", memory_log::get_process_memory_mb());
-    let gpu = match OptimizedScanner::new_with_cache(&hashes, Some(&xor_cache)) {
+    
+    let gpu = match OptimizedScanner::new_with_iter(
+        targets.iter_hashes(),
+        targets.total(),
+        Some(&xor_cache)
+    ) {
         Ok(g) => {
             eprintln!("[MEM] After GPU scanner: {:.1} MB", memory_log::get_process_memory_mb());
             Arc::new(g)
@@ -210,10 +205,6 @@ fn main() {
             return;
         }
     };
-    
-    // Drop hashes Vec immediately after GPU scanner creation to free ~980 MB
-    drop(hashes);
-    eprintln!("[MEM] After drop(hashes): {:.1} MB", memory_log::get_process_memory_mb());
 
     if !fast_start {
         if !run_gpu_correctness_test(&gpu, &targets) {

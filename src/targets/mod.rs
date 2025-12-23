@@ -213,6 +213,9 @@ impl TargetDatabase {
     
     /// Collect all hashes (only when absolutely necessary)
     /// WARNING: Allocates ~980MB for 49M targets
+    /// Get all hashes as a Vec (for backward compatibility)
+    /// Prefer `iter_hashes()` for zero-copy iteration
+    #[allow(dead_code)]
     pub fn get_all_hashes(&self) -> Vec<[u8; 20]> {
         self.iter_hashes().collect()
     }

@@ -1,5 +1,8 @@
-/// Memory diagnostic logging module
-/// Tracks allocations and helps identify memory leaks
+//! Memory diagnostic logging module
+//! Tracks allocations and helps identify memory leaks
+//!
+//! Most functions here are for debugging and may be unused in production.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -60,7 +63,7 @@ pub fn print_stats() {
 pub fn get_process_memory_mb() -> f64 {
     use std::process::Command;
     
-    if let Ok(pid) = std::env::var("$$").or_else(|_| Ok::<_, ()>(std::process::id().to_string())) {
+    if let Ok(_pid) = std::env::var("$$").or_else(|_| Ok::<_, ()>(std::process::id().to_string())) {
         if let Ok(output) = Command::new("ps")
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
             .output()

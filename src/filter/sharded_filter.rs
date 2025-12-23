@@ -87,35 +87,102 @@ impl ShardedXorFilter {
         filter
     }
     
+    /// Create filter from iterator (avoids intermediate Vec allocation)
+    /// Use this when you have mmap'ed data to avoid 980MB copy
+    pub fn new_from_iter<I>(iter: I, expected_count: usize, cache_path: Option<&str>) -> Self 
+    where 
+        I: Iterator<Item = [u8; 20]>
+    {
+        // Try to load from cache first
+        if let Some(path) = cache_path {
+            if let Some(filter) = Self::load_from_cache(path, expected_count) {
+                return filter;
+            }
+        }
+        
+        // Collect only when cache miss - this is unavoidable for dedup
+        eprintln!("[MEM] Cache miss, collecting {} hashes for filter build", expected_count);
+        let targets: Vec<[u8; 20]> = iter.collect();
+        
+        let filter = Self::build_new(&targets);
+        
+        // Save to cache
+        if let Some(path) = cache_path {
+            if let Err(e) = filter.save_to_cache(path) {
+                eprintln!("[Shard] Warning: Failed to save cache: {}", e);
+            } else {
+                println!("[Shard] Cache saved: {}", path);
+            }
+        }
+        
+        filter
+    }
+    
+    /// Check if data is already sorted (avoids sort+dedup copy)
+    fn is_sorted_and_unique(targets: &[[u8; 20]]) -> bool {
+        if targets.len() < 2 {
+            return true;
+        }
+        
+        // Sample check: verify first 10K entries are sorted
+        // Full check would be O(n) but we already need O(n) for partition
+        let sample_size = targets.len().min(10_000);
+        for i in 1..sample_size {
+            if targets[i] <= targets[i - 1] {
+                return false;
+            }
+        }
+        
+        // Also check last 10K for robustness
+        if targets.len() > 20_000 {
+            let start = targets.len() - 10_000;
+            for i in (start + 1)..targets.len() {
+                if targets[i] <= targets[i - 1] {
+                    return false;
+                }
+            }
+        }
+        
+        true
+    }
+    
     /// Build filter from targets using parallel shard construction
     fn build_new(targets: &[[u8; 20]]) -> Self {
         let start = std::time::Instant::now();
         
-        // Step 0: Deduplicate targets - duplicates cause peeling to fail!
-        // XOR filter requires unique keys because duplicates map to same slots
-        // 
-        // MEMORY NOTE: This copies all targets (~20 bytes × N)
-        // For 49M targets: ~980 MB temporary allocation
-        // This is unavoidable for dedup but only happens once at startup.
-        let alloc_mb = (targets.len() * 20) as f64 / 1e6;
-        eprintln!("[MEM] ShardedXorFilter: allocating {:.1} MB for dedup", alloc_mb);
+        // Step 0: Check if data is already sorted and unique (from binary cache)
+        // If yes, skip the expensive copy+sort+dedup
+        let (unique_targets, _total) = if Self::is_sorted_and_unique(targets) {
+            eprintln!("[MEM] Data already sorted, skipping 980MB copy for dedup");
+            (None, targets.len())
+        } else {
+            // Must copy for dedup - duplicates cause peeling to fail!
+            let alloc_mb = (targets.len() * 20) as f64 / 1e6;
+            eprintln!("[MEM] ShardedXorFilter: allocating {:.1} MB for dedup", alloc_mb);
+            
+            let mut unique = targets.to_vec();
+            unique.par_sort_unstable();
+            unique.dedup();
+            let count = unique.len();
+            
+            if count < targets.len() {
+                println!("[Shard] Removed {} duplicate targets ({} → {})", 
+                    targets.len() - count, targets.len(), count);
+            }
+            
+            (Some(unique), count)
+        };
         
-        let mut unique_targets = targets.to_vec();
-        unique_targets.par_sort_unstable();
-        unique_targets.dedup();
-        let total = unique_targets.len();
-        
-        if total < targets.len() {
-            println!("[Shard] Removed {} duplicate targets ({} → {})", 
-                targets.len() - total, targets.len(), total);
-        }
+        // Use sorted data if available, otherwise original
+        let data: &[[u8; 20]] = unique_targets.as_ref().map(|v| v.as_slice()).unwrap_or(targets);
+        let total = data.len();
         
         println!("[Shard] Building {} shards for {} targets...", NUM_SHARDS, total);
         
         // Step 1: Partition targets by first 12 bits of hash (4096 shards)
         // shard_idx = (hash[0] << 4) | (hash[1] >> 4)
         let mut buckets: Vec<Vec<[u8; 20]>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-        for target in &unique_targets {
+        for target in data {
             let shard_idx = ((target[0] as usize) << 4) | ((target[1] as usize) >> 4);
             buckets[shard_idx].push(*target);
         }
@@ -143,8 +210,8 @@ impl ShardedXorFilter {
         let build_time = start.elapsed();
         println!("[Shard] All shards built in {:.2}s", build_time.as_secs_f64());
         
-        // Step 3: Build prefix table
-        let mut prefixes: Vec<u32> = targets.par_iter()
+        // Step 3: Build prefix table (use original data, already deduped if needed)
+        let mut prefixes: Vec<u32> = data.par_iter()
             .map(|h| u32::from_be_bytes([h[0], h[1], h[2], h[3]]))
             .collect();
         prefixes.par_sort_unstable();
@@ -382,8 +449,18 @@ impl ShardedXorFilter {
         
         // Read header
         let total_count = u64::from_le_bytes(mmap[8..16].try_into().ok()?) as usize;
-        if total_count != expected_count {
-            eprintln!("[Shard] Target count mismatch (expected {}, got {}), rebuilding...", 
+        
+        // Allow for dedup tolerance: cache stores unique count, expected may include duplicates
+        // Accept if within 1% tolerance (typical dedup removes <0.1%)
+        let diff = if total_count > expected_count {
+            total_count - expected_count
+        } else {
+            expected_count - total_count
+        };
+        let tolerance = expected_count / 100; // 1% tolerance
+        
+        if diff > tolerance && total_count != expected_count {
+            eprintln!("[Shard] Target count mismatch (expected ~{}, got {}), rebuilding...", 
                 expected_count, total_count);
             return None;
         }

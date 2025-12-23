@@ -538,18 +538,39 @@ impl OptimizedScanner {
     
     /// Create scanner with XorFilter cache support
     pub fn new_with_cache(target_hashes: &[[u8; 20]], xor_cache_path: Option<&str>) -> Result<Self> {
+        let xor_filter = ShardedXorFilter::new_with_cache(target_hashes, xor_cache_path);
+        Self::new_with_filter_internal(xor_filter, target_hashes.len())
+    }
+    
+    /// Create scanner from iterator (avoids 980MB copy on cache hit)
+    /// 
+    /// MEMORY OPTIMIZATION:
+    /// - Cache hit: Iterator is never consumed, 0 bytes allocated
+    /// - Cache miss: Iterator collected once for filter build
+    pub fn new_with_iter<I>(iter: I, expected_count: usize, xor_cache_path: Option<&str>) -> Result<Self>
+    where
+        I: Iterator<Item = [u8; 20]>,
+    {
+        // Build filter from iterator (avoids 980MB copy on cache hit!)
+        let xor_filter = ShardedXorFilter::new_from_iter(iter, expected_count, xor_cache_path);
+        
+        // Create a dummy hash slice for compatibility with existing code
+        // The actual hashes are already in the filter
+        Self::new_with_filter_internal(xor_filter, expected_count)
+    }
+    
+    /// Internal constructor with pre-built filter
+    fn new_with_filter_internal(xor_filter: ShardedXorFilter, hash_count: usize) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| ScannerError::Gpu("No Metal GPU found".into()))?;
 
         println!("[GPU] Device: {}", device.name());
         
-        // Auto-detect optimal configuration for this GPU
         let config = GpuConfig::detect(&device);
         config.print_summary();
 
         let opts = CompileOptions::new();
 
-        // Load and combine shader files
         let shader_path = "src/secp256k1_scanner.metal";
         let base_shader = fs::read_to_string(shader_path)
             .map_err(|e| ScannerError::Gpu(format!(
@@ -557,7 +578,6 @@ impl OptimizedScanner {
                 shader_path, e
             )))?;
 
-        // Combine with feature-specific shaders (batch_size from config)
         let src = Self::combine_metal_shaders(&base_shader, config.batch_size)?;
 
         let lib = device.new_library_with_source(&src, &opts)
@@ -570,14 +590,6 @@ impl OptimizedScanner {
             .map_err(|e| ScannerError::Gpu(format!("pipeline: {}", e)))?;
 
         println!("[GPU] Pipeline: max_threads_per_threadgroup={}", pipeline.max_total_threads_per_threadgroup());
-
-        // Build Sharded Xor Filter with cache support
-        // ShardedXorFilter provides:
-        // - 4096 parallel shards for instant construction (no retries)
-        // - Auto-deduplication of targets
-        // - mmap cache with CRC32 integrity check (~10ms reload)
-        // - 32-bit fingerprints: <0.0015% false positive rate (1/65536)
-        let xor_filter = ShardedXorFilter::new_with_cache(target_hashes, xor_cache_path);
 
         // Use pre-computed wNAF table for keys_per_thread=128 (most common config)
         // lazy_static eliminates ~10ms initialization overhead
@@ -696,22 +708,22 @@ impl OptimizedScanner {
             storage,
         );
         
-        let hash_count = target_hashes.len() as u32;
+        let hash_count_u32 = hash_count as u32;
         let hash_count_buf = device.new_buffer_with_data(
-            &hash_count as *const u32 as *const _,
+            &hash_count_u32 as *const u32 as *const _,
             4,
             storage,
         );
 
-        // Memory stats (Xor Filter32 only)
-        let double_buf_mem = 2 * (8 + 16 + match_buffer_size * 52 + 4);  // philox_key + philox_counter + match_data + match_count
+        // Memory stats
+        let double_buf_mem = 2 * (8 + 16 + match_buffer_size * 52 + 4);
         let xor_mem = xor_filter.memory_bytes();
-        let shared_mem = 75 * 64 + xor_mem + 4 + 4;  // wnaf_table + xor filter + kpt + hash_count
+        let shared_mem = 75 * 64 + xor_mem + 4 + 4;
         let mem_mb = (double_buf_mem + shared_mem) as f64 / 1_000_000.0;
         
-        println!("[GPU] Double buffering enabled for async pipelining");
+        println!("[GPU] Triple buffering enabled for async pipelining");
         let filter_mem = xor_filter.memory_bytes();
-        let bits_per_elem = (filter_mem * 8) as f64 / target_hashes.len() as f64;
+        let bits_per_elem = (filter_mem * 8) as f64 / hash_count as f64;
         println!("[GPU] Sharded Xor Filter: {:.1} MB ({:.2} bits/element), FP rate <0.0015%",
             filter_mem as f64 / 1_000_000.0,
             bits_per_elem);
