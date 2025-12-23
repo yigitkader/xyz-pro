@@ -122,30 +122,21 @@ fn try_sysctl_temperature() -> Option<f32> {
 /// Estimate temperature from performance metrics
 /// Used as fallback when hardware reading is unavailable
 /// 
-/// CRITICAL FIX: Performance-based estimation was causing a CIRCULAR DEPENDENCY:
-/// PID throttles → batch slows → estimator thinks "hot" → more throttling → slower → "hotter"
-/// 
-/// NEW APPROACH: 
-/// - Return a FIXED CONSERVATIVE temperature (75°C) when hardware reading unavailable
-/// - This keeps PID at 100% speed (no throttling)
-/// - Apple Silicon has excellent built-in thermal management - it will throttle itself
-/// - The PID controller should only be used with REAL temperature sensors
-/// 
-/// The batch_duration/baseline parameters are IGNORED because they cause feedback loops.
+/// SAFETY MODE: Return 92°C (above 87°C target) to trigger PID throttling
+/// This ensures GPU runs at ~50% speed when we can't read actual temperature
+/// Apple Silicon has built-in thermal protection, but we add this as extra safety
 #[allow(unused_variables)]
 pub fn estimate_temperature_from_performance(_batch_duration_ms: u64, _baseline_ms: u64) -> f32 {
     use std::sync::atomic::{AtomicBool, Ordering};
     
-    // Only warn once about fallback mode
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("[PID] Hardware temperature unavailable - using safe fixed estimate (75°C)");
-        eprintln!("[PID] Apple Silicon thermal management will handle throttling if needed");
+        eprintln!("[PID] Hardware temperature unavailable - SAFETY MODE active (92°C estimate)");
+        eprintln!("[PID] GPU will run at reduced speed (~50%) for thermal safety");
     }
     
-    // Return fixed temperature that keeps PID at ~100% speed
-    // 75°C is well below the 87°C target, so PID won't throttle
-    // This effectively disables PID when hardware sensors aren't available
-    75.0
+    // Return 92°C (above 87°C target) to trigger PID throttling
+    // PID will reduce speed to ~50%, preventing thermal runaway
+    92.0
 }
 

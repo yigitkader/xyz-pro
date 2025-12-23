@@ -1,12 +1,117 @@
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::fs;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use crossbeam_channel::{Sender, Receiver, bounded};
 
 use crate::error::{Result, ScannerError};
 use crate::types::Hash160;
 use crate::rng::philox::{PhiloxCounter, PhiloxState, philox_to_privkey};
 use crate::filter::ShardedXorFilter;
+
+// ============================================================================
+// BUFFER POOL SYSTEM - Zero-copy ownership transfer
+// ============================================================================
+
+/// Pre-allocated buffer pool for zero-allocation batch processing
+/// 
+/// ARCHITECTURE:
+///   GPU fills buffer → ownership transfer to CPU → CPU processes → auto-return to pool
+/// 
+/// MEMORY GUARANTEE:
+///   - Fixed pool size (POOL_SIZE buffers)
+///   - No allocation after initialization
+///   - Automatic return via Drop trait
+pub struct BufferPool {
+    return_tx: Sender<Vec<PotentialMatch>>,
+    pool_rx: Receiver<Vec<PotentialMatch>>,
+}
+
+const POOL_SIZE: usize = 16;  // Enough for triple buffering + pipeline depth
+
+impl BufferPool {
+    pub fn new(buffer_capacity: usize) -> Self {
+        let (return_tx, pool_rx) = bounded(POOL_SIZE);
+        
+        // Pre-allocate all buffers
+        for _ in 0..POOL_SIZE {
+            let buf = Vec::with_capacity(buffer_capacity);
+            let _ = return_tx.try_send(buf);
+        }
+        
+        BufferPool { return_tx, pool_rx }
+    }
+    
+    /// Get a buffer from pool (blocks if empty, waits for return)
+    pub fn acquire(&self) -> Vec<PotentialMatch> {
+        self.pool_rx.recv().unwrap_or_else(|_| Vec::new())
+    }
+    
+    /// Create a PooledBuffer that auto-returns on drop
+    pub fn wrap(&self, mut buf: Vec<PotentialMatch>) -> PooledBuffer {
+        buf.clear();
+        PooledBuffer {
+            inner: Some(buf),
+            return_tx: self.return_tx.clone(),
+        }
+    }
+}
+
+/// Smart pointer wrapper that returns buffer to pool on drop
+/// 
+/// ZERO-COPY GUARANTEE:
+///   - No allocation on access
+///   - No copy on transfer
+///   - Automatic pool return on drop
+pub struct PooledBuffer {
+    inner: Option<Vec<PotentialMatch>>,
+    return_tx: Sender<Vec<PotentialMatch>>,
+}
+
+impl PooledBuffer {
+    /// Take ownership of inner Vec (for direct use)
+    /// Buffer will NOT return to pool after this
+    #[allow(dead_code)]
+    pub fn take(mut self) -> Vec<PotentialMatch> {
+        self.inner.take().unwrap_or_default()
+    }
+    
+    /// Get mutable access for filling
+    pub fn as_mut(&mut self) -> &mut Vec<PotentialMatch> {
+        self.inner.as_mut().unwrap()
+    }
+    
+    pub fn len(&self) -> usize {
+        self.inner.as_ref().map(|v| v.len()).unwrap_or(0)
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Deref for PooledBuffer {
+    type Target = [PotentialMatch];
+    
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(mut buf) = self.inner.take() {
+            buf.clear();  // Clear data but keep capacity
+            let _ = self.return_tx.try_send(buf);  // Return to pool
+        }
+    }
+}
+
+// Implement Send + Sync for cross-thread transfer
+unsafe impl Send for PooledBuffer {}
+unsafe impl Sync for PooledBuffer {}
 
 // BATCH_SIZE = 16 must match secp256k1_scanner.metal
 
@@ -171,9 +276,9 @@ pub struct OptimizedScanner {
     total_scanned: AtomicU64,
     total_matches: AtomicU64,
     philox_counter: PhiloxCounter,
-    match_vecs: [std::cell::UnsafeCell<Vec<PotentialMatch>>; 3],
+    buffer_pool: Arc<BufferPool>,  // Zero-allocation buffer pool
     lookahead_pubkey: std::cell::UnsafeCell<Option<(Vec<u8>, Vec<u8>)>>,
-    last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,  // Cached for dispatch_batch
+    last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,14 +637,11 @@ impl OptimizedScanner {
             PhiloxCounter::new(seed)
         };
 
-        // ZERO-COPY: Pre-allocate match buffers to eliminate allocation churn
-        // Size each for worst-case (match_buffer_size) to avoid any resizing
-        // 3 buffers for triple buffering pipeline
-        let match_vecs = [
-            std::cell::UnsafeCell::new(Vec::with_capacity(match_buffer_size)),
-            std::cell::UnsafeCell::new(Vec::with_capacity(match_buffer_size)),
-            std::cell::UnsafeCell::new(Vec::with_capacity(match_buffer_size)),
-        ];
+        // BUFFER POOL: Pre-allocated buffers with automatic return
+        // Zero allocation after init, zero copy on transfer
+        let buffer_pool = Arc::new(BufferPool::new(match_buffer_size));
+        println!("[GPU] Buffer pool: {} pre-allocated buffers ({:.1} MB total)",
+            POOL_SIZE, (POOL_SIZE * match_buffer_size * std::mem::size_of::<PotentialMatch>()) as f64 / 1_000_000.0);
         
         Ok(Self {
             pipeline,
@@ -557,7 +659,7 @@ impl OptimizedScanner {
             total_scanned: AtomicU64::new(0),
             total_matches: AtomicU64::new(0),
             philox_counter,
-            match_vecs,
+            buffer_pool,
             lookahead_pubkey: std::cell::UnsafeCell::new(None),
             last_philox_state: std::cell::UnsafeCell::new(None),
         })
@@ -600,12 +702,12 @@ impl OptimizedScanner {
         
         // CRITICAL FIX: Use cached state from next_base_key() instead of calling next_batch() again!
         // Double next_batch() calls caused GPU/CPU state mismatch → 0 FP bug!
-        let (state, used_cached) = unsafe {
+        let state = unsafe {
             match (*self.last_philox_state.get()).take() {
-                Some(s) => (s, true),
+                Some(s) => s,
                 None => {
                     // Fallback for scan_batch() direct calls (tests, etc.)
-                    (self.philox_counter.next_batch(batch_size), false)
+                    self.philox_counter.next_batch(batch_size)
                 }
             }
         };
@@ -707,14 +809,13 @@ impl OptimizedScanner {
         Ok(())
     }
     
-    fn wait_and_collect(&self, buf_idx: usize) -> Result<Vec<PotentialMatch>> {
+    fn wait_and_collect(&self, buf_idx: usize) -> Result<PooledBuffer> {
         let buffers = &self.buffer_sets[buf_idx];
         
         // GPU SYNCHRONIZATION:
         // Metal command buffers on the same queue execute in FIFO order.
         // By committing an empty command buffer and waiting for it,
         // we guarantee all previously committed commands are complete.
-        // This is the standard Metal pattern for CPU-GPU synchronization.
         let sync_cmd = buffers.queue.new_command_buffer();
         sync_cmd.commit();
         sync_cmd.wait_until_completed();
@@ -727,108 +828,59 @@ impl OptimizedScanner {
         let match_buffer_size = self.config.match_buffer_size;
         if raw_match_count as usize > match_buffer_size {
             return Err(ScannerError::Gpu(format!(
-                "CRITICAL: Match buffer overflow! {} matches found, buffer size {}. \
-                 {} potential matches were lost. GPU config may need adjustment.",
-                raw_match_count, match_buffer_size, raw_match_count as usize - match_buffer_size
+                "CRITICAL: Match buffer overflow! {} > {}",
+                raw_match_count, match_buffer_size
             )));
         }
         
         let match_count = raw_match_count as usize;
-
         let keys_scanned = self.config.keys_per_batch();
         self.total_scanned.fetch_add(keys_scanned, Ordering::Relaxed);
 
-        // ZERO-COPY OPTIMIZATION: Reuse pre-allocated buffer
-        // Get mutable reference to pre-allocated Vec (safe because buffers alternate)
-        let matches = unsafe { &mut *self.match_vecs[buf_idx].get() };
-        matches.clear();  // Clear previous contents
-        
-        // Re-reserve capacity if needed (after previous take())
-        // This amortizes allocation cost - once per batch pair instead of every batch
-        if matches.capacity() < self.config.match_buffer_size {
-            matches.reserve(self.config.match_buffer_size);
-        }
+        // BUFFER POOL: Acquire pre-allocated buffer (zero allocation)
+        let mut pooled = self.buffer_pool.wrap(self.buffer_pool.acquire());
+        let matches = pooled.as_mut();
         
         if match_count > 0 {
             self.total_matches.fetch_add(match_count as u64, Ordering::Relaxed);
-            #[cfg(feature = "zero-copy")]
-            {
-                // ZERO-COPY: Direct read from unified memory (no explicit copy)
-                // GPU writes directly to shared memory, CPU reads from same location
-                unsafe {
-                    let data_ptr = buffers.match_data_buf.contents() as *const u8;
-                    for i in 0..match_count {
-                        let offset = i * 52;
-                        let entry_ptr = data_ptr.add(offset);
-                        
-                        // Direct read (no copy) - unified memory handles synchronization
-                        let key_index = u32::from_le_bytes([
-                            *entry_ptr,
-                            *entry_ptr.add(1),
-                            *entry_ptr.add(2),
-                            *entry_ptr.add(3),
-                        ]);
-                        
-                        let type_byte = *entry_ptr.add(4);
-                        let match_type = match MatchType::from_u8(type_byte) {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        
-                        // Direct read of hash (20 bytes)
-                        let hash_bytes = std::slice::from_raw_parts(entry_ptr.add(32), 20);
-                        let hash_array: [u8; 20] = hash_bytes.try_into().unwrap_or([0; 20]);
-                        
-                        matches.push(PotentialMatch {
-                            key_index,
-                            match_type,
-                            hash: Hash160::from_slice(&hash_array),
-                        });
-                    }
-                }
-            }
-            #[cfg(not(feature = "zero-copy"))]
-            {
-                // Fallback: explicit copy for non-zero-copy mode
-                unsafe {
-                    let ptr = buffers.match_data_buf.contents() as *const u8;
-                    for i in 0..match_count {
-                        let off = i * 52;
-                        let mut key_bytes = [0u8; 4];
-                        std::ptr::copy_nonoverlapping(ptr.add(off), key_bytes.as_mut_ptr(), 4);
-                        
-                        let type_byte = *ptr.add(off + 4);
-                        let match_type = match MatchType::from_u8(type_byte) {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        
-                        let mut hash_bytes = [0u8; 20];
-                        std::ptr::copy_nonoverlapping(ptr.add(off + 32), hash_bytes.as_mut_ptr(), 20);
-                        
-                        matches.push(PotentialMatch {
-                            key_index: u32::from_le_bytes(key_bytes),
-                            match_type,
-                            hash: Hash160::from_slice(&hash_bytes),
-                        });
-                    }
+            
+            // Direct read from unified memory into pooled buffer
+            unsafe {
+                let data_ptr = buffers.match_data_buf.contents() as *const u8;
+                for i in 0..match_count {
+                    let off = i * 52;
+                    let entry_ptr = data_ptr.add(off);
+                    
+                    let key_index = u32::from_le_bytes([
+                        *entry_ptr,
+                        *entry_ptr.add(1),
+                        *entry_ptr.add(2),
+                        *entry_ptr.add(3),
+                    ]);
+                    
+                    let type_byte = *entry_ptr.add(4);
+                    let match_type = match MatchType::from_u8(type_byte) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    
+                    let hash_bytes = std::slice::from_raw_parts(entry_ptr.add(32), 20);
+                    let hash_array: [u8; 20] = hash_bytes.try_into().unwrap_or([0; 20]);
+                    
+                    matches.push(PotentialMatch {
+                        key_index,
+                        match_type,
+                        hash: Hash160::from_slice(&hash_array),
+                    });
                 }
             }
         }
 
-        // BUFFER POOL: Get a buffer from pool, copy matches into it, return
-        // FIXED: Don't use pool - it causes memory leak because Vec is never returned!
-        // Each batch creates ~26MB (512K * 52 bytes) that accumulates.
-        // Simple solution: just clone the data and let Rust handle deallocation.
-        let result: Vec<PotentialMatch> = matches.iter().cloned().collect();
-        
-        // Clear the internal buffer (keeps capacity for next batch)
-        matches.clear();
-        
-        Ok(result)
+        // Return PooledBuffer - auto-returns to pool on drop
+        Ok(pooled)
     }
     
-    pub fn scan_batch(&self, base_key: &[u8; 32]) -> Result<Vec<PotentialMatch>> {
+    pub fn scan_batch(&self, base_key: &[u8; 32]) -> Result<PooledBuffer> {
         // Rotate through 3 buffers for triple buffering
         let buf_idx = self.current_buffer.fetch_add(1, Ordering::Relaxed) % 3;
         self.dispatch_batch(base_key, buf_idx)?;
@@ -851,10 +903,13 @@ impl OptimizedScanner {
     /// CRITICAL: The callback receives PhiloxState so CPU can reconstruct
     /// exact private keys using Philox(base_state + key_index).
     /// Previous bug: CPU used base_key + offset which is WRONG!
+    /// 
+    /// BUFFER POOL: Callback receives PooledBuffer which auto-returns to pool on drop.
+    /// Zero allocation, zero copy - just ownership transfer.
     pub fn scan_pipelined<F, G>(&self, mut key_gen: F, mut on_batch: G, shutdown: &std::sync::atomic::AtomicBool) -> Result<()>
     where
-        F: FnMut() -> ([u8; 32], PhiloxState),  // Returns both key and state
-        G: FnMut([u8; 32], PhiloxState, Vec<PotentialMatch>),  // Callback gets state too
+        F: FnMut() -> ([u8; 32], PhiloxState),
+        G: FnMut([u8; 32], PhiloxState, PooledBuffer),
     {
         let mut batch_queue: std::collections::VecDeque<([u8; 32], PhiloxState, usize)> = std::collections::VecDeque::with_capacity(2);
         let mut current_buf = 0usize;

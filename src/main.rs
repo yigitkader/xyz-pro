@@ -18,7 +18,7 @@ mod math;
 #[cfg(feature = "pid-thermal")]
 mod thermal;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 use std::io::{stdout, Write};
@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use address::to_wif_compressed;
-use gpu::{MatchType, OptimizedScanner, PotentialMatch};
+use gpu::{MatchType, OptimizedScanner, PotentialMatch, PooledBuffer};
 use startup_tests::{run_self_test, run_gpu_correctness_test, run_gpu_pipeline_test};
 #[cfg(feature = "philox-rng")]
 use startup_tests::run_startup_verification;
@@ -39,7 +39,7 @@ use rng::philox::{PhiloxState, philox_to_privkey};
 const TARGETS_FILE: &str = "targets.json";
 const PIPELINE_DEPTH: usize = 8;
 
-type VerifyBatch = ([u8; 32], PhiloxState, Vec<PotentialMatch>);
+type VerifyBatch = ([u8; 32], PhiloxState, PooledBuffer);
 
 #[cfg(target_os = "macos")]
 fn check_memory_pressure() -> f32 {
@@ -154,7 +154,7 @@ fn main() {
 
     let hashes = targets.get_all_hashes();
     let xor_cache = TARGETS_FILE.replace(".json", ".shxor");
-    
+
     let gpu = match OptimizedScanner::new_with_cache(&hashes, Some(&xor_cache)) {
         Ok(g) => Arc::new(g),
         Err(e) => {
@@ -164,19 +164,19 @@ fn main() {
     };
 
     if !fast_start {
-        if !run_gpu_correctness_test(&gpu, &targets) {
+    if !run_gpu_correctness_test(&gpu, &targets) {
             eprintln!("[FATAL] GPU correctness test failed.");
-            std::process::exit(1);
-        }
-        if !run_gpu_pipeline_test(&gpu) {
+        std::process::exit(1);
+    }
+    if !run_gpu_pipeline_test(&gpu) {
             eprintln!("[FATAL] GPU pipeline test failed.");
-            std::process::exit(1);
-        }
-        #[cfg(feature = "philox-rng")]
-        if !run_startup_verification(&gpu) {
+        std::process::exit(1);
+    }
+    #[cfg(feature = "philox-rng")]
+            if !run_startup_verification(&gpu) {
             eprintln!("[FATAL] Startup verification failed.");
             std::process::exit(1);
-        }
+    }
     } else {
         print!("[⚡] Quick GPU check... ");
         stdout().flush().ok();
@@ -187,7 +187,7 @@ fn main() {
             Err(e) => {
                 println!("FAILED");
                 eprintln!("[FATAL] GPU: {}", e);
-                std::process::exit(1);
+            std::process::exit(1);
             }
         }
     }
@@ -478,31 +478,33 @@ fn flush_logger() {
 }
 
 fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
-    let (tx, rx) = unbounded::<ReportEntry>();
+    // SAFETY: Bounded channel prevents RAM explosion if matches flood in
+    // 1000 entries max = ~100KB buffer, provides backpressure
+    let (tx, rx) = bounded::<ReportEntry>(1000);
     
     thread::Builder::new()
         .name("logger".to_string())
         .spawn(move || {
-            use chrono::Local;
-            use std::fs::OpenOptions;
-            
+    use chrono::Local;
+    use std::fs::OpenOptions;
+
             let mut file = OpenOptions::new().create(true).append(true).open("found.txt").ok();
             
             for entry in rx {
                 let hex = hex::encode(&entry.privkey);
                 let wif = to_wif_compressed(&entry.privkey, entry.compressed);
                 let key_type = if entry.compressed { "compressed" } else { "uncompressed" };
-                let time = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let time = Local::now().format("%Y-%m-%d %H:%M:%S");
 
-                println!("\n\n\x1b[1;32m");
-                println!("╔═══════════════════════════════════════════════════════╗");
-                println!("║                   🎉 KEY FOUND! 🎉                     ║");
-                println!("╠═══════════════════════════════════════════════════════╣");
+    println!("\n\n\x1b[1;32m");
+    println!("╔═══════════════════════════════════════════════════════╗");
+    println!("║                   🎉 KEY FOUND! 🎉                     ║");
+    println!("╠═══════════════════════════════════════════════════════╣");
                 println!("║ Address: {} ({})", entry.addr, entry.atype.as_str());
-                println!("║ Key: {} ({})", hex, key_type);
-                println!("║ WIF: {}", wif);
-                println!("╚═══════════════════════════════════════════════════════╝");
-                println!("\x1b[0m");
+    println!("║ Key: {} ({})", hex, key_type);
+    println!("║ WIF: {}", wif);
+    println!("╚═══════════════════════════════════════════════════════╝");
+    println!("\x1b[0m");
 
                 if let Some(ref mut f) = file {
                     let _ = writeln!(f, "[{}] {} | {} | {} | {} | {}", 
