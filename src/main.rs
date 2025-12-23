@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use address::to_wif_compressed;
 use gpu::{MatchType, OptimizedScanner, PotentialMatch, PooledBuffer};
-use startup_tests::{run_self_test, run_gpu_correctness_test, run_gpu_pipeline_test};
+use startup_tests::{run_self_test, run_gpu_correctness_test, run_gpu_pipeline_test, run_end_to_end_match_test};
 #[cfg(feature = "philox-rng")]
 use startup_tests::run_startup_verification;
 use targets::TargetDatabase;
@@ -176,6 +176,12 @@ fn main() {
             eprintln!("[FATAL] Startup verification failed.");
             std::process::exit(1);
     }
+    
+    // END-TO-END MATCH TEST: Verify we can find a known private key
+        if !run_end_to_end_match_test(&gpu, &targets) {
+            eprintln!("[FATAL] End-to-end match test failed.");
+            std::process::exit(1);
+        }
     } else {
         print!("[⚡] Quick GPU check... ");
         stdout().flush().ok();

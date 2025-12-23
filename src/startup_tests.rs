@@ -8,6 +8,7 @@ use crate::crypto;
 use crate::gpu::{self, OptimizedScanner, MatchType, PotentialMatch};
 use crate::targets::TargetDatabase;
 use crate::types;
+use hex;
 #[cfg(feature = "philox-rng")]
 use crate::rng::philox::PhiloxState;
 
@@ -638,4 +639,134 @@ pub fn run_startup_verification(scanner: &OptimizedScanner) -> bool {
         eprintln!("[✗] STARTUP VERIFICATION FAILED!\n");
     }
     all_passed
+}
+
+/// END-TO-END MATCH VERIFICATION TEST
+/// 
+/// This is the ULTIMATE test: Can we find a known private key?
+/// 
+/// Test scenario:
+///   1. We know private key 1 (0x01) corresponds to address 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH
+///   2. Load a targets file containing this address
+///   3. Scan starting from key 1 using GPU
+///   4. Verify that we find a match AND recover the correct private key
+/// 
+/// If this test passes, the entire pipeline is working correctly:
+///   GPU key generation → GPU hash160 → XorFilter → CPU verification → Key recovery
+pub fn run_end_to_end_match_test(scanner: &OptimizedScanner, targets: &TargetDatabase) -> bool {
+    println!("[🎯] Running END-TO-END match test...");
+    println!("     This verifies: GPU finds match → CPU recovers correct private key");
+    
+    let start = Instant::now();
+    
+    // Step 1: Check if key 1's address is in targets
+    let key1_hash = types::Hash160::from_slice(&EXPECTED_HASH_KEY1);
+    let in_targets = targets.check_direct(&key1_hash).is_some();
+    
+    print!("  [1/4] Target check (key 1 in database)... ");
+    stdout().flush().ok();
+    if in_targets {
+        println!("YES ✓");
+    } else {
+        println!("NO - skipping match test");
+        println!("      To enable: add '1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH' to targets.json");
+        return true; // Not a failure, just skip
+    }
+    
+    // Step 2: Scan from key 1 using GPU
+    print!("  [2/4] GPU scan from key 1... ");
+    stdout().flush().ok();
+    
+    let matches = match scanner.scan_batch(&TEST_KEY_1) {
+        Ok(m) => {
+            println!("done ({} candidates)", m.len());
+            m
+        }
+        Err(e) => {
+            println!("FAILED: {}", e);
+            return false;
+        }
+    };
+    
+    // Step 3: Find the match for key 1 (offset 0)
+    print!("  [3/4] Finding key 1 match... ");
+    stdout().flush().ok();
+    
+    let key1_match = matches.iter().find(|m| {
+        m.key_index == 0 && m.hash == key1_hash
+    });
+    
+    if key1_match.is_none() {
+        // Maybe it's in another batch position, search by hash
+        let any_key1 = matches.iter().find(|m| m.hash == key1_hash);
+        if let Some(m) = any_key1 {
+            println!("found at offset {} (type: {:?})", m.key_index, m.match_type);
+        } else {
+            println!("NOT FOUND in {} candidates", matches.len());
+            println!("      [DEBUG] Expected hash: {}", hex::encode(EXPECTED_HASH_KEY1));
+            println!("      [DEBUG] This may indicate XorFilter or hash160 mismatch");
+            return false;
+        }
+    } else {
+        println!("found at offset 0 ✓");
+    }
+    
+    // Step 4: Verify we can recover the correct private key
+    print!("  [4/4] Verifying key recovery... ");
+    stdout().flush().ok();
+    
+    // Find any match with key1's hash and try to recover
+    let recoverable_match = matches.iter().find(|m| m.hash == key1_hash);
+    
+    if let Some(m) = recoverable_match {
+        // Recover the private key
+        let recovered_key = add_offset_to_key(&TEST_KEY_1, m.key_index);
+        
+        // For GLV matches, apply lambda transform
+        let actual_key = if m.match_type.is_glv() {
+            gpu::glv_transform_key(&recovered_key)
+        } else {
+            recovered_key
+        };
+        
+        // Verify hash matches
+        if let Some(computed_hash) = compute_hash_for_match(&actual_key, m.match_type) {
+            if computed_hash == *m.hash.as_bytes() {
+                // Check if this is actually key 1 (or GLV equivalent)
+                let is_key1 = actual_key == TEST_KEY_1 || 
+                    gpu::glv_transform_key(&actual_key) == TEST_KEY_1 ||
+                    gpu::glv_transform_key(&gpu::glv_transform_key(&actual_key)) == TEST_KEY_1;
+                
+                if m.key_index == 0 && !m.match_type.is_glv() {
+                    // Direct match at offset 0, should be exactly key 1
+                    if actual_key == TEST_KEY_1 {
+                        println!("SUCCESS! ✓");
+                        println!("      Recovered: {}", hex::encode(&actual_key));
+                        println!("      Expected:  {}", hex::encode(&TEST_KEY_1));
+                        println!("\n[✓] END-TO-END test PASSED ({:.2}s)\n", start.elapsed().as_secs_f64());
+                        return true;
+                    }
+                }
+                
+                // Check GLV equivalence
+                if is_key1 {
+                    println!("SUCCESS (GLV equivalent)! ✓");
+                    println!("      Recovered: {} (GLV)", hex::encode(&actual_key));
+                    println!("\n[✓] END-TO-END test PASSED ({:.2}s)\n", start.elapsed().as_secs_f64());
+                    return true;
+                }
+                
+                println!("HASH MATCH but key mismatch");
+                println!("      Recovered: {}", hex::encode(&actual_key));
+                println!("      Expected:  {}", hex::encode(&TEST_KEY_1));
+                return false;
+            }
+        }
+        
+        println!("FAILED - hash verification failed");
+        return false;
+    }
+    
+    println!("FAILED - no recoverable match found");
+    false
 }
