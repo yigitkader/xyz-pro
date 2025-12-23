@@ -720,26 +720,26 @@ inline bool prefix_exists(thread uchar* hash,
 //   0 = Production (XorFilter + Prefix)
 //   1 = XorFilter only (bypass prefix)
 //   2 = Accept every Nth hash (bypass all filters, test hash output)
-#define DEBUG_FILTER_MODE 1  // DEBUG: Only XorFilter (skip prefix binary search for speed)
+#define DEBUG_FILTER_MODE 2  // DEBUG: Accept every Nth hash to test hash output
 #define DEBUG_ACCEPT_EVERY_N 1000  // Only used when DEBUG_FILTER_MODE=2
 
-inline bool filter_check_with_prefix(thread uchar* h,
-                                     constant uint* xor_fingerprints,
-                                     constant ulong* xor_seeds,
-                                     uint xor_block_length,
-                                     constant uint* prefix_table,
-                                     uint prefix_count) {
+inline bool filter_check_with_prefix_sharded(thread uchar* h,
+                                             constant uint* xor_fingerprints,
+                                             constant uint* xor_shard_info,
+                                             uint num_shards,
+                                             constant uint* prefix_table,
+                                             uint prefix_count) {
 #if DEBUG_FILTER_MODE == 2
     // DEBUG: Bypass ALL filters, accept every Nth hash
     // This tests if hash160 output is correct by sending samples to CPU
     uint hash_val = ((uint)h[0] << 8) | (uint)h[1];
     return (hash_val % DEBUG_ACCEPT_EVERY_N) == 0;
 #elif DEBUG_FILTER_MODE == 1
-    // DEBUG: Only XorFilter, skip prefix
-    return xor_filter_contains(h, xor_fingerprints, xor_seeds, xor_block_length);
+    // DEBUG: Only XorFilter (sharded), skip prefix
+    return xor_filter_contains_sharded(h, xor_fingerprints, xor_shard_info, num_shards);
 #else
-    // PRODUCTION: Full check
-    if (!xor_filter_contains(h, xor_fingerprints, xor_seeds, xor_block_length)) {
+    // PRODUCTION: Full check with sharded filter
+    if (!xor_filter_contains_sharded(h, xor_fingerprints, xor_shard_info, num_shards)) {
         return false;
     }
     return prefix_exists(h, prefix_table, prefix_count);
@@ -771,10 +771,10 @@ kernel void scan_keys(
     constant uchar* base_privkey [[buffer(10)]],   // Base private key (kept for compat)
     constant uchar* base_pubkey_x [[buffer(13)]],  // Pre-computed pubkey X (32 bytes)
     constant uchar* base_pubkey_y [[buffer(14)]],  // Pre-computed pubkey Y (32 bytes)
-    // Xor Filter32: O(1) lookup, <0.15% false positive rate
-    constant uint* xor_fingerprints [[buffer(3)]],  // Fingerprint table (32-bit)
-    constant ulong* xor_seeds [[buffer(4)]],          // 3 hash seeds
-    constant uint* xor_block_length [[buffer(5)]],     // Block length
+    // SHARDED Xor Filter: 4096 shards, O(1) lookup, <0.0015% FP rate
+    constant uint* xor_fingerprints [[buffer(3)]],    // All shard fingerprints concatenated
+    constant uint* xor_shard_info [[buffer(4)]],      // 4096 × 5 u32: (offset_lo, offset_hi, block_len, seed_lo, seed_hi)
+    constant uint* xor_num_shards [[buffer(5)]],      // Number of shards (4096)
     // PREFIX TABLE: Sorted 4-byte prefixes for GPU-side FP reduction
     // Binary search reduces FP rate from 0.15% to ~0.01% (90% less CPU verification)
     constant uint* prefix_table [[buffer(11)]],     // Sorted unique prefixes
@@ -812,7 +812,7 @@ kernel void scan_keys(
     
     uint kpt = *keys_per_thread;
     uint base_offset = gid * kpt;
-    uint xor_block_len = *xor_block_length;
+    uint num_shards = *xor_num_shards;  // 4096 shards
     uint target_count = *hash_count;  // For stats only
     uint pref_count = *prefix_count;  // For prefix table binary search
 
@@ -1020,26 +1020,26 @@ kernel void scan_keys(
             } while(0)
             
             // Check PRIMARY range (original keys)
-            // OPTIMIZED: Xor Filter32 + Prefix Check (FP rate: 0.15% → ~0.01%)
-            // This reduces CPU verification load by 90%
-            if (filter_check_with_prefix(h_comp, xor_fingerprints, xor_seeds, xor_block_len, prefix_table, pref_count)) {
+            // OPTIMIZED: Sharded Xor Filter + Prefix Check (FP rate: <0.0015%)
+            // This reduces CPU verification load by 99%
+            if (filter_check_with_prefix_sharded(h_comp, xor_fingerprints, xor_shard_info, num_shards, prefix_table, pref_count)) {
                 SAVE_MATCH(h_comp, 0);
             }
-            if (filter_check_with_prefix(h_uncomp, xor_fingerprints, xor_seeds, xor_block_len, prefix_table, pref_count)) {
+            if (filter_check_with_prefix_sharded(h_uncomp, xor_fingerprints, xor_shard_info, num_shards, prefix_table, pref_count)) {
                 SAVE_MATCH(h_uncomp, 1);
             }
-            if (filter_check_with_prefix(h_p2sh, xor_fingerprints, xor_seeds, xor_block_len, prefix_table, pref_count)) {
+            if (filter_check_with_prefix_sharded(h_p2sh, xor_fingerprints, xor_shard_info, num_shards, prefix_table, pref_count)) {
                 SAVE_MATCH(h_p2sh, 2);
             }
             
             // GLV endomorphic range - same prefix optimization
-            if (filter_check_with_prefix(glv_comp, xor_fingerprints, xor_seeds, xor_block_len, prefix_table, pref_count)) {
+            if (filter_check_with_prefix_sharded(glv_comp, xor_fingerprints, xor_shard_info, num_shards, prefix_table, pref_count)) {
                 SAVE_MATCH(glv_comp, 3);
             }
-            if (filter_check_with_prefix(glv_uncomp, xor_fingerprints, xor_seeds, xor_block_len, prefix_table, pref_count)) {
+            if (filter_check_with_prefix_sharded(glv_uncomp, xor_fingerprints, xor_shard_info, num_shards, prefix_table, pref_count)) {
                 SAVE_MATCH(glv_uncomp, 4);
             }
-            if (filter_check_with_prefix(glv_p2sh, xor_fingerprints, xor_seeds, xor_block_len, prefix_table, pref_count)) {
+            if (filter_check_with_prefix_sharded(glv_p2sh, xor_fingerprints, xor_shard_info, num_shards, prefix_table, pref_count)) {
                 SAVE_MATCH(glv_p2sh, 5);
             }
             

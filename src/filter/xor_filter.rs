@@ -55,7 +55,17 @@ impl XorFilter32 {
     
     /// Build filter from targets (no cache)
     fn build_new(targets: &[[u8; 20]]) -> Self {
-        let size = targets.len();
+        // Step 0: Deduplicate targets (required for XOR filter construction)
+        let mut unique_targets = targets.to_vec();
+        unique_targets.par_sort_unstable();
+        unique_targets.dedup();
+        
+        if unique_targets.len() < targets.len() {
+            println!("[Xor] Removed {} duplicate targets ({} → {})", 
+                targets.len() - unique_targets.len(), targets.len(), unique_targets.len());
+        }
+        
+        let size = unique_targets.len();
         // 1.5x capacity for reliable construction with large datasets (49M+ targets)
         // 1.23 is theoretical minimum, 1.35 causes retries on 49M targets
         // 1.5x ensures single-attempt success while only adding ~15% more memory
@@ -73,7 +83,7 @@ impl XorFilter32 {
         
         for attempt in 0..50 {
             fingerprints.fill(0);
-            if Self::construct_optimized(targets, &mut fingerprints, block_length, seed) {
+            if Self::construct_optimized(&unique_targets, &mut fingerprints, block_length, seed) {
                 success = true;
                 println!("[Xor] Construction succeeded on attempt {} in {:.2}s", 
                     attempt + 1, start.elapsed().as_secs_f64());
@@ -90,7 +100,7 @@ impl XorFilter32 {
         }
         
         // Build sorted prefix table (parallel)
-        let mut prefixes: Vec<u32> = targets.par_iter()
+        let mut prefixes: Vec<u32> = unique_targets.par_iter()
             .map(|h| u32::from_be_bytes([h[0], h[1], h[2], h[3]]))
             .collect();
         prefixes.par_sort_unstable();

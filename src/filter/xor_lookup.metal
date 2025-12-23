@@ -173,7 +173,7 @@ inline uint xor_fingerprint(thread uchar* hash) {
     return (uint)(h >> 32);
 }
 
-/// O(1) Xor Filter membership test
+/// O(1) Xor Filter membership test (legacy single-filter mode)
 inline bool xor_filter_contains(
     thread uchar* hash,
     constant uint* fingerprints,
@@ -187,6 +187,73 @@ inline bool xor_filter_contains(
     uint h2 = xor_hash_to_block(hash, seeds, block_length, 2);
     
     uint xor_val = fingerprints[h0] ^ fingerprints[h1] ^ fingerprints[h2];
+    
+    return xor_val == fp;
+}
+
+// ============================================================================
+// SHARDED XOR FILTER (4096 shards)
+// 
+// Each shard has its own seed and block_length.
+// Shard ID = (hash[0] << 4) | (hash[1] >> 4)  (12-bit = 4096 shards)
+// 
+// Memory layout:
+// - shard_info: 4096 entries × (offset:u32, block_len:u32, seed:u64) = 16 bytes each
+// - fingerprints: all shard fingerprints concatenated
+// ============================================================================
+
+/// Sharded Xor Filter lookup
+/// shard_info format: [offset_low, offset_high_and_block_len, seed_low, seed_high] per shard
+/// Actually: [offset:u64, block_len:u32, seed:u64] = 20 bytes per shard
+inline bool xor_filter_contains_sharded(
+    thread uchar* hash,
+    constant uint* fingerprints,
+    constant uint* shard_info,  // 4096 shards × 5 u32 = 20480 u32s
+    uint num_shards             // 4096
+) {
+    // Calculate shard ID from first 12 bits of hash
+    uint shard_id = ((uint)hash[0] << 4) | ((uint)hash[1] >> 4);
+    if (shard_id >= num_shards) shard_id = num_shards - 1;  // Safety
+    
+    // Read shard metadata (5 u32 per shard = 20 bytes)
+    uint base_idx = shard_id * 5;
+    uint offset_lo = shard_info[base_idx];
+    uint offset_hi = shard_info[base_idx + 1];
+    uint block_len = shard_info[base_idx + 2];
+    uint seed_lo = shard_info[base_idx + 3];
+    uint seed_hi = shard_info[base_idx + 4];
+    
+    ulong offset = ((ulong)offset_hi << 32) | (ulong)offset_lo;
+    ulong seed = ((ulong)seed_hi << 32) | (ulong)seed_lo;
+    
+    // Empty shard check
+    if (block_len == 0) return false;
+    
+    // Compute fingerprint
+    uint fp = xor_fingerprint(hash);
+    
+    // Compute 3 hash positions within this shard
+    // seeds[0] = seed, seeds[1] = seed ^ 0xc3a5c85c97cb3127
+    ulong seeds[3] = { seed, seed ^ 0xc3a5c85c97cb3127UL, 0 };
+    
+    // Hash to block positions (within shard)
+    ulong h = fx_hash_u64(seeds[0], 0);
+    h = fx_hash_bytes(hash, 20, h);
+    uint h0 = (uint)(h % (ulong)block_len);
+    
+    h = fx_hash_u64(seeds[1], 0);
+    h = fx_hash_bytes(hash, 20, h);
+    uint h1 = block_len + (uint)(h % (ulong)block_len);
+    
+    h = fx_hash_u64(seeds[2], 0);
+    h = fx_hash_bytes(hash, 20, h);
+    uint h2 = 2 * block_len + (uint)(h % (ulong)block_len);
+    
+    // Add shard offset to get global fingerprint index
+    uint shard_offset = (uint)offset;  // offset is in u32 units
+    uint xor_val = fingerprints[shard_offset + h0] ^ 
+                   fingerprints[shard_offset + h1] ^ 
+                   fingerprints[shard_offset + h2];
     
     return xor_val == fp;
 }

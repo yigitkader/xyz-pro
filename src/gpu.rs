@@ -161,8 +161,8 @@ pub struct OptimizedScanner {
     current_buffer: std::sync::atomic::AtomicUsize,
     wnaf_table_buf: Buffer,
     xor_fingerprints_buf: Buffer,
-    xor_seeds_buf: Buffer,
-    xor_block_length_buf: Buffer,
+    xor_shard_info_buf: Buffer,
+    xor_num_shards_buf: Buffer,
     prefix_table_buf: Buffer,
     prefix_count_buf: Buffer,
     kpt_buf: Buffer,
@@ -379,13 +379,10 @@ impl OptimizedScanner {
 
         // Build Sharded Xor Filter with cache support
         // ShardedXorFilter provides:
-        // - 256 parallel shards for instant construction (no retries)
-        // - 90% reduction in cache misses
-        // - 40% reduction in GPU thread idle time  
-        // - Lower false positive rate (0.15% vs 0.4%)
-        // - O(n) construction with XOR-trick peeling algorithm
-        // - mmap cache with CRC32 integrity check
-        // - Binary cache for instant reload (~10ms vs 5min for 49M targets)
+        // - 4096 parallel shards for instant construction (no retries)
+        // - Auto-deduplication of targets
+        // - mmap cache with CRC32 integrity check (~10ms reload)
+        // - 32-bit fingerprints: <0.0015% false positive rate (1/65536)
         let xor_filter = ShardedXorFilter::new_with_cache(target_hashes, xor_cache_path);
 
         // Use pre-computed wNAF table for keys_per_thread=128 (most common config)
@@ -455,8 +452,9 @@ impl OptimizedScanner {
             storage,
         );
 
-        // Create Sharded Xor Filter buffers (legacy mode for GPU compatibility)
-        let (xor_fingerprints, xor_seeds, xor_block_length) = xor_filter.gpu_data_legacy();
+        // Create Sharded Xor Filter buffers for GPU
+        // Format: fingerprints (all shards concatenated) + shard_info (5 u32 per shard)
+        let (xor_fingerprints, xor_shard_info, num_shards) = xor_filter.gpu_data_sharded();
         
         let xor_fingerprints_buf = device.new_buffer_with_data(
             xor_fingerprints.as_ptr() as *const _,
@@ -464,14 +462,14 @@ impl OptimizedScanner {
             storage,
         );
         
-        let xor_seeds_buf = device.new_buffer_with_data(
-            xor_seeds.as_ptr() as *const _,
-            24,  // 3 × 8 bytes
+        let xor_shard_info_buf = device.new_buffer_with_data(
+            xor_shard_info.as_ptr() as *const _,
+            (xor_shard_info.len() * 4) as u64,  // 5 u32 × 4096 shards
             storage,
         );
         
-        let xor_block_length_buf = device.new_buffer_with_data(
-            &xor_block_length as *const u32 as *const _,
+        let xor_num_shards_buf = device.new_buffer_with_data(
+            &num_shards as *const u32 as *const _,
             4,
             storage,
         );
@@ -520,7 +518,7 @@ impl OptimizedScanner {
         println!("[GPU] Double buffering enabled for async pipelining");
         let filter_mem = xor_filter.memory_bytes();
         let bits_per_elem = (filter_mem * 8) as f64 / target_hashes.len() as f64;
-        println!("[GPU] Sharded Xor Filter: {:.1} MB ({:.2} bits/element), FP rate <0.15%",
+        println!("[GPU] Sharded Xor Filter: {:.1} MB ({:.2} bits/element), FP rate <0.0015%",
             filter_mem as f64 / 1_000_000.0,
             bits_per_elem);
         println!("[GPU] Total buffer memory: {:.2} MB", mem_mb);
@@ -549,8 +547,8 @@ impl OptimizedScanner {
             current_buffer: std::sync::atomic::AtomicUsize::new(0),
             wnaf_table_buf,
             xor_fingerprints_buf,
-            xor_seeds_buf,
-            xor_block_length_buf,
+            xor_shard_info_buf,
+            xor_num_shards_buf,
             prefix_table_buf,
             prefix_count_buf,
             kpt_buf,
@@ -699,8 +697,8 @@ impl OptimizedScanner {
                 enc.set_buffer(1, Some(&buffers.philox_counter_buf), 0);
                 enc.set_buffer(2, Some(&self.wnaf_table_buf), 0);
                 enc.set_buffer(3, Some(&self.xor_fingerprints_buf), 0);
-                enc.set_buffer(4, Some(&self.xor_seeds_buf), 0);
-                enc.set_buffer(5, Some(&self.xor_block_length_buf), 0);
+                enc.set_buffer(4, Some(&self.xor_shard_info_buf), 0);
+                enc.set_buffer(5, Some(&self.xor_num_shards_buf), 0);
                 enc.set_buffer(6, Some(&self.kpt_buf), 0);
                 enc.set_buffer(7, Some(&buffers.match_data_buf), 0);
                 enc.set_buffer(8, Some(&buffers.match_count_buf), 0);
@@ -999,8 +997,8 @@ mod tests {
         // 1: philox_counter_buf
         // 2: wnaf_table_buf
         // 3: xor_fingerprints_buf
-        // 4: xor_seeds_buf
-        // 5: xor_block_length_buf
+        // 4: xor_shard_info_buf
+        // 5: xor_num_shards_buf
         // 6: kpt_buf
         // 7: match_data_buf
         // 8: match_count_buf

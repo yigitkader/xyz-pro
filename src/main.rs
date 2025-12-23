@@ -316,7 +316,7 @@ fn main() {
 
     // Init GPU with ShardedXorFilter cache support
     // Cache path derived from targets file: targets.json → targets.shxor
-    // Sharded filter: 256 parallel shards, mmap cache, CRC32 integrity
+    // ShardedXorFilter: 4096 shards, O(n) construction, auto-dedup, mmap cache
     let xor_cache_path = TARGETS_FILE.replace(".json", ".shxor");
     let gpu = match OptimizedScanner::new_with_cache(&hashes, Some(&xor_cache_path)) {
         Ok(g) => Arc::new(g),

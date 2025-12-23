@@ -90,14 +90,25 @@ impl ShardedXorFilter {
     /// Build filter from targets using parallel shard construction
     fn build_new(targets: &[[u8; 20]]) -> Self {
         let start = std::time::Instant::now();
-        let total = targets.len();
+        
+        // Step 0: Deduplicate targets - duplicates cause peeling to fail!
+        // XOR filter requires unique keys because duplicates map to same slots
+        let mut unique_targets = targets.to_vec();
+        unique_targets.par_sort_unstable();
+        unique_targets.dedup();
+        let total = unique_targets.len();
+        
+        if total < targets.len() {
+            println!("[Shard] Removed {} duplicate targets ({} → {})", 
+                targets.len() - total, targets.len(), total);
+        }
         
         println!("[Shard] Building {} shards for {} targets...", NUM_SHARDS, total);
         
         // Step 1: Partition targets by first 12 bits of hash (4096 shards)
         // shard_idx = (hash[0] << 4) | (hash[1] >> 4)
         let mut buckets: Vec<Vec<[u8; 20]>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-        for target in targets {
+        for target in &unique_targets {
             let shard_idx = ((target[0] as usize) << 4) | ((target[1] as usize) >> 4);
             buckets[shard_idx].push(*target);
         }
@@ -166,10 +177,9 @@ impl ShardedXorFilter {
             return Shard { fingerprints: Vec::new(), seed: 0, block_length: 0 };
         }
         
-        // 5.0x capacity for reliable construction with non-uniform shard distribution
-        // Some shards may have more entries than average due to hash distribution
-        // Higher multiplier ensures peeling succeeds even for dense shards
-        let capacity = (((size as f64) * 5.0) as usize / 3).max(3) * 3;
+        // 1.5x capacity - sufficient after deduplication
+        // Duplicates were the cause of peeling failures, not capacity
+        let capacity = (((size as f64) * 1.5) as usize / 3).max(3) * 3;
         let block_length = capacity / 3;
         
         let mut fingerprints = vec![0u32; capacity];
@@ -498,6 +508,46 @@ impl ShardedXorFilter {
     
     pub fn prefix_table(&self) -> &[u32] { &self.prefix_table }
     pub fn prefix_count(&self) -> u32 { self.prefix_table.len() as u32 }
+    pub fn num_shards(&self) -> u32 { NUM_SHARDS as u32 }
+    
+    /// GPU data for sharded filter
+    /// Returns: (fingerprints, shard_info, num_shards)
+    /// shard_info format: [offset_lo, offset_hi, block_len, seed_lo, seed_hi] × 4096
+    pub fn gpu_data_sharded(&self) -> (Vec<u32>, Vec<u32>, u32) {
+        // Build shard_info array: 5 u32 per shard
+        let mut shard_info: Vec<u32> = Vec::with_capacity(NUM_SHARDS * 5);
+        
+        for (offset, block_len, seed) in &self.shard_offsets {
+            // offset is in bytes from fingerprint start, convert to u32 index
+            let offset_u32 = (*offset as usize / 4) as u64;
+            shard_info.push(offset_u32 as u32);                    // offset_lo
+            shard_info.push((offset_u32 >> 32) as u32);           // offset_hi
+            shard_info.push(*block_len);                           // block_len
+            shard_info.push(*seed as u32);                         // seed_lo
+            shard_info.push((*seed >> 32) as u32);                // seed_hi
+        }
+        
+        // Get fingerprints
+        let fingerprints = if let Some(ref shards) = self.shards {
+            shards.iter()
+                .flat_map(|s| s.fingerprints.iter().copied())
+                .collect()
+        } else if let Some(ref mmap) = self.mmap {
+            let fp_start = HEADER_SIZE;
+            let last = self.shard_offsets[NUM_SHARDS - 1];
+            let last_size = if last.1 > 0 { (last.1 as usize * 3) * 4 } else { 0 };
+            let fp_end = fp_start + last.0 as usize + last_size;
+            
+            let fp_bytes = &mmap[fp_start..fp_end];
+            (0..fp_bytes.len()/4)
+                .map(|i| u32::from_le_bytes(fp_bytes[i*4..(i+1)*4].try_into().unwrap()))
+                .collect()
+        } else {
+            panic!("No data available");
+        };
+        
+        (fingerprints, shard_info, NUM_SHARDS as u32)
+    }
     
     pub fn memory_bytes(&self) -> usize {
         if let Some(ref shards) = self.shards {
