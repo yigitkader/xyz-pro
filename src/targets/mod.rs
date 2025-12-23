@@ -108,8 +108,6 @@ impl TargetDatabase {
             )));
         }
 
-        println!("[✓] Loaded {} targets ({:.1} MB)", count, (count * RECORD_SIZE) as f64 / 1e6);
-
         Ok(Self {
             mmap: Some(mmap),
             count,

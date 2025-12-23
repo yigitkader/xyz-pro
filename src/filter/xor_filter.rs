@@ -31,13 +31,11 @@ impl XorFilter32 {
         let mut seeds = seed_sets[0];
         let mut success = false;
         
+        println!("[Xor] Capacity: {} (3 × {} blocks)", capacity, block_length);
+        
         for attempt in 0..10 {
             for &try_seeds in &seed_sets {
                 fingerprints.fill(0);
-                
-                if attempt == 0 {
-                    println!("[Xor] Capacity: {} (3 × {} blocks)", capacity, block_length);
-                }
                 
                 // Build Xor filter using Dietzfelbinger construction
                 if Self::construct_filter(targets, &mut fingerprints, block_length, &try_seeds) {
