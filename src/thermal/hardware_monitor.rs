@@ -122,21 +122,38 @@ fn try_sysctl_temperature() -> Option<f32> {
 /// Estimate temperature from performance metrics
 /// Used as fallback when hardware reading is unavailable
 /// 
-/// SAFETY MODE: Return 92°C (above 87°C target) to trigger PID throttling
-/// This ensures GPU runs at ~50% speed when we can't read actual temperature
-/// Apple Silicon has built-in thermal protection, but we add this as extra safety
+/// BEHAVIOR:
+/// - FAST_MODE=1 env var: Returns 75°C (no throttling, max performance)
+/// - Default: Returns 82°C (slight throttle, safe operation)
+///
+/// Apple Silicon has built-in hardware thermal protection that will
+/// throttle the SoC regardless of software. Our throttle is just extra safety.
 #[allow(unused_variables)]
 pub fn estimate_temperature_from_performance(_batch_duration_ms: u64, _baseline_ms: u64) -> f32 {
     use std::sync::atomic::{AtomicBool, Ordering};
     
+    // Check for FAST_MODE environment variable (disables software throttling)
+    let fast_mode = std::env::var("FAST_MODE").map(|v| v == "1").unwrap_or(false);
+    
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("[PID] Hardware temperature unavailable - SAFETY MODE active (92°C estimate)");
-        eprintln!("[PID] GPU will run at reduced speed (~50%) for thermal safety");
+        if fast_mode {
+            eprintln!("[PID] Hardware temp unavailable - FAST_MODE enabled (no software throttle)");
+            eprintln!("[PID] Relying on Apple Silicon's built-in thermal protection");
+        } else {
+            eprintln!("[PID] Hardware temp unavailable - using estimated 82°C");
+            eprintln!("[PID] Set FAST_MODE=1 to disable software throttling if system is not overheating");
+        }
     }
     
-    // Return 92°C (above 87°C target) to trigger PID throttling
-    // PID will reduce speed to ~50%, preventing thermal runaway
-    92.0
+    if fast_mode {
+        // Return 75°C (well below 87°C target) - no throttling
+        // Relies on Apple's hardware thermal protection
+        75.0
+    } else {
+        // Return 82°C (slightly below 87°C target) - minimal throttle (~90% speed)
+        // Provides gentle slowdown without freezing the system
+        82.0
+    }
 }
 
