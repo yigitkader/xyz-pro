@@ -1005,10 +1005,10 @@ kernel void scan_keys(
             // FIXED: Overflow protection - if overflow detected, decrement counter and stop
             // This prevents buffer overflow and ensures match_count stays accurate
             #define SAVE_MATCH(hash_arr, type_val) do { \
-                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_acq_rel); \
+                uint idx = atomic_fetch_add_explicit(match_count, 1, memory_order_relaxed); \
                 if (idx >= MAX_MATCHES) { \
                     /* Overflow detected - revert increment and stop scanning */ \
-                    atomic_fetch_sub_explicit(match_count, 1, memory_order_acq_rel); \
+                    atomic_fetch_sub_explicit(match_count, 1, memory_order_relaxed); \
                     break; \
                 } \
                 uint off = idx * 52; \
