@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_curve_order_key_invalid() {
-        let mut order_key = SECP256K1_ORDER;
+        let order_key = SECP256K1_ORDER;
         assert!(!is_valid_private_key(&order_key), "Curve order key should be invalid");
     }
 

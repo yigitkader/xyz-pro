@@ -8,8 +8,7 @@ use crate::types::Hash160;
 use crate::rng::philox::{PhiloxCounter, PhiloxState, philox_to_privkey};
 use crate::filter::XorFilter32;
 
-/// Must match BATCH_SIZE in secp256k1_scanner.metal
-pub const GPU_BATCH_SIZE: u32 = 16;
+// BATCH_SIZE = 16 must match secp256k1_scanner.metal
 
 #[derive(Debug, Clone)]
 pub struct GpuConfig {
@@ -345,10 +344,6 @@ impl OptimizedScanner {
         // Auto-detect optimal configuration for this GPU
         let config = GpuConfig::detect(&device);
         config.print_summary();
-
-        // Verify GPU-CPU sync (debug builds only)
-        #[cfg(debug_assertions)]
-        println!("[GPU] BATCH_SIZE: {} (must match Metal shader)", GPU_BATCH_SIZE);
 
         let opts = CompileOptions::new();
 
@@ -969,10 +964,6 @@ unsafe impl Sync for OptimizedScanner {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    
-    /// Test buffer index constants match between Metal and Rust
-    /// This is a documentation test - actual verification requires running GPU
     #[test]
     fn test_buffer_index_documentation() {
         // Buffer indices in dispatch_batch() (Philox RNG mode):

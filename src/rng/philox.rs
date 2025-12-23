@@ -163,7 +163,6 @@ impl PhiloxCounter {
         state
     }
     
-    /// Get total keys generated
     pub fn total_generated(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
     }

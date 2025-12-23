@@ -112,24 +112,6 @@ impl PIDController {
         speed
     }
     
-    /// Get controller statistics
-    pub fn stats(&self) -> PIDStats {
-        PIDStats {
-            updates: self.updates.load(Ordering::Relaxed),
-            adjustments: self.adjustments.load(Ordering::Relaxed),
-            time_at_target_ms: self.time_at_target.load(Ordering::Relaxed),
-            current_integral: self.integral,
-        }
-    }
-    
-    /// Reset controller state (e.g., after long pause)
-    pub fn reset(&mut self) {
-        self.integral = 0.0;
-        self.last_error = 0.0;
-        self.last_temp = self.target_temp;
-        self.last_update = Instant::now();
-        self.last_speed = 1.0;
-    }
 }
 
 /// PID tuning parameters
@@ -219,25 +201,6 @@ impl PIDTuning {
     }
 }
 
-/// Statistics from PID controller
-#[derive(Clone, Copy, Debug)]
-pub struct PIDStats {
-    pub updates: u64,
-    pub adjustments: u64,
-    pub time_at_target_ms: u64,
-    pub current_integral: f32,
-}
-
-impl PIDStats {
-    /// Percentage of time spent at target temperature
-    pub fn target_percentage(&self, total_time_ms: u64) -> f32 {
-        if total_time_ms == 0 {
-            return 0.0;
-        }
-        (self.time_at_target_ms as f32 / total_time_ms as f32) * 100.0
-    }
-}
-
 /// Dynamic speed controller that integrates PID with GPU
 pub struct DynamicSpeedController {
     pid: PIDController,
@@ -283,10 +246,6 @@ impl DynamicSpeedController {
     
     pub fn current_speed(&self) -> f32 {
         self.current_speed
-    }
-    
-    pub fn stats(&self) -> PIDStats {
-        self.pid.stats()
     }
 }
 
