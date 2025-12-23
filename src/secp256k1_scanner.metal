@@ -720,7 +720,7 @@ inline bool prefix_exists(thread uchar* hash,
 //   0 = Production (XorFilter + Prefix)
 //   1 = XorFilter only (bypass prefix)
 //   2 = Accept every Nth hash (bypass all filters, test hash output)
-#define DEBUG_FILTER_MODE 0  // Production mode - full filter chain
+#define DEBUG_FILTER_MODE 1  // DEBUG: Only XorFilter (skip prefix binary search for speed)
 #define DEBUG_ACCEPT_EVERY_N 1000  // Only used when DEBUG_FILTER_MODE=2
 
 inline bool filter_check_with_prefix(thread uchar* h,
@@ -755,9 +755,10 @@ inline bool filter_check_with_prefix(thread uchar* h,
 // ============================================================================
 
 // Match buffer size - must match config.match_buffer_size in gpu.rs
-// OPTIMIZED: 512K is sufficient with Xor Filter32 (FP ~0.15%)
-// Memory savings: 4M → 512K = 87.5% reduction
-#define MAX_MATCHES 524288
+// CRITICAL FIX (analiz.md): Use MINIMUM from all GPU configs to prevent buffer overflow
+// M1 Base 8GB = 65536, so we use this as MAX to ensure safety on ALL devices
+// If filter bypassed, more than 65K matches could cause kernel panic!
+#define MAX_MATCHES 65536
 
 kernel void scan_keys(
     // PHILOX RNG MODE: GPU generates private keys internally

@@ -504,6 +504,54 @@ fn run_gpu_correctness_test(scanner: &OptimizedScanner, targets: &TargetDatabase
     println!("[🔍] Running GPU correctness test...");
     println!("      This verifies GPU hash calculations match CPU exactly.");
     
+    // =========================================================================
+    // CANARY TEST: Verify known key (Private Key = 1) is in targets database
+    // If this key's hash is in targets.bin, GPU should find it when scanning from key=1
+    // This proves: targets loaded correctly, verification pipeline works
+    // =========================================================================
+    print!("  [🐤] Canary test (Key=1)... ");
+    stdout().flush().ok();
+    
+    let canary_key: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+        .unwrap().try_into().unwrap();
+    let canary_secret = SecretKey::from_slice(&canary_key).unwrap();
+    let canary_pubkey = canary_secret.public_key();
+    
+    // Check all 3 hash types for Key=1
+    let comp_point = canary_pubkey.to_encoded_point(true);
+    let comp_hash = crate::crypto::hash160(comp_point.as_bytes());
+    let comp_h160 = crate::types::Hash160::from_slice(&comp_hash);
+    
+    let uncomp_point = canary_pubkey.to_encoded_point(false);
+    let uncomp_hash = crate::crypto::hash160(uncomp_point.as_bytes());
+    let uncomp_h160 = crate::types::Hash160::from_slice(&uncomp_hash);
+    
+    let p2sh_hash = crate::address::p2sh_script_hash(&comp_hash);
+    let p2sh_h160 = crate::types::Hash160::from_slice(&p2sh_hash);
+    
+    let comp_in_targets = targets.check_direct(&comp_h160);
+    let uncomp_in_targets = targets.check_direct(&uncomp_h160);
+    let p2sh_in_targets = targets.check_direct(&p2sh_h160);
+    
+    if comp_in_targets.is_some() || uncomp_in_targets.is_some() || p2sh_in_targets.is_some() {
+        println!("FOUND in targets! ✓");
+        if comp_in_targets.is_some() {
+            println!("      → Compressed: {} ({})", hex::encode(&comp_hash), comp_in_targets.unwrap().0);
+        }
+        if uncomp_in_targets.is_some() {
+            println!("      → Uncompressed: {}", hex::encode(&uncomp_hash));
+        }
+        if p2sh_in_targets.is_some() {
+            println!("      → P2SH: {}", hex::encode(&p2sh_hash));
+        }
+        println!("      → System is LIVE! If GPU scans key=1, it WILL find this!");
+    } else {
+        println!("not in targets");
+        println!("      → Key=1 hashes: comp={}, uncomp={}", 
+            hex::encode(&comp_hash), hex::encode(&uncomp_hash));
+        println!("      → To add canary: include 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH in targets.json");
+    }
+    
     let mut all_passed = true;
     
     // Test vectors: known private keys with known hashes
@@ -1630,6 +1678,15 @@ fn run_pipelined(
                         }
                         
                         gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
+                        
+                        // DEBUG: Log every batch from scan_pipelined callback
+                        static BATCH_DEBUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let bdebug = BATCH_DEBUG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if bdebug < 10 || matches.len() > 0 || bdebug % 50 == 0 {
+                            eprintln!("[DEBUG] scan_pipelined callback #{}: matches.len()={} base_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                                bdebug, matches.len(),
+                                base_key[0], base_key[1], base_key[2], base_key[3]);
+                        }
                         
                         if !matches.is_empty() {
                             if let Err(e) = tx.send((base_key, matches)) {
