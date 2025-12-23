@@ -117,9 +117,10 @@ impl MatchOutput for ConsoleOutput {
 }
 
 /// File output - writes matches to a file
+/// Uses unbuffered writes to ensure no data loss
 pub struct FileOutput {
     path: std::path::PathBuf,
-    file: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    file: std::sync::Mutex<std::fs::File>,
     count: std::sync::atomic::AtomicU64,
 }
 
@@ -133,7 +134,7 @@ impl FileOutput {
         
         Ok(Self {
             path: path.as_ref().to_path_buf(),
-            file: std::sync::Mutex::new(std::io::BufWriter::new(file)),
+            file: std::sync::Mutex::new(file),
             count: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -154,15 +155,16 @@ impl MatchOutput for FileOutput {
                 .map_err(|e| format!("Write error: {}", e))?;
         }
         
+        // CRITICAL: sync_all forces write to physical disk - no data loss!
+        file.sync_all().map_err(|e| format!("Sync error: {}", e))?;
+        
         self.count.fetch_add(matches.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     
     fn flush(&self) -> Result<(), String> {
-        use std::io::Write;
-        
-        let mut file = self.file.lock().map_err(|e| format!("Lock error: {}", e))?;
-        file.flush().map_err(|e| format!("Flush error: {}", e))
+        let file = self.file.lock().map_err(|e| format!("Lock error: {}", e))?;
+        file.sync_all().map_err(|e| format!("Sync error: {}", e))
     }
     
     fn total_matches(&self) -> u64 {
