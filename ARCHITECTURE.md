@@ -12,6 +12,8 @@
 9. [Memory Layout](#9-memory-layout)
 10. [Performance Characteristics](#10-performance-characteristics)
 11. [Sharded XOR Filter System](#11-sharded-xor-filter-system)
+12. [Scan Modes](#12-scan-modes)
+13. [Unused Code & Reserved Modules](#13-unused-code--reserved-modules)
 
 ---
 
@@ -200,8 +202,9 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 │  │ // First 128 bits                                                │  │
 │  │ random[0..3] = philox4x32_10(thread_counter, key)                │  │
 │  │                                                                   │  │
-│  │ // Second 128 bits (domain separation)                           │  │
-│  │ thread_counter.x ^= 0xDEADBEEF   // CRITICAL: Must match CPU!   │  │
+│  │ // Second 128 bits (cryptographic domain separation)             │  │
+│  │ key.x ^= 0x9E3779B9   // φ (golden ratio)                       │  │
+│  │ key.y ^= 0x243F6A88   // π                                      │  │
 │  │ random[4..7] = philox4x32_10(thread_counter, key)                │  │
 │  │                                                                   │  │
 │  │ private_key[0..31] = concatenate(random[0..7])                   │  │
@@ -401,13 +404,13 @@ XYZ-PRO is a high-performance Bitcoin private key scanner that uses **Apple Meta
 ```
 xyz-pro/
 ├── src/
-│   ├── main.rs                    # Entry point, orchestration
-│   ├── gpu.rs                     # GPU management, buffer allocation
+│   ├── main.rs                    # Entry point, orchestration, ScanMode routing
+│   ├── gpu.rs                     # GPU management, BufferPool, GpuConfig
 │   ├── types.rs                   # Hash160, AddressType definitions
 │   ├── address.rs                 # WIF encoding, P2SH script hash
-│   ├── error.rs                   # Error types
-│   ├── lib.rs                     # Library exports
-│   ├── startup_tests.rs           # GPU correctness tests
+│   ├── error.rs                   # Error types (ScannerError)
+│   ├── lib.rs                     # Library exports + feature gates
+│   ├── startup_tests.rs           # GPU correctness tests, end-to-end verification
 │   │
 │   ├── crypto/
 │   │   └── mod.rs                 # hash160, is_valid_private_key
@@ -415,32 +418,38 @@ xyz-pro/
 │   ├── rng/
 │   │   ├── mod.rs                 # Philox module exports
 │   │   ├── philox.rs              # Philox4x32-10 CPU implementation
-│   │   │                          # + for_thread() synchronization
+│   │   │                          # + for_thread() + domain separation
 │   │   └── philox.metal           # Philox4x32-10 GPU implementation
 │   │
 │   ├── filter/
-│   │   ├── mod.rs                 # Filter module exports
-│   │   ├── xor_filter.rs          # XorFilter32 (legacy single filter)
-│   │   ├── sharded_filter.rs      # ShardedXorFilter (4096 shards)
+│   │   ├── mod.rs                 # Filter module exports (ShardedXorFilter only)
+│   │   ├── xor_filter.rs          # XorFilter32 (LEGACY - not used in production)
+│   │   ├── sharded_filter.rs      # ShardedXorFilter (4096 shards, ACTIVE)
 │   │   │                          # + mmap cache + CRC32 integrity
 │   │   └── xor_lookup.metal       # GPU Xor filter lookup (sharded)
 │   │
 │   ├── targets/
-│   │   └── mod.rs                 # Target database (binary/JSON)
+│   │   └── mod.rs                 # Target database (binary/JSON), iter_hashes()
 │   │
 │   ├── thermal/
 │   │   ├── mod.rs                 # Thermal module exports
-│   │   ├── pid_controller.rs      # PID thermal controller
-│   │   └── hardware_monitor.rs    # Temperature reading
+│   │   ├── pid_controller.rs      # PID + DynamicSpeedController
+│   │   └── hardware_monitor.rs    # Temperature reading (ioreg/sysctl)
 │   │
-│   ├── scanner/                   # Scanner module (reserved)
+│   ├── scanner/                   # RESERVED - empty module for future extensions
 │   │
 │   ├── math/
 │   │   ├── mod.rs                 # Math module exports
 │   │   ├── field_ops.metal        # Modular arithmetic primitives
 │   │   └── simd_bigint.metal      # SIMD 256-bit operations
 │   │
-│   ├── secp256k1_scanner.metal    # Main GPU kernel
+│   │   # NEW MODULES (v0.3.0)
+│   ├── puzzle_mode.rs             # Bitcoin Puzzle configuration & info
+│   ├── puzzle_scanner.rs          # Sequential scanner for Puzzle challenges
+│   ├── weak_key_generator.rs      # Brain wallets & weak patterns
+│   │
+│   │   # METAL SHADERS (DO NOT DELETE)
+│   ├── secp256k1_scanner.metal    # Main GPU kernel (BATCH_SIZE injected)
 │   ├── sha256_33.metal            # SHA256 for 33-byte input
 │   └── sha256_65.metal            # SHA256 for 65-byte input
 │
@@ -456,22 +465,28 @@ xyz-pro/
 ├── Cargo.toml                     # Dependencies and features
 ├── ARCHITECTURE.md                # This document
 ├── targets.json / targets.bin     # Target address database
-└── targets.shxor                  # Sharded filter cache
+├── targets.shxor                  # Sharded filter cache
+└── puzzle_checkpoint.bin          # Resume file for Puzzle mode
 ```
 
 ### 4.2 Module Responsibilities
 
 | Module | Responsibility |
 |--------|---------------|
-| `main.rs` | Entry point, thread spawning, stats display, self-tests |
-| `gpu.rs` | GPU initialization, buffer management, dispatch/collect, PhiloxState sync |
-| `rng/philox.rs` | Counter-based RNG state management, `for_thread()` for CPU sync |
-| `filter/sharded_filter.rs` | 4096-shard probabilistic filter, mmap cache, CRC32 |
-| `filter/xor_lookup.metal` | GPU sharded filter lookup with correct hash computation |
-| `targets/mod.rs` | Address database loading and lookup |
-| `thermal/*` | GPU temperature monitoring and throttling |
-| `secp256k1_scanner.metal` | GPU kernel for key scanning |
-| `startup_tests.rs` | GPU correctness verification at startup |
+| `main.rs` | Entry point, ScanMode routing, pipelined scanning, crash-safe reporting |
+| `gpu.rs` | GPU init, BufferPool, GpuConfig (hardware-tuned), dispatch/collect |
+| `rng/philox.rs` | Counter-based RNG, `for_thread()` sync, domain separation constants |
+| `filter/sharded_filter.rs` | 4096-shard probabilistic filter, mmap cache, 8-byte aligned shard info |
+| `filter/xor_filter.rs` | **LEGACY** - Single XorFilter32 (not used, kept for reference) |
+| `filter/xor_lookup.metal` | GPU sharded filter lookup with FxHash |
+| `targets/mod.rs` | Address database, binary cache, `iter_hashes()` zero-copy iterator |
+| `thermal/*` | PID controller, DynamicSpeedController, hardware temp reading |
+| `puzzle_mode.rs` | **NEW** - Bitcoin Puzzle configuration (ranges, addresses, rewards) |
+| `puzzle_scanner.rs` | **NEW** - Sequential scanner with checkpointing for Puzzles |
+| `weak_key_generator.rs` | **NEW** - Brain wallets, weak patterns, wordlists |
+| `secp256k1_scanner.metal` | GPU kernel (BATCH_SIZE config-driven, GLV, Montgomery batch) |
+| `startup_tests.rs` | GPU correctness tests, GLV recovery test, end-to-end verification |
+| `scanner/` | **RESERVED** - Empty directory for future scanner implementations |
 
 ---
 
@@ -578,17 +593,18 @@ fn hash_to_positions(hash: &[u8; 20], seed: u64, block_len: usize) -> (u32, u32,
 inline bool xor_filter_contains_sharded(
     thread uchar* hash,
     constant uint* fingerprints,
-    constant uint* shard_info,   // 4096 × 5 u32
+    constant uint* shard_info,   // 4096 × 6 u32 (8-byte aligned)
     uint num_shards
 ) {
     // 12-bit shard index
     uint shard_id = ((uint)hash[0] << 4) | ((uint)hash[1] >> 4);
     
-    // Read shard metadata (5 u32 per shard)
-    uint base_idx = shard_id * 5;
+    // Read shard metadata (6 u32 per shard, last is padding)
+    uint base_idx = shard_id * 6;
     ulong offset = ((ulong)shard_info[base_idx+1] << 32) | shard_info[base_idx];
     uint block_len = shard_info[base_idx + 2];
     ulong seed = ((ulong)shard_info[base_idx+4] << 32) | shard_info[base_idx+3];
+    // shard_info[base_idx+5] is padding for 8-byte alignment
     
     if (block_len == 0) return false;
     
@@ -751,10 +767,20 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 16 × 32 bytes = 512 bytes
 │  ──────  ────  ─────────────────────────────────────────────────────   │
 │  0       4     key_index: u32 (thread_id for Philox state)             │
 │  4       1     match_type: u8 (0-5, see GLV types)                     │
-│  5       27    padding (reserved for future use)                       │
+│  5       27    _pad: [u8; 27] (explicit padding for alignment)         │
 │  32      20    hash160: [u8; 20] (the matched hash)                    │
 │                                                                         │
-│  match_type values:                                                     │
+│  RUST DEFINITION:                                                       │
+│  #[repr(C)]                                                             │
+│  struct PotentialMatch {                                                │
+│      key_index: u32,                                                    │
+│      match_type: MatchType,  // #[repr(u8)]                            │
+│      _pad: [u8; 27],         // Explicit padding                       │
+│      hash: Hash160,                                                     │
+│  }                                                                      │
+│  const _SIZE_CHECK: () = assert!(size_of::<PotentialMatch>() == 52);   │
+│                                                                         │
+│  match_type values (#[repr(u8)]):                                       │
 │  0 = Compressed (primary key)                                          │
 │  1 = Uncompressed (primary key)                                        │
 │  2 = P2SH (primary key)                                                │
@@ -1096,9 +1122,9 @@ ulong4 batch_Zinv[BATCH_SIZE];  // 16 × 32 bytes = 512 bytes
 │  │   └─ Total: ~294 MB                                             │   │
 │  │                                                                  │   │
 │  │ Buffer 4: xor_shard_info                                        │   │
-│  │   └─ 4096 entries × 5 u32 each = 80 KB                          │   │
+│  │   └─ 4096 entries × 6 u32 each = 96 KB (8-byte aligned)        │   │
 │  │   └─ Per entry: [offset_lo, offset_hi, block_len,               │   │
-│  │                  seed_lo, seed_hi]                               │   │
+│  │                  seed_lo, seed_hi, padding]                      │   │
 │  │                                                                  │   │
 │  │ Buffer 5: xor_num_shards                                        │   │
 │  │   └─ 4 bytes (value: 4096)                                      │   │
@@ -1164,21 +1190,28 @@ const FX_SEED_OFFSET: u64 = 0xc3a5c85c97cb3127;  // For second hash
 # Build (release mode with optimizations)
 cargo build --release
 
-# Run with default features (all optimizations)
+# Run with default features (random mode)
 ./target/release/xyz-pro
 
 # Run with fast startup (skip heavy tests)
 FAST_START=1 ./target/release/xyz-pro
-# or
-./target/release/xyz-pro --fast
+
+# Run in Puzzle mode (sequential scan)
+PUZZLE=66 ./target/release/xyz-pro
+
+# Run in Weak Key mode (brain wallets)
+WEAK_KEYS=1 ./target/release/xyz-pro
 
 # Run tests
-cargo test --release --lib   # Library tests (faster)
+cargo test --release --lib   # Library tests (faster, 45 tests)
 cargo test --release         # All tests
 
 # Clean cache to force filter rebuild
 rm targets.shxor
 ./target/release/xyz-pro
+
+# Resume Puzzle from checkpoint
+PUZZLE=66 ./target/release/xyz-pro  # Reads puzzle_checkpoint.bin
 ```
 
 ---
@@ -1219,6 +1252,194 @@ rm targets.shxor
 
 ---
 
-*Document Version: 2.0*
+---
+
+## 12. Scan Modes
+
+### 12.1 ScanMode Enum
+
+```rust
+enum ScanMode {
+    Random,           // Default: Philox RNG, random key search
+    Puzzle(u8),       // Sequential: Bitcoin Puzzle challenge (e.g., #66)
+    WeakKeys,         // Pattern-based: Brain wallets, common passwords
+}
+```
+
+### 12.2 Mode Selection
+
+```bash
+# Random mode (default)
+./target/release/xyz-pro
+
+# Puzzle mode (sequential scan for known ranges)
+PUZZLE=66 ./target/release/xyz-pro
+
+# Weak key mode
+WEAK_KEYS=1 ./target/release/xyz-pro
+```
+
+### 12.3 Puzzle Mode Details
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        BITCOIN PUZZLE MODE                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  WHAT: Sequential key search in known private key ranges                │
+│  WHY:  Real BTC rewards (6.6+ BTC per puzzle)                          │
+│                                                                         │
+│  Puzzle #66:                                                            │
+│  ├─ Range: 2^65 to 2^66 (36 quintillion keys)                          │
+│  ├─ Address: 13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so                        │
+│  ├─ Reward: 6.6 BTC                                                    │
+│  └─ ETA @ 2.5M/s: ~467 million years (mathematically impossible)       │
+│                                                                         │
+│  Features:                                                              │
+│  ├─ No Philox overhead (direct sequential generation)                  │
+│  ├─ Checkpoint/resume support (puzzle_checkpoint.bin)                  │
+│  ├─ Progress tracking with ETA                                         │
+│  └─ Immediate crash-safe key saving (PUZZLE_FOUND.txt)                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.4 Key Generation Comparison
+
+| Mode | Key Generation | Use Case |
+|------|---------------|----------|
+| Random | Philox4x32-10 RNG | General search (49M targets) |
+| Puzzle | Sequential (base + offset) | Known ranges (Bitcoin Puzzle) |
+| WeakKeys | SHA256(password) | Brain wallets, patterns |
+
+---
+
+## 13. Unused Code & Reserved Modules
+
+### 13.1 `#[allow(dead_code)]` Annotations
+
+The following items are marked as dead code but **intentionally kept**:
+
+| Location | Item | Reason |
+|----------|------|--------|
+| `gpu.rs` | `PooledBuffer::take()` | Public API for buffer ownership transfer |
+| `gpu.rs` | `OptimizedScanner::new()` | Convenience constructor (uses `new_with_cache`) |
+| `gpu.rs` | `config()`, `total_scanned()`, `total_matches()` | Public API accessors |
+| `rng/philox.rs` | `for_thread()` | CPU verification sync |
+| `rng/philox.rs` | `PhiloxCounter::total_generated()` | Stats API |
+| `targets/mod.rs` | `check()`, `check_type()`, `hash_at()` | Full database API |
+| `filter/sharded_filter.rs` | `gpu_data()`, `gpu_data_legacy()`, `contains()` | Testing/debugging |
+| `filter/xor_filter.rs` | Entire module | Legacy single filter (reference implementation) |
+| `thermal/pid_controller.rs` | `current_speed()` | Controller state access |
+| `error.rs` | `InvalidAddress` variant | Reserved for future address validation |
+
+### 13.2 Reserved Directories
+
+```
+src/scanner/           # Empty - reserved for future scanner implementations
+                       # (e.g., distributed scanner, FPGA scanner interface)
+```
+
+### 13.3 Legacy vs Active Components
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `xor_filter.rs` | **LEGACY** | Single filter, kept for reference |
+| `sharded_filter.rs` | **ACTIVE** | 4096-shard filter, production |
+| `XorFilter32` (export) | **REMOVED** | Not exported from `filter/mod.rs` |
+| `PhiloxState::for_thread()` | **USED** | CPU verification requires this |
+
+### 13.4 Metal Shaders (DO NOT DELETE)
+
+```
+⚠️ WARNING: Metal shaders are CRITICAL for GPU operations!
+
+src/secp256k1_scanner.metal  - Main kernel (EC ops, hash160, GLV)
+src/sha256_33.metal          - Optimized for compressed pubkey
+src/sha256_65.metal          - Optimized for uncompressed pubkey
+src/rng/philox.metal         - RNG (included in main kernel)
+src/filter/xor_lookup.metal  - Filter lookup (included in main kernel)
+src/math/field_ops.metal     - Modular arithmetic (included)
+src/math/simd_bigint.metal   - SIMD bigint ops (included)
+
+These files are COMBINED at runtime by gpu.rs::combine_metal_shaders()
+```
+
+---
+
+## Appendix E: Configuration Reference
+
+### E.1 GpuConfig Structure
+
+```rust
+pub struct GpuConfig {
+    pub threads: u32,              // GPU threads (e.g., 8192)
+    pub keys_per_thread: u32,      // Keys per thread (e.g., 128)
+    pub match_buffer_size: u32,    // Match buffer capacity (e.g., 65536)
+    pub pipeline_depth: u8,        // Triple buffer depth (2-8)
+    pub pool_size: usize,          // Buffer pool size
+    pub gpu_breath_ms: u64,        // Sleep for UI responsiveness
+    pub throttle_multiplier: f32,  // PID throttle factor
+    pub batch_size: u32,           // Montgomery batch size (8-32)
+}
+```
+
+### E.2 Hardware-Based Defaults
+
+| GPU Tier | `batch_size` | `pipeline_depth` | `gpu_breath_ms` | Notes |
+|----------|--------------|------------------|-----------------|-------|
+| BASE (M1) | 16 | 3 | 5 | Conservative for 8GB RAM |
+| PRO | 20 | 4 | 3 | Balanced |
+| MAX | 24 | 6 | 2 | Higher register capacity |
+| ULTRA | 32 | 8 | 1 | Full utilization |
+
+### E.3 Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `FAST_START` | Skip heavy startup tests | `FAST_START=1` |
+| `PUZZLE` | Enable Puzzle mode | `PUZZLE=66` |
+| `WEAK_KEYS` | Enable weak key mode | `WEAK_KEYS=1` |
+
+---
+
+## Appendix F: Crash Safety
+
+### F.1 Key Saving Mechanism
+
+```rust
+// In report() function:
+fn report(addr: &str, key: &[u8; 32], ...) {
+    // 1. IMMEDIATE sync write (crash-safe)
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("found.txt") 
+    {
+        writeln!(f, "{} | {}", addr, hex::encode(key))?;
+        f.sync_all()?;  // CRITICAL: Force to disk NOW
+    }
+    
+    // 2. Then send to async logger for pretty printing
+    async_logger.send(...);
+}
+```
+
+### F.2 Checkpoint System (Puzzle Mode)
+
+```
+puzzle_checkpoint.bin format:
+┌────────┬─────────────────┐
+│ puzzle │ position (u64)  │
+│ 1 byte │ 8 bytes LE      │
+└────────┴─────────────────┘
+
+Saved every 100M keys or on Ctrl+C
+Resume: PUZZLE=66 ./target/release/xyz-pro
+```
+
+---
+
+*Document Version: 3.0*
 *Last Updated: December 2024*
-*Target Platform: Apple Silicon (M1/M2/M3)*
+*Target Platform: Apple Silicon (M1/M2/M3/M4)*

@@ -1084,19 +1084,8 @@ impl OptimizedScanner {
         (philox_to_privkey(&state), state)
     }
     
-    #[allow(dead_code)]
     pub fn config(&self) -> &GpuConfig {
         &self.config
-    }
-
-    #[allow(dead_code)]
-    pub fn total_scanned(&self) -> u64 {
-        self.total_scanned.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn total_matches(&self) -> u64 {
-        self.total_matches.load(Ordering::Relaxed)
     }
 }
 

@@ -5,7 +5,6 @@ mod gpu;
 mod startup_tests;
 mod targets;
 mod types;
-mod weak_key_generator;
 mod puzzle_mode;
 mod puzzle_scanner;
 
@@ -123,20 +122,15 @@ fn get_performance_core_count() -> usize {
     6
 }
 
-/// Scan mode selection
+/// Scan mode: Random or Puzzle
 #[derive(Clone, Copy, PartialEq)]
 enum ScanMode {
-    /// Random key generation using Philox RNG (default)
     Random,
-    /// Sequential scanning for Bitcoin Puzzle (e.g., PUZZLE=66)
     Puzzle(u8),
-    /// Brain wallet / weak key patterns
-    WeakKeys,
 }
 
 impl ScanMode {
     fn from_env() -> Self {
-        // Check for puzzle mode: PUZZLE=66
         if let Ok(puzzle_str) = std::env::var("PUZZLE") {
             if let Ok(num) = puzzle_str.parse::<u8>() {
                 if (40..=160).contains(&num) {
@@ -144,27 +138,13 @@ impl ScanMode {
                 }
             }
         }
-        
-        // Check for weak key mode: WEAK_KEYS=1
-        if std::env::var("WEAK_KEYS").is_ok() {
-            return ScanMode::WeakKeys;
-        }
-        
-        // Default: random (Philox RNG)
         ScanMode::Random
     }
     
     fn print_info(&self, keys_per_sec: f64) {
         match self {
-            ScanMode::Random => {
-                println!("[Mode] Random (Philox RNG)");
-            }
-            ScanMode::Puzzle(num) => {
-                puzzle_mode::print_puzzle_info(*num, keys_per_sec);
-            }
-            ScanMode::WeakKeys => {
-                println!("[Mode] Weak Key Patterns (brain wallets, sequential, etc.)");
-            }
+            ScanMode::Random => println!("[Mode] Random (Philox RNG)"),
+            ScanMode::Puzzle(num) => puzzle_mode::print_puzzle_info(*num, keys_per_sec),
         }
     }
 }
@@ -281,15 +261,8 @@ fn main() {
                 eprintln!("[!] Unknown puzzle #{}, use PUZZLE=66 to PUZZLE=160", puzzle_num);
             }
         }
-        ScanMode::WeakKeys => {
-            // Weak keys mode: Brain wallets and patterns
-            println!("[WeakKeys] Not yet fully integrated - falling back to random mode");
-            println!("[WeakKeys] Use brain_wallet() from weak_key_generator for custom searches");
-            run_pipelined(gpu.clone(), targets.clone(), counter.clone(), found.clone(), shutdown.clone(), start, scan_mode);
-        }
         ScanMode::Random => {
-            // Default: Philox RNG random scanning
-            run_pipelined(gpu.clone(), targets.clone(), counter.clone(), found.clone(), shutdown.clone(), start, scan_mode);
+            run_pipelined(gpu.clone(), targets.clone(), counter.clone(), found.clone(), shutdown.clone(), start);
         }
     }
 
@@ -346,11 +319,7 @@ fn run_pipelined(
     found: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     start: Instant,
-    scan_mode: ScanMode,
 ) {
-    // Note: scan_mode is now handled in main() before calling run_pipelined
-    // This function is only called for Random and WeakKeys (fallback) modes
-    let _ = scan_mode; // Silence unused warning
     // Get config-driven values from GPU
     let config = gpu.config();
     let pipeline_depth = config.pipeline_depth;
