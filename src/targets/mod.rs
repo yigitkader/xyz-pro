@@ -38,10 +38,24 @@ impl TargetDatabase {
 
         println!("[*] Converting JSON to sorted binary format...");
         let mut entries = Self::parse_json(json_path)?;
+        let original_count = entries.len();
+        
+        // Sort by hash for binary search and dedup
         entries.par_sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         
+        // CRITICAL: Dedup BEFORE saving to binary!
+        // This ensures targets.bin count matches XorFilter cache count
+        // Without this, every startup triggers expensive rebuild
+        entries.dedup_by(|a, b| a.0.as_bytes() == b.0.as_bytes());
+        
+        let removed = original_count - entries.len();
+        if removed > 0 {
+            println!("[*] Removed {} duplicate hashes ({} → {})", 
+                removed, original_count, entries.len());
+        }
+        
         Self::save_sorted_binary(&bin_path, &entries)?;
-        println!("[✓] Sorted binary cache saved: {}", bin_path);
+        println!("[✓] Sorted binary cache saved: {} ({} unique targets)", bin_path, entries.len());
         Self::load_binary(&bin_path)
     }
 
