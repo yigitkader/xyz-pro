@@ -203,8 +203,12 @@ inline bool xor_filter_contains(
 // ============================================================================
 
 /// Sharded Xor Filter lookup
-/// shard_info format: [offset_low, offset_high_and_block_len, seed_low, seed_high] per shard
-/// Actually: [offset:u64, block_len:u32, seed:u64] = 20 bytes per shard
+/// shard_info format: [offset_lo, offset_hi, block_len, seed_lo, seed_hi] per shard (5 u32)
+/// CRITICAL: Must match CPU hash_to_positions() exactly!
+///   CPU: p0 = hash1 % block_len
+///        p1 = (hash1 >> 32) % block_len + block_len  (SAME hash, upper 32 bits!)
+///        p2 = hash2 % block_len + 2*block_len
+///        fp = hash2 >> 32
 inline bool xor_filter_contains_sharded(
     thread uchar* hash,
     constant uint* fingerprints,
@@ -229,25 +233,24 @@ inline bool xor_filter_contains_sharded(
     // Empty shard check
     if (block_len == 0) return false;
     
-    // Compute fingerprint
-    uint fp = xor_fingerprint(hash);
+    // Hash 1: FxHash(seed, data) - used for p0 and p1
+    ulong hash1 = fx_hash_u64(seed, 0);
+    hash1 = fx_hash_bytes(hash, 20, hash1);
     
-    // Compute 3 hash positions within this shard
-    // seeds[0] = seed, seeds[1] = seed ^ 0xc3a5c85c97cb3127
-    ulong seeds[3] = { seed, seed ^ 0xc3a5c85c97cb3127UL, 0 };
+    // Hash 2: FxHash(seed ^ 0xc3a5c85c97cb3127, data) - used for p2 and fingerprint
+    ulong hash2 = fx_hash_u64(seed ^ 0xc3a5c85c97cb3127UL, 0);
+    hash2 = fx_hash_bytes(hash, 20, hash2);
     
-    // Hash to block positions (within shard)
-    ulong h = fx_hash_u64(seeds[0], 0);
-    h = fx_hash_bytes(hash, 20, h);
-    uint h0 = (uint)(h % (ulong)block_len);
+    // Positions - MUST match CPU exactly:
+    // p0 = hash1 % block_len (lower 64 bits modulo)
+    // p1 = (hash1 >> 32) % block_len + block_len (upper 32 bits modulo)
+    // p2 = hash2 % block_len + 2*block_len
+    uint h0 = (uint)(hash1 % (ulong)block_len);
+    uint h1 = (uint)((hash1 >> 32) % (ulong)block_len) + block_len;
+    uint h2 = (uint)(hash2 % (ulong)block_len) + 2 * block_len;
     
-    h = fx_hash_u64(seeds[1], 0);
-    h = fx_hash_bytes(hash, 20, h);
-    uint h1 = block_len + (uint)(h % (ulong)block_len);
-    
-    h = fx_hash_u64(seeds[2], 0);
-    h = fx_hash_bytes(hash, 20, h);
-    uint h2 = 2 * block_len + (uint)(h % (ulong)block_len);
+    // Fingerprint = upper 32 bits of hash2
+    uint fp = (uint)(hash2 >> 32);
     
     // Add shard offset to get global fingerprint index
     uint shard_offset = (uint)offset;  // offset is in u32 units

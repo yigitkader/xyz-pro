@@ -720,7 +720,7 @@ inline bool prefix_exists(thread uchar* hash,
 //   0 = Production (XorFilter + Prefix)
 //   1 = XorFilter only (bypass prefix)
 //   2 = Accept every Nth hash (bypass all filters, test hash output)
-#define DEBUG_FILTER_MODE 2  // DEBUG: Accept every Nth hash to test hash output
+#define DEBUG_FILTER_MODE 1  // 0=Production(XorFilter+Prefix), 1=XorFilter only, 2=Debug bypass
 #define DEBUG_ACCEPT_EVERY_N 1000  // Only used when DEBUG_FILTER_MODE=2
 
 inline bool filter_check_with_prefix_sharded(thread uchar* h,
