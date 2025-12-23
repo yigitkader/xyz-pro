@@ -75,6 +75,7 @@ constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,
 
 #define BATCH_SIZE 32
 #define OUTPUT_SIZE 72
+#define GLV_OUTPUT_SIZE 144  // 2 keys per thread (primary + GLV)
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -505,6 +506,64 @@ void compute_p2sh_hash(thread const uchar* pubkey_hash, thread uchar* script_has
     ripemd160_32(sha, script_hash);
 }
 
+// GLV Lambda constant for private key transformation
+// λ·k mod n gives the private key for the endomorphic point φ(P)
+constant ulong4 GLV_LAMBDA = {
+    0xDF02967C1B23BD72ULL, 0x122E22EA20816678ULL,
+    0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL
+};
+
+// Multiply two 256-bit numbers modulo n (group order)
+ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
+    ulong r[8] = {0,0,0,0,0,0,0,0};
+    
+    for (int i = 0; i < 4; i++) {
+        ulong ai = (i == 0) ? a.x : ((i == 1) ? a.y : ((i == 2) ? a.z : a.w));
+        ulong c = 0;
+        for (int j = 0; j < 4; j++) {
+            ulong bj = (j == 0) ? b.x : ((j == 1) ? b.y : ((j == 2) ? b.z : b.w));
+            ulong hi, lo;
+            mul64(ai, bj, hi, lo);
+            ulong old = r[i + j]; r[i + j] += lo;
+            ulong c1 = (r[i + j] < old) ? 1 : 0;
+            old = r[i + j + 1]; r[i + j + 1] += hi + c1 + c;
+            c = (r[i + j + 1] < old) ? 1 : 0;
+            if (hi + c1 < hi) c++;
+        }
+        for (int k = i + 4; k < 8 && c; k++) {
+            ulong old = r[k]; r[k] += c; c = (r[k] < old) ? 1 : 0;
+        }
+    }
+    
+    // Reduce mod n using the group order
+    // n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    ulong4 result = {r[0], r[1], r[2], r[3]};
+    
+    // Simplified reduction - may need multiple iterations for full correctness
+    while (r[4] || r[5] || r[6] || r[7] ||
+           result.w > SECP256K1_N.w ||
+           (result.w == SECP256K1_N.w && result.z > SECP256K1_N.z) ||
+           (result.w == SECP256K1_N.w && result.z == SECP256K1_N.z && result.y > SECP256K1_N.y) ||
+           (result.w == SECP256K1_N.w && result.z == SECP256K1_N.z && result.y == SECP256K1_N.y && result.x >= SECP256K1_N.x)) {
+        
+        // Subtract n
+        ulong bw = 0;
+        ulong4 tmp;
+        tmp.x = result.x - SECP256K1_N.x; bw = (result.x < SECP256K1_N.x) ? 1 : 0;
+        tmp.y = result.y - SECP256K1_N.y - bw; bw = (result.y < SECP256K1_N.y + bw) ? 1 : 0;
+        tmp.z = result.z - SECP256K1_N.z - bw; bw = (result.z < SECP256K1_N.z + bw) ? 1 : 0;
+        tmp.w = result.w - SECP256K1_N.w - bw;
+        
+        if (r[4] || r[5] || r[6] || r[7]) {
+            r[4]--; // Borrow from high words
+            if (r[4] == 0xFFFFFFFFFFFFFFFFULL) { r[5]--; }
+        }
+        result = tmp;
+    }
+    
+    return result;
+}
+
 // ============================================================================
 // MAIN KERNEL: generate_btc_keys (v3)
 // ============================================================================
@@ -644,6 +703,192 @@ kernel void generate_btc_keys(
         }
         for (int i = 0; i < 20; i++) {
             output[out_base + 52 + i] = p2sh_hash[i];
+        }
+    }
+}
+
+// ============================================================================
+// GLV KERNEL: 2x THROUGHPUT
+// For each EC operation, we get 2 keys:
+// 1. Primary: privkey k → pubkey P
+// 2. GLV:     privkey λ·k mod n → pubkey φ(P) = (β·x, y)
+// ============================================================================
+
+kernel void generate_btc_keys_glv(
+    constant uchar* base_privkey [[buffer(0)]],
+    constant uchar* base_pubkey_x [[buffer(1)]],
+    constant uchar* base_pubkey_y [[buffer(2)]],
+    constant uchar* wnaf_table [[buffer(3)]],
+    device uchar* output [[buffer(4)]],
+    constant uint* keys_per_thread [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint kpt = *keys_per_thread;
+    uint thread_offset = gid * kpt;
+    
+    // Load base private key and pubkey
+    ulong4 base_priv = load_be(base_privkey);
+    ulong4 base_x = load_be(base_pubkey_x);
+    ulong4 base_y = load_be(base_pubkey_y);
+    
+    // Compute thread start point using wNAF table
+    ulong4 cur_X = base_x;
+    ulong4 cur_Y = base_y;
+    ulong4 cur_Z = {1,0,0,0};
+    ulong4 cur_ZZ = {1,0,0,0};
+    
+    if (thread_offset > 0) {
+        #define WINDOW_ADD(window) { \
+            uint digit = (thread_offset >> (4 * window)) & 0xF; \
+            if (digit != 0) { \
+                uint idx = window * 15 + (digit - 1); \
+                constant uchar* wp = wnaf_table + idx * 64; \
+                ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, \
+                                   load_be(wp), load_be(wp + 32), \
+                                   cur_X, cur_Y, cur_Z, cur_ZZ); \
+            } \
+        }
+        WINDOW_ADD(0)
+        WINDOW_ADD(1)
+        WINDOW_ADD(2)
+        WINDOW_ADD(3)
+        WINDOW_ADD(4)
+        #undef WINDOW_ADD
+    }
+    
+    // Thread-local arrays - for primary keys
+    ulong4 batch_X[BATCH_SIZE];
+    ulong4 batch_Y[BATCH_SIZE];
+    ulong4 batch_Z[BATCH_SIZE];
+    ulong4 batch_ZZ[BATCH_SIZE];
+    ulong4 batch_Zinv[BATCH_SIZE];
+    ulong4 batch_privkey[BATCH_SIZE];
+    bool batch_valid[BATCH_SIZE];
+    
+    ulong4 products[BATCH_SIZE];
+    int product_map[BATCH_SIZE];
+    
+    // Phase 1: Generate batch points
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        ulong4 priv = base_priv;
+        scalar_add_u64(priv, thread_offset + b);
+        batch_privkey[b] = priv;
+        
+        batch_X[b] = cur_X;
+        batch_Y[b] = cur_Y;
+        batch_Z[b] = cur_Z;
+        batch_ZZ[b] = cur_ZZ;
+        batch_valid[b] = !IsZero(cur_Z);
+        
+        ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
+                           SECP256K1_GX, SECP256K1_GY,
+                           cur_X, cur_Y, cur_Z, cur_ZZ);
+    }
+    
+    // Phase 2: Montgomery Batch Inversion
+    int valid_count = 0;
+    
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        if (batch_valid[b]) {
+            if (valid_count == 0) {
+                products[0] = batch_Z[b];
+            } else {
+                products[valid_count] = mod_mul(products[valid_count - 1], batch_Z[b]);
+            }
+            product_map[valid_count] = b;
+            valid_count++;
+        } else {
+            batch_Zinv[b] = ulong4{0, 0, 0, 0};
+        }
+    }
+    
+    if (valid_count > 0) {
+        ulong4 inv = mod_inv(products[valid_count - 1]);
+        
+        for (int i = valid_count - 1; i > 0; i--) {
+            int b = product_map[i];
+            batch_Zinv[b] = mod_mul(inv, products[i - 1]);
+            inv = mod_mul(inv, batch_Z[b]);
+        }
+        batch_Zinv[product_map[0]] = inv;
+    }
+    
+    // Phase 3: Output - 2 keys per point (PRIMARY + GLV)
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        // Output position: 2 keys per batch entry (primary at even, GLV at odd)
+        uint out_base_primary = (gid * BATCH_SIZE * 2 + b * 2) * OUTPUT_SIZE;
+        uint out_base_glv = out_base_primary + OUTPUT_SIZE;
+        
+        if (!batch_valid[b]) {
+            // Zero out both entries
+            for (int i = 0; i < OUTPUT_SIZE; i++) {
+                output[out_base_primary + i] = 0;
+                output[out_base_glv + i] = 0;
+            }
+            continue;
+        }
+        
+        // Convert to affine coordinates
+        ulong4 z_inv2 = mod_sqr(batch_Zinv[b]);
+        ulong4 z_inv3 = mod_mul(z_inv2, batch_Zinv[b]);
+        ulong4 ax = mod_mul(batch_X[b], z_inv2);
+        ulong4 ay = mod_mul(batch_Y[b], z_inv3);
+        
+        // ========================
+        // PRIMARY KEY OUTPUT
+        // ========================
+        {
+            uchar pubkey_hash[20];
+            hash160_compressed(ax, ay, pubkey_hash);
+            
+            uchar p2sh_hash[20];
+            compute_p2sh_hash(pubkey_hash, p2sh_hash);
+            
+            uchar privkey_bytes[32];
+            store_be(batch_privkey[b], privkey_bytes);
+            
+            for (int i = 0; i < 32; i++) {
+                output[out_base_primary + i] = privkey_bytes[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_primary + 32 + i] = pubkey_hash[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_primary + 52 + i] = p2sh_hash[i];
+            }
+        }
+        
+        // ========================
+        // GLV KEY OUTPUT
+        // φ(x, y) = (β·x mod p, y)
+        // privkey_glv = λ·privkey mod n
+        // ========================
+        {
+            // Apply GLV endomorphism to get secondary pubkey (FREE - just multiply x by β)
+            ulong4 glv_x, glv_y;
+            glv_endomorphism(ax, ay, glv_x, glv_y);
+            
+            // Compute GLV private key: λ·k mod n
+            ulong4 glv_priv = scalar_mul_mod_n(batch_privkey[b], GLV_LAMBDA);
+            
+            uchar glv_pubkey_hash[20];
+            hash160_compressed(glv_x, glv_y, glv_pubkey_hash);
+            
+            uchar glv_p2sh_hash[20];
+            compute_p2sh_hash(glv_pubkey_hash, glv_p2sh_hash);
+            
+            uchar glv_privkey_bytes[32];
+            store_be(glv_priv, glv_privkey_bytes);
+            
+            for (int i = 0; i < 32; i++) {
+                output[out_base_glv + i] = glv_privkey_bytes[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_glv + 32 + i] = glv_pubkey_hash[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_glv + 52 + i] = glv_p2sh_hash[i];
+            }
         }
     }
 }

@@ -1,0 +1,227 @@
+//! Shared Data Types for Bridge
+//!
+//! These types are the contract between Generator and Reader.
+//! Neither module should depend on the other's implementation details.
+
+/// Raw key data - the minimal unit of data exchanged
+/// Layout: [privkey: 32 bytes][pubkey_hash: 20 bytes][p2sh_hash: 20 bytes]
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct RawKeyData {
+    /// Private key (32 bytes, big-endian)
+    pub private_key: [u8; 32],
+    /// RIPEMD160(SHA256(compressed_pubkey)) - used for P2PKH and P2WPKH
+    pub pubkey_hash: [u8; 20],
+    /// RIPEMD160(SHA256(0x0014 || pubkey_hash)) - used for P2SH-P2WPKH
+    pub p2sh_hash: [u8; 20],
+}
+
+impl RawKeyData {
+    /// Size of RawKeyData in bytes
+    pub const SIZE: usize = 72;
+    
+    /// Create from raw bytes
+    #[inline]
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::SIZE {
+            return None;
+        }
+        
+        let mut private_key = [0u8; 32];
+        let mut pubkey_hash = [0u8; 20];
+        let mut p2sh_hash = [0u8; 20];
+        
+        private_key.copy_from_slice(&data[0..32]);
+        pubkey_hash.copy_from_slice(&data[32..52]);
+        p2sh_hash.copy_from_slice(&data[52..72]);
+        
+        Some(Self {
+            private_key,
+            pubkey_hash,
+            p2sh_hash,
+        })
+    }
+    
+    /// Check if this key data is valid (non-zero private key)
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.private_key.iter().any(|&b| b != 0)
+    }
+    
+    /// Get private key as hex string
+    pub fn private_key_hex(&self) -> String {
+        hex::encode(&self.private_key)
+    }
+}
+
+/// A batch of raw key data - zero-copy view into GPU buffer
+pub struct KeyBatch<'a> {
+    /// Raw byte slice from GPU buffer (Unified Memory)
+    data: &'a [u8],
+    /// Number of keys in this batch
+    count: usize,
+}
+
+impl<'a> KeyBatch<'a> {
+    /// Create a new key batch from raw bytes
+    pub fn new(data: &'a [u8]) -> Self {
+        let count = data.len() / RawKeyData::SIZE;
+        Self { data, count }
+    }
+    
+    /// Number of keys in this batch
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    
+    /// Is the batch empty?
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    
+    /// Get key at index
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<RawKeyData> {
+        if index >= self.count {
+            return None;
+        }
+        let offset = index * RawKeyData::SIZE;
+        RawKeyData::from_bytes(&self.data[offset..offset + RawKeyData::SIZE])
+    }
+    
+    /// Iterate over all keys
+    pub fn iter(&self) -> KeyBatchIter<'a> {
+        KeyBatchIter {
+            data: self.data,
+            index: 0,
+            count: self.count,
+        }
+    }
+    
+    /// Get raw bytes for parallel processing
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.data
+    }
+    
+    /// Split into chunks for parallel processing
+    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = KeyBatch<'a>> {
+        self.data
+            .chunks(chunk_size * RawKeyData::SIZE)
+            .map(|chunk| KeyBatch::new(chunk))
+    }
+}
+
+/// Iterator over KeyBatch
+pub struct KeyBatchIter<'a> {
+    data: &'a [u8],
+    index: usize,
+    count: usize,
+}
+
+impl<'a> Iterator for KeyBatchIter<'a> {
+    type Item = RawKeyData;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.count {
+            return None;
+        }
+        let offset = self.index * RawKeyData::SIZE;
+        self.index += 1;
+        RawKeyData::from_bytes(&self.data[offset..offset + RawKeyData::SIZE])
+    }
+    
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for KeyBatchIter<'a> {}
+
+/// Type of address match
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchType {
+    /// P2PKH (Legacy) - starts with 1
+    P2PKH,
+    /// P2SH (Nested SegWit) - starts with 3
+    P2SH,
+    /// P2WPKH (Native SegWit) - starts with bc1q
+    P2WPKH,
+}
+
+impl std::fmt::Display for MatchType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatchType::P2PKH => write!(f, "P2PKH"),
+            MatchType::P2SH => write!(f, "P2SH"),
+            MatchType::P2WPKH => write!(f, "P2WPKH"),
+        }
+    }
+}
+
+/// A match result - when a key matches a target
+#[derive(Debug, Clone)]
+pub struct Match {
+    /// The matching key data
+    pub key: RawKeyData,
+    /// Which address type matched
+    pub match_type: MatchType,
+    /// The matched hash (20 bytes)
+    pub matched_hash: [u8; 20],
+}
+
+impl Match {
+    /// Create a new match
+    pub fn new(key: RawKeyData, match_type: MatchType) -> Self {
+        let matched_hash = match match_type {
+            MatchType::P2PKH | MatchType::P2WPKH => key.pubkey_hash,
+            MatchType::P2SH => key.p2sh_hash,
+        };
+        Self {
+            key,
+            match_type,
+            matched_hash,
+        }
+    }
+    
+    /// Format as a readable string
+    pub fn to_string_detailed(&self) -> String {
+        format!(
+            "🎯 FOUND! Key: {} | Type: {} | Hash: {}",
+            self.key.private_key_hex(),
+            self.match_type,
+            hex::encode(&self.matched_hash)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_raw_key_data_size() {
+        assert_eq!(RawKeyData::SIZE, 72);
+    }
+    
+    #[test]
+    fn test_key_batch_iteration() {
+        let mut data = vec![0u8; RawKeyData::SIZE * 3];
+        // Set first byte of each key to make them different
+        data[0] = 1;
+        data[RawKeyData::SIZE] = 2;
+        data[RawKeyData::SIZE * 2] = 3;
+        
+        let batch = KeyBatch::new(&data);
+        assert_eq!(batch.len(), 3);
+        
+        let keys: Vec<_> = batch.iter().collect();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].private_key[0], 1);
+        assert_eq!(keys[1].private_key[0], 2);
+        assert_eq!(keys[2].private_key[0], 3);
+    }
+}
+

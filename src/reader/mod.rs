@@ -9,17 +9,30 @@
 //!
 //! Optimizations:
 //! - Memory-mapped file reading
-//! - HashSet with pre-hashed lookups
+//! - HashSet with O(1) lookups
 //! - Parallel processing with rayon
 //! - Zero-copy address matching
+//!
+//! ## Bridge Integration
+//! 
+//! Use `TargetMatcher` to integrate with the bridge pipeline:
+//! ```ignore
+//! use xyz_pro::reader::{TargetSet, TargetMatcher};
+//! use xyz_pro::bridge::Matcher;
+//! 
+//! let matcher = TargetMatcher::load("targets.json")?;
+//! // Now 'matcher' implements Matcher trait
+//! ```
 
 mod targets;
 mod scanner;
 mod encoder;
+mod adapter;
 
 pub use targets::{TargetSet, TargetStats};
 pub use scanner::{RawFileScanner, ScanResult, Match, save_matches};
 pub use encoder::AddressEncoder;
+pub use adapter::{TargetMatcher, ParallelMatcher};
 
 /// Configuration for the reader
 #[derive(Debug, Clone)]

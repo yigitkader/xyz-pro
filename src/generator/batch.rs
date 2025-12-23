@@ -13,14 +13,14 @@ use dashmap::DashSet;
 use rayon::prelude::*;
 
 use super::{
-    AddressEncoder, GeneratorConfig, GeneratorStats, KeyEntry, KeyGenerator,
+    AddressEncoder, GeneratorConfig, GeneratorStats, KeyEntry, CpuKeyGenerator,
     OutputWriter,
 };
 
 /// Batch processor for high-throughput key generation
 pub struct BatchProcessor {
     config: GeneratorConfig,
-    keygen: Arc<KeyGenerator>,
+    keygen: Arc<CpuKeyGenerator>,
     /// Lock-free set for deduplication (stores private key hashes)
     seen_keys: Arc<DashSet<[u8; 32]>>,
     /// Statistics
@@ -43,7 +43,7 @@ impl BatchProcessor {
         
         Self {
             config,
-            keygen: Arc::new(KeyGenerator::new()),
+            keygen: Arc::new(CpuKeyGenerator::new()),
             seen_keys: Arc::new(DashSet::new()),
             total_generated: Arc::new(AtomicU64::new(0)),
             duplicates: Arc::new(AtomicU64::new(0)),
@@ -62,7 +62,7 @@ impl BatchProcessor {
         
         Self {
             config,
-            keygen: Arc::new(KeyGenerator::with_seed(seed)),
+            keygen: Arc::new(CpuKeyGenerator::with_seed(seed)),
             seen_keys: Arc::new(DashSet::new()),
             total_generated: Arc::new(AtomicU64::new(0)),
             duplicates: Arc::new(AtomicU64::new(0)),

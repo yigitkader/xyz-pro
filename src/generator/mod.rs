@@ -1,24 +1,44 @@
 //! High-Performance Bitcoin Key Generator
 //! 
 //! Standalone module for generating BTC private keys with addresses.
-//! Target: 1 billion keys per minute with deduplication.
+//! Target: 1 billion keys per minute.
+//! 
+//! Features:
+//! - GPU-accelerated with Metal (GLV Endomorphism for 2x throughput)
+//! - CPU fallback with parallel processing
+//! - Multiple output formats (JSON, Binary, Raw)
 //! 
 //! Supports:
 //! - P2PKH (Legacy)
 //! - P2SH (Nested SegWit)
 //! - P2WPKH (Native SegWit - Bech32)
+//!
+//! ## Bridge Integration
+//! 
+//! Use `GpuGeneratorAdapter` to integrate with the bridge pipeline:
+//! ```ignore
+//! use xyz_pro::generator::{GpuKeyGenerator, GpuGeneratorAdapter, GeneratorConfig};
+//! use xyz_pro::bridge::KeyGenerator;
+//! 
+//! let config = GeneratorConfig::default();
+//! let gpu_gen = GpuKeyGenerator::new(config)?;
+//! let adapter = GpuGeneratorAdapter::new(gpu_gen);
+//! // Now 'adapter' implements KeyGenerator trait
+//! ```
 
 mod keygen;
 mod encoder;
 mod writer;
 mod batch;
 mod gpu;
+mod adapter;
 
-pub use keygen::KeyGenerator;
+pub use keygen::KeyGenerator as CpuKeyGenerator;
 pub use encoder::AddressEncoder;
 pub use writer::{OutputWriter, OutputFormat, AsyncRawWriter};
 pub use batch::BatchProcessor;
-pub use gpu::GpuKeyGenerator;
+pub use gpu::{GpuKeyGenerator, BufferSet};
+pub use adapter::{GpuGeneratorAdapter, DirectBufferAdapter};
 
 use serde::{Deserialize, Serialize};
 

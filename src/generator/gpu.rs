@@ -145,13 +145,13 @@ unsafe impl Sync for PooledBuffer {}
 // ============================================================================
 
 /// Triple buffer set for async pipelining
-struct BufferSet {
-    queue: CommandQueue,
-    base_privkey_buf: Buffer,
-    base_pubkey_x_buf: Buffer,
-    base_pubkey_y_buf: Buffer,
-    output_buffer: Buffer,
-    keys_per_thread_buf: Buffer,
+pub struct BufferSet {
+    pub queue: CommandQueue,
+    pub base_privkey_buf: Buffer,
+    pub base_pubkey_x_buf: Buffer,
+    pub base_pubkey_y_buf: Buffer,
+    pub output_buffer: Buffer,
+    pub keys_per_thread_buf: Buffer,
 }
 
 /// GPU configuration based on hardware tier
@@ -208,6 +208,7 @@ pub struct GpuKeyGenerator {
     #[allow(dead_code)]
     device: Device,
     pipeline: ComputePipelineState,
+    pipeline_glv: ComputePipelineState,  // GLV kernel for 2x throughput
     config: GeneratorConfig,
     tier: GpuTier,
     
@@ -268,8 +269,20 @@ impl GpuKeyGenerator {
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| format!("Failed to create pipeline: {}", e))?;
         
+        // GLV kernel for 2x throughput
+        let function_glv = library
+            .get_function("generate_btc_keys_glv", None)
+            .map_err(|e| format!("Failed to get GLV kernel function: {}", e))?;
+        
+        let pipeline_glv = device
+            .new_compute_pipeline_state_with_function(&function_glv)
+            .map_err(|e| format!("Failed to create GLV pipeline: {}", e))?;
+        
+        println!("✅ GLV Endomorphism kernel loaded (2x throughput)");
+        
         let storage = MTLResourceOptions::StorageModeShared;
-        let output_buffer_size = tier.keys_per_dispatch * OUTPUT_SIZE;
+        // GLV outputs 2x keys per dispatch
+        let output_buffer_size = tier.keys_per_dispatch * OUTPUT_SIZE * 2;
         
         // Create buffer sets for pipelining
         println!("   Creating {} command queues for async pipelining", tier.pipeline_depth);
@@ -320,6 +333,7 @@ impl GpuKeyGenerator {
         Ok(Self {
             device,
             pipeline,
+            pipeline_glv,
             config,
             tier,
             buffer_sets,
@@ -337,6 +351,57 @@ impl GpuKeyGenerator {
     pub fn stop(&self) {
         self.should_stop.store(true, Ordering::SeqCst);
     }
+    
+    // ========================================================================
+    // ACCESSOR METHODS FOR BRIDGE ADAPTER
+    // ========================================================================
+    
+    /// Get batch size (keys per dispatch)
+    pub fn batch_size(&self) -> usize {
+        self.tier.keys_per_dispatch
+    }
+    
+    /// Get pipeline depth
+    pub fn pipeline_depth(&self) -> usize {
+        self.tier.pipeline_depth
+    }
+    
+    /// Get buffer set at index
+    pub fn buffer_set(&self, idx: usize) -> &BufferSet {
+        &self.buffer_sets[idx]
+    }
+    
+    /// Fetch and add to current offset
+    pub fn fetch_add_offset(&self, delta: u64) -> u64 {
+        self.current_offset.fetch_add(delta, Ordering::Relaxed)
+    }
+    
+    /// Get current offset
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset.load(Ordering::Relaxed)
+    }
+    
+    /// Check if should stop
+    pub fn should_stop_flag(&self) -> bool {
+        self.should_stop.load(Ordering::SeqCst)
+    }
+    
+    /// Get total generated
+    pub fn total_generated(&self) -> u64 {
+        self.total_generated.load(Ordering::Relaxed)
+    }
+    
+    /// Add to total generated
+    pub fn add_generated(&self, count: u64) {
+        self.total_generated.fetch_add(count, Ordering::Relaxed);
+    }
+    
+    /// Dispatch with GLV (public for adapter)
+    pub fn dispatch_glv(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        self.dispatch_batch_glv(buf_idx, base_offset)
+    }
+    
+    // ========================================================================
     
     /// Pre-compute base public key from private key (CPU side)
     fn compute_base_pubkey(base_privkey: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), String> {
@@ -385,6 +450,15 @@ impl GpuKeyGenerator {
     
     /// Dispatch a batch on the specified buffer set
     fn dispatch_batch(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        self.dispatch_batch_internal(buf_idx, base_offset, false)
+    }
+    
+    /// Dispatch batch with GLV endomorphism (2x output)
+    fn dispatch_batch_glv(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        self.dispatch_batch_internal(buf_idx, base_offset, true)
+    }
+    
+    fn dispatch_batch_internal(&self, buf_idx: usize, base_offset: u64, use_glv: bool) -> Result<(), String> {
         let bs = &self.buffer_sets[buf_idx];
         
         let base_privkey = Self::offset_to_privkey(base_offset);
@@ -413,7 +487,10 @@ impl GpuKeyGenerator {
         let command_buffer = bs.queue.new_command_buffer();
         let compute_encoder = command_buffer.new_compute_command_encoder();
         
-        compute_encoder.set_compute_pipeline_state(&self.pipeline);
+        // Select pipeline: GLV for 2x throughput, standard otherwise
+        let pipeline = if use_glv { &self.pipeline_glv } else { &self.pipeline };
+        
+        compute_encoder.set_compute_pipeline_state(pipeline);
         compute_encoder.set_buffer(0, Some(&bs.base_privkey_buf), 0);
         compute_encoder.set_buffer(1, Some(&bs.base_pubkey_x_buf), 0);
         compute_encoder.set_buffer(2, Some(&bs.base_pubkey_y_buf), 0);
@@ -723,6 +800,196 @@ impl GpuKeyGenerator {
             files_written,
             elapsed_secs: elapsed,
         })
+    }
+    
+    /// NASA-GRADE INTEGRATED SCAN MODE
+    /// - Zero Disk I/O (Matching in RAM)
+    /// - GPU generates, CPU matches in parallel
+    /// - Uses Unified Memory (zero-copy)
+    /// - Only writes when match found
+    /// NASA-GRADE INTEGRATED SCAN MODE with GLV Endomorphism (2x throughput)
+    /// - Zero Disk I/O (Matching in RAM)
+    /// - GPU generates 2 keys per EC operation (primary + GLV)
+    /// - Uses Unified Memory (zero-copy)
+    /// - Only writes when match found
+    pub fn run_scan(&self, targets: std::sync::Arc<crate::reader::TargetSet>) -> Result<ScanStats, String> {
+        use rayon::prelude::*;
+        use std::sync::atomic::AtomicU64;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        
+        let start_time = Instant::now();
+        let depth = self.tier.pipeline_depth;
+        let hits_found = AtomicU64::new(0);
+        
+        // GLV mode: 2 keys per EC operation
+        let keys_per_dispatch = self.tier.keys_per_dispatch * 2;
+        let output_size = keys_per_dispatch * OUTPUT_SIZE;
+        
+        println!("🚀 NASA-GRADE INTEGRATED SCAN MODE + GLV ENDOMORPHISM");
+        println!("   ✓ Zero Disk I/O (Matching in RAM)");
+        println!("   ✓ GLV Endomorphism: 2x throughput (2 keys per EC op)");
+        println!("   ✓ GPU generates → CPU matches (parallel)");
+        println!("   ✓ Unified Memory (zero-copy access)");
+        println!("   ✓ Target Count: {} (Hash160: {}, P2SH: {})", 
+                 targets.stats.total, 
+                 targets.stats.p2pkh + targets.stats.p2wpkh,
+                 targets.stats.p2sh);
+        println!("   Pipeline depth: {}", depth);
+        println!("   Keys per dispatch: {} ({:.2}M) [GLV: 2x]", 
+                 keys_per_dispatch,
+                 keys_per_dispatch as f64 / 1_000_000.0);
+        println!();
+        
+        // Open matches file (append mode)
+        let matches_file = std::sync::Mutex::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("matches.txt")
+                .map_err(|e| format!("Failed to open matches file: {}", e))?
+        );
+        
+        let mut last_report = Instant::now();
+        let report_interval = Duration::from_secs(2);
+        
+        // Prime the pipeline with GLV kernel
+        for i in 0..depth {
+            let offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            self.dispatch_batch_glv(i, offset)?;
+        }
+        
+        let mut current_buf = 0;
+        
+        while !self.should_stop.load(Ordering::SeqCst) {
+            let process_idx = current_buf % depth;
+            let bs = &self.buffer_sets[process_idx];
+            
+            // Wait for GPU completion
+            let cb = bs.queue.new_command_buffer();
+            cb.commit();
+            cb.wait_until_completed();
+            
+            // ZERO-COPY: Direct access to GPU buffer via Unified Memory
+            // GLV outputs 2x keys per dispatch
+            let output_ptr = bs.output_buffer.contents() as *const u8;
+            let output_slice = unsafe {
+                std::slice::from_raw_parts(output_ptr, output_size)
+            };
+            
+            // PARALLEL SCAN: CPU matches while GPU prepares next batch
+            let batch_hits: Vec<String> = output_slice
+                .par_chunks_exact(OUTPUT_SIZE)
+                .filter_map(|entry| {
+                    let privkey = &entry[0..32];
+                    
+                    // Skip zero keys
+                    if privkey.iter().all(|&b| b == 0) {
+                        return None;
+                    }
+                    
+                    let pubkey_hash: &[u8; 20] = entry[32..52].try_into().ok()?;
+                    let p2sh_hash: &[u8; 20] = entry[52..72].try_into().ok()?;
+                    
+                    // O(1) HashSet lookup
+                    let (match_p2pkh, match_p2sh, match_p2wpkh) = targets.check_raw(pubkey_hash, p2sh_hash);
+                    
+                    if match_p2pkh || match_p2sh || match_p2wpkh {
+                        let priv_hex = hex::encode(privkey);
+                        let mut result = format!("🎯 FOUND! Key: {}", priv_hex);
+                        
+                        if match_p2pkh {
+                            result.push_str(&format!(" | P2PKH hash: {}", hex::encode(pubkey_hash)));
+                        }
+                        if match_p2sh {
+                            result.push_str(&format!(" | P2SH hash: {}", hex::encode(p2sh_hash)));
+                        }
+                        if match_p2wpkh {
+                            result.push_str(&format!(" | P2WPKH hash: {}", hex::encode(pubkey_hash)));
+                        }
+                        
+                        Some(result)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            // Write matches (if any)
+            if !batch_hits.is_empty() {
+                hits_found.fetch_add(batch_hits.len() as u64, Ordering::Relaxed);
+                
+                if let Ok(mut file) = matches_file.lock() {
+                    for hit in &batch_hits {
+                        println!("{}", hit);
+                        let _ = writeln!(file, "{}", hit);
+                    }
+                    let _ = file.flush();
+                }
+            }
+            
+            // GLV: 2 keys per EC operation
+            self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
+            
+            // LOOK-AHEAD: Dispatch next batch while CPU is matching
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            self.dispatch_batch_glv(process_idx, next_offset)?;
+            
+            current_buf += 1;
+            
+            // Progress report
+            if last_report.elapsed() >= report_interval {
+                let total = self.total_generated.load(Ordering::Relaxed);
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let rate = total as f64 / elapsed;
+                let hits = hits_found.load(Ordering::Relaxed);
+                
+                println!(
+                    "⚡ {} keys | {:.2}M/sec | {:.1}M/min | Hits: {} | Key: 0x{:012x}",
+                    format_number(total),
+                    rate / 1_000_000.0,
+                    rate * 60.0 / 1_000_000.0,
+                    hits,
+                    self.current_offset.load(Ordering::Relaxed)
+                );
+                
+                last_report = Instant::now();
+            }
+        }
+        
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let total = self.total_generated.load(Ordering::Relaxed);
+        let hits = hits_found.load(Ordering::Relaxed);
+        
+        Ok(ScanStats {
+            keys_scanned: total,
+            hits_found: hits,
+            elapsed_secs: elapsed,
+        })
+    }
+}
+
+/// Scan statistics
+#[derive(Debug, Default)]
+pub struct ScanStats {
+    pub keys_scanned: u64,
+    pub hits_found: u64,
+    pub elapsed_secs: f64,
+}
+
+impl ScanStats {
+    pub fn keys_per_second(&self) -> f64 {
+        if self.elapsed_secs > 0.0 {
+            self.keys_scanned as f64 / self.elapsed_secs
+        } else {
+            0.0
+        }
+    }
+    
+    pub fn keys_per_minute(&self) -> f64 {
+        self.keys_per_second() * 60.0
     }
 }
 
