@@ -282,5 +282,100 @@ mod tests {
         
         assert_eq!(output, expected, "Should match reference Philox output");
     }
+    
+    #[test]
+    fn test_for_thread_matches_gpu() {
+        // CRITICAL: Verify for_thread() matches GPU's philox_for_thread()
+        // GPU code:
+        //   ulong sum = (ulong)base_counter->x + (ulong)thread_id;
+        //   state.counter.x = (uint)sum;
+        //   ulong carry = sum >> 32;
+        //   ... (propagate carry through y, z, w)
+        
+        let base_state = PhiloxState {
+            counter: [1000, 5, 0, 0],
+            key: [0x12345678, 0x9ABCDEF0],
+        };
+        
+        // Test various thread_ids
+        for thread_id in [0u32, 1, 100, 1000, 0xFFFFFFFF] {
+            let thread_state = base_state.for_thread(thread_id);
+            
+            // Manually compute expected counter (GPU algorithm)
+            let sum0 = (base_state.counter[0] as u64) + (thread_id as u64);
+            let expected_c0 = sum0 as u32;
+            let carry0 = sum0 >> 32;
+            
+            let sum1 = (base_state.counter[1] as u64) + carry0;
+            let expected_c1 = sum1 as u32;
+            let carry1 = sum1 >> 32;
+            
+            let sum2 = (base_state.counter[2] as u64) + carry1;
+            let expected_c2 = sum2 as u32;
+            let carry2 = sum2 >> 32;
+            
+            let expected_c3 = base_state.counter[3].wrapping_add(carry2 as u32);
+            
+            assert_eq!(thread_state.counter[0], expected_c0, 
+                "counter[0] mismatch for thread_id={}", thread_id);
+            assert_eq!(thread_state.counter[1], expected_c1, 
+                "counter[1] mismatch for thread_id={}", thread_id);
+            assert_eq!(thread_state.counter[2], expected_c2, 
+                "counter[2] mismatch for thread_id={}", thread_id);
+            assert_eq!(thread_state.counter[3], expected_c3, 
+                "counter[3] mismatch for thread_id={}", thread_id);
+            
+            // Key should be unchanged
+            assert_eq!(thread_state.key, base_state.key, 
+                "key should be unchanged for thread_id={}", thread_id);
+        }
+    }
+    
+    #[test]
+    fn test_for_thread_overflow_handling() {
+        // Test 128-bit overflow propagation
+        // This is critical for GPU/CPU sync!
+        
+        // Case 1: Overflow in counter[0]
+        let state1 = PhiloxState {
+            counter: [0xFFFFFFFF, 0, 0, 0],
+            key: [1, 2],
+        };
+        let result1 = state1.for_thread(2);
+        assert_eq!(result1.counter, [1, 1, 0, 0], 
+            "Overflow should propagate from counter[0] to counter[1]");
+        
+        // Case 2: Cascade overflow
+        let state2 = PhiloxState {
+            counter: [0xFFFFFFFF, 0xFFFFFFFF, 0, 0],
+            key: [1, 2],
+        };
+        let result2 = state2.for_thread(1);
+        assert_eq!(result2.counter, [0, 0, 1, 0], 
+            "Cascade overflow should propagate through counter[1] to counter[2]");
+        
+        // Case 3: Full cascade
+        let state3 = PhiloxState {
+            counter: [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0],
+            key: [1, 2],
+        };
+        let result3 = state3.for_thread(1);
+        assert_eq!(result3.counter, [0, 0, 0, 1], 
+            "Full cascade should reach counter[3]");
+    }
+    
+    #[test]
+    fn test_thread_keys_unique() {
+        // Verify different threads produce different keys
+        let base_state = PhiloxState::new(42);
+        
+        let key0 = philox_to_privkey(&base_state.for_thread(0));
+        let key1 = philox_to_privkey(&base_state.for_thread(1));
+        let key100 = philox_to_privkey(&base_state.for_thread(100));
+        
+        assert_ne!(key0, key1, "Thread 0 and 1 should have different keys");
+        assert_ne!(key0, key100, "Thread 0 and 100 should have different keys");
+        assert_ne!(key1, key100, "Thread 1 and 100 should have different keys");
+    }
 }
 
