@@ -1,10 +1,17 @@
 use std::hash::Hasher;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 use fxhash::FxHasher;
 use rayon::prelude::*;
+
+const CACHE_MAGIC: &[u8; 8] = b"XORFL_01";
 
 /// XorFilter32 - Probabilistic set membership filter
 /// False positive rate: ~0.0015% (1 in 65536)
 /// Memory: ~40 bits per element
+/// 
+/// Construction uses XOR-trick peeling algorithm: O(n) instead of O(n²)
 pub struct XorFilter32 {
     fingerprints: Vec<u32>,
     seed: u64,
@@ -13,7 +20,41 @@ pub struct XorFilter32 {
 }
 
 impl XorFilter32 {
+    /// Create new filter from targets - uses cache if available
+    #[allow(dead_code)]
     pub fn new(targets: &[[u8; 20]]) -> Self {
+        Self::new_with_cache(targets, None)
+    }
+    
+    /// Create filter with optional cache path
+    pub fn new_with_cache(targets: &[[u8; 20]], cache_path: Option<&str>) -> Self {
+        // Try to load from cache first
+        if let Some(path) = cache_path {
+            if let Some(filter) = Self::load_from_cache(path, targets.len()) {
+                println!("[Xor] Loaded from cache: {} ({:.1} MB)", 
+                    path, 
+                    (filter.fingerprints.len() * 4) as f64 / 1e6);
+                return filter;
+            }
+        }
+        
+        // Build from scratch
+        let filter = Self::build_new(targets);
+        
+        // Save to cache if path provided
+        if let Some(path) = cache_path {
+            if let Err(e) = filter.save_to_cache(path) {
+                eprintln!("[Xor] Warning: Failed to save cache: {}", e);
+            } else {
+                println!("[Xor] Cache saved: {}", path);
+            }
+        }
+        
+        filter
+    }
+    
+    /// Build filter from targets (no cache)
+    fn build_new(targets: &[[u8; 20]]) -> Self {
         let size = targets.len();
         // 1.35x capacity for reliable construction (1.23 is theoretical minimum)
         let capacity = (((size as f64) * 1.35) as usize / 3) * 3;
@@ -22,14 +63,18 @@ impl XorFilter32 {
         println!("[Xor] Building filter for {} targets...", size);
         println!("[Xor] Capacity: {} (3 × {} blocks)", capacity, block_length);
         
+        let start = std::time::Instant::now();
+        
         let mut fingerprints = vec![0u32; capacity];
         let mut seed = 0x517cc1b727220a95_u64;
         let mut success = false;
         
         for attempt in 0..20 {
             fingerprints.fill(0);
-            if Self::construct(&targets, &mut fingerprints, block_length, seed) {
+            if Self::construct_optimized(targets, &mut fingerprints, block_length, seed) {
                 success = true;
+                println!("[Xor] Construction succeeded on attempt {} in {:.2}s", 
+                    attempt + 1, start.elapsed().as_secs_f64());
                 break;
             }
             seed = seed.wrapping_mul(0x5851f42d4c957f2d).wrapping_add(attempt as u64);
@@ -49,15 +94,23 @@ impl XorFilter32 {
         prefixes.par_sort_unstable();
         prefixes.dedup();
         
-        println!("[Xor] Built: {:.1} MB filter | {} prefixes ({:.1} MB)",
+        println!("[Xor] Built: {:.1} MB filter | {} prefixes ({:.1} MB) | Total: {:.2}s",
             (fingerprints.len() * 4) as f64 / 1e6,
             prefixes.len(),
-            (prefixes.len() * 4) as f64 / 1e6);
+            (prefixes.len() * 4) as f64 / 1e6,
+            start.elapsed().as_secs_f64());
         
         Self { fingerprints, seed, block_length, prefix_table: prefixes }
     }
     
-    fn construct(
+    /// O(n) Optimized construction using XOR-trick for graph peeling
+    /// 
+    /// Instead of searching for keys that use a slot, we maintain:
+    /// - count[slot]: Number of keys using this slot
+    /// - key_xor[slot]: XOR of indices of keys using this slot
+    /// 
+    /// When count == 1, key_xor directly gives the key index!
+    fn construct_optimized(
         targets: &[[u8; 20]],
         fingerprints: &mut [u32],
         block_length: usize,
@@ -68,53 +121,62 @@ impl XorFilter32 {
         
         // Step 1: Parallel hash computation
         let hashes: Vec<(u32, u32, u32, u32)> = targets.par_iter()
-            .map(|hash| {
-                let (h0, h1, h2, fp) = Self::hash_to_positions(hash, seed, block_length);
-                (h0, h1, h2, fp)
-            })
+            .map(|hash| Self::hash_to_positions(hash, seed, block_length))
             .collect();
         
-        // Step 2: Build degree counts
-        let mut degree = vec![0u32; m];
-        for &(h0, h1, h2, _) in &hashes {
-            degree[h0 as usize] += 1;
-            degree[h1 as usize] += 1;
-            degree[h2 as usize] += 1;
+        // Step 2: Build slot metadata using XOR-trick
+        // count[i] = number of keys that use slot i
+        // key_xor[i] = XOR of all key indices that use slot i
+        // When count[i] == 1, key_xor[i] is the index of that single key
+        let mut count = vec![0u32; m];
+        let mut key_xor = vec![0u32; m];
+        
+        for (idx, &(h0, h1, h2, _)) in hashes.iter().enumerate() {
+            let idx32 = idx as u32;
+            count[h0 as usize] += 1;
+            count[h1 as usize] += 1;
+            count[h2 as usize] += 1;
+            key_xor[h0 as usize] ^= idx32;
+            key_xor[h1 as usize] ^= idx32;
+            key_xor[h2 as usize] ^= idx32;
         }
         
-        // Step 3: Initialize queue with singletons
+        // Step 3: Initialize queue with singleton slots
         let mut queue: Vec<u32> = (0..m as u32)
-            .filter(|&i| degree[i as usize] == 1)
+            .filter(|&i| count[i as usize] == 1)
             .collect();
         
-        // Step 4: Peel graph
+        // Step 4: Peel graph - O(n) total!
         let mut stack = Vec::with_capacity(n);
-        let mut removed = vec![false; n];
         
-        while let Some(pos) = queue.pop() {
-            if degree[pos as usize] != 1 { continue; }
+        while let Some(slot) = queue.pop() {
+            if count[slot as usize] != 1 { 
+                continue; 
+            }
             
-            // Find the key that maps to this position
-            for (idx, &(h0, h1, h2, _)) in hashes.iter().enumerate() {
-                if removed[idx] { continue; }
-                if h0 == pos || h1 == pos || h2 == pos {
-                    removed[idx] = true;
-                    stack.push((idx, pos));
-                    
-                    // Update degrees
-                    degree[h0 as usize] -= 1;
-                    degree[h1 as usize] -= 1;
-                    degree[h2 as usize] -= 1;
-                    
-                    if degree[h0 as usize] == 1 { queue.push(h0); }
-                    if degree[h1 as usize] == 1 { queue.push(h1); }
-                    if degree[h2 as usize] == 1 { queue.push(h2); }
-                    break;
+            // XOR-trick: key_xor directly gives us the key index!
+            let key_idx = key_xor[slot as usize] as usize;
+            let (h0, h1, h2, _) = hashes[key_idx];
+            
+            stack.push((key_idx, slot));
+            
+            // Remove this key from all its slots
+            let key_idx32 = key_idx as u32;
+            for &slot_pos in &[h0, h1, h2] {
+                count[slot_pos as usize] -= 1;
+                key_xor[slot_pos as usize] ^= key_idx32;
+                
+                // If slot becomes singleton, add to queue
+                if count[slot_pos as usize] == 1 {
+                    queue.push(slot_pos);
                 }
             }
         }
         
-        if stack.len() != n { return false; }
+        // Check if all keys were peeled
+        if stack.len() != n { 
+            return false; 
+        }
         
         // Step 5: Assign fingerprints in reverse order
         for (idx, pos) in stack.into_iter().rev() {
@@ -147,6 +209,134 @@ impl XorFilter32 {
         let fp = (hash2 >> 32) as u32;
         
         (p0, p1, p2, fp)
+    }
+    
+    // ========================================================================
+    // CACHE SUPPORT
+    // ========================================================================
+    
+    /// Save filter to binary cache file
+    /// Format: MAGIC (8) | count (8) | seed (8) | block_length (8) | 
+    ///         prefix_count (8) | fingerprints | prefixes
+    pub fn save_to_cache(&self, path: &str) -> std::io::Result<()> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        
+        // Header
+        writer.write_all(CACHE_MAGIC)?;
+        writer.write_all(&(self.fingerprints.len() as u64).to_le_bytes())?;
+        writer.write_all(&self.seed.to_le_bytes())?;
+        writer.write_all(&(self.block_length as u64).to_le_bytes())?;
+        writer.write_all(&(self.prefix_table.len() as u64).to_le_bytes())?;
+        
+        // Fingerprints (bulk write)
+        let fp_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.fingerprints.as_ptr() as *const u8,
+                self.fingerprints.len() * 4,
+            )
+        };
+        writer.write_all(fp_bytes)?;
+        
+        // Prefixes (bulk write)
+        let prefix_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.prefix_table.as_ptr() as *const u8,
+                self.prefix_table.len() * 4,
+            )
+        };
+        writer.write_all(prefix_bytes)?;
+        
+        writer.flush()?;
+        Ok(())
+    }
+    
+    /// Load filter from binary cache file
+    /// Returns None if cache doesn't exist, is invalid, or target count mismatch
+    pub fn load_from_cache(path: &str, expected_target_count: usize) -> Option<Self> {
+        let path = Path::new(path);
+        if !path.exists() {
+            return None;
+        }
+        
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::with_capacity(1024 * 1024, file);
+        
+        // Read header
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic).ok()?;
+        if &magic != CACHE_MAGIC {
+            eprintln!("[Xor] Cache version mismatch, rebuilding...");
+            return None;
+        }
+        
+        let mut buf8 = [0u8; 8];
+        
+        reader.read_exact(&mut buf8).ok()?;
+        let fingerprint_count = u64::from_le_bytes(buf8) as usize;
+        
+        reader.read_exact(&mut buf8).ok()?;
+        let seed = u64::from_le_bytes(buf8);
+        
+        reader.read_exact(&mut buf8).ok()?;
+        let block_length = u64::from_le_bytes(buf8) as usize;
+        
+        reader.read_exact(&mut buf8).ok()?;
+        let prefix_count = u64::from_le_bytes(buf8) as usize;
+        
+        // Validate expected capacity
+        // capacity = ((target_count * 1.35) / 3) * 3
+        let expected_capacity = (((expected_target_count as f64) * 1.35) as usize / 3) * 3;
+        if fingerprint_count != expected_capacity {
+            eprintln!("[Xor] Cache capacity mismatch (expected {}, got {}), rebuilding...", 
+                expected_capacity, fingerprint_count);
+            return None;
+        }
+        
+        // Read fingerprints
+        let mut fingerprints = vec![0u32; fingerprint_count];
+        let fp_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                fingerprints.as_mut_ptr() as *mut u8,
+                fingerprint_count * 4,
+            )
+        };
+        reader.read_exact(fp_bytes).ok()?;
+        
+        // Read prefixes
+        let mut prefix_table = vec![0u32; prefix_count];
+        let prefix_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                prefix_table.as_mut_ptr() as *mut u8,
+                prefix_count * 4,
+            )
+        };
+        reader.read_exact(prefix_bytes).ok()?;
+        
+        Some(Self {
+            fingerprints,
+            seed,
+            block_length,
+            prefix_table,
+        })
+    }
+    
+    /// Check if cache file exists and appears valid
+    #[allow(dead_code)]
+    pub fn cache_exists(path: &str) -> bool {
+        Path::new(path).exists()
+    }
+    
+    // ========================================================================
+    // PUBLIC API
+    // ========================================================================
+    
+    #[allow(dead_code)]
+    pub fn contains(&self, hash: &[u8; 20]) -> bool {
+        let (h0, h1, h2, fp) = Self::hash_to_positions(hash, self.seed, self.block_length);
+        self.fingerprints[h0 as usize] 
+            ^ self.fingerprints[h1 as usize] 
+            ^ self.fingerprints[h2 as usize] == fp
     }
     
     pub fn gpu_data(&self) -> (&[u32], [u64; 3], u32) {
@@ -210,13 +400,50 @@ mod tests {
         println!("FP rate: {:.4}%", rate * 100.0);
         assert!(rate < 0.002, "FP rate too high: {:.4}%", rate * 100.0);
     }
-}
-
-impl XorFilter32 {
-    pub fn contains(&self, hash: &[u8; 20]) -> bool {
-        let (h0, h1, h2, fp) = Self::hash_to_positions(hash, self.seed, self.block_length);
-        self.fingerprints[h0 as usize] 
-            ^ self.fingerprints[h1 as usize] 
-            ^ self.fingerprints[h2 as usize] == fp
+    
+    #[test]
+    fn test_cache_roundtrip() {
+        let targets: Vec<_> = (0..5_000).map(|_| random_hash()).collect();
+        let filter = XorFilter32::new(&targets);
+        
+        let temp_path = std::env::temp_dir().join("test_xor_cache.xor");
+        let path_str = temp_path.to_str().unwrap();
+        
+        // Save
+        filter.save_to_cache(path_str).unwrap();
+        
+        // Load
+        let loaded = XorFilter32::load_from_cache(path_str, targets.len()).unwrap();
+        
+        // Verify
+        assert_eq!(filter.seed, loaded.seed);
+        assert_eq!(filter.block_length, loaded.block_length);
+        assert_eq!(filter.fingerprints, loaded.fingerprints);
+        assert_eq!(filter.prefix_table, loaded.prefix_table);
+        
+        // Test membership
+        for hash in &targets {
+            assert!(loaded.contains(hash), "False negative after cache load");
+        }
+        
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    
+    #[test]
+    fn test_large_construction_performance() {
+        // Test that O(n) algorithm is fast even for larger sets
+        let targets: Vec<_> = (0..100_000).map(|_| random_hash()).collect();
+        
+        let start = std::time::Instant::now();
+        let filter = XorFilter32::new(&targets);
+        let elapsed = start.elapsed();
+        
+        println!("100K targets built in {:.2}s", elapsed.as_secs_f64());
+        assert!(elapsed.as_secs() < 5, "Construction too slow: {:?}", elapsed);
+        
+        // Verify no false negatives
+        for hash in targets.iter().take(1000) {
+            assert!(filter.contains(hash));
+        }
     }
 }

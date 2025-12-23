@@ -309,8 +309,10 @@ fn main() {
 
     let hashes = targets.get_all_hashes();
 
-    // Init GPU
-    let gpu = match OptimizedScanner::new(&hashes) {
+    // Init GPU with XorFilter cache support
+    // Cache path derived from targets file: targets.json → targets.xor
+    let xor_cache_path = TARGETS_FILE.replace(".json", ".xor");
+    let gpu = match OptimizedScanner::new_with_cache(&hashes, Some(&xor_cache_path)) {
         Ok(g) => Arc::new(g),
         Err(e) => {
             eprintln!("[✗] GPU: {}", e);
