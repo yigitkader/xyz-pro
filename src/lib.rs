@@ -5,6 +5,7 @@ pub mod address;
 pub mod crypto;
 pub mod error;
 pub mod gpu;
+pub mod startup_tests;
 pub mod targets;
 pub mod types;
 

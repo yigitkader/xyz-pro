@@ -1,5 +1,4 @@
-// src/targets/mod.rs
-// Target management module - MMAP OPTIMIZED (RAM: 2GB → 200MB)
+// Target management - MMAP optimized
 
 use bech32::{convert_bits, decode};
 use bs58;
@@ -15,19 +14,9 @@ use crate::address::p2sh_script_hash;
 use crate::error::{Result, ScannerError};
 use crate::types::{hash160_to_address, AddressType, Hash160};
 
-// ============================================================================
-// BINARY FORMAT v3 (SORTED for mmap binary search)
-// ============================================================================
-// Header: "XYZPRO03" (8 bytes) + count (8 bytes, LE) = 16 bytes
-// Records: [hash160 (20 bytes) + type (1 byte)] × count = 21 bytes each
-// SORTED by hash160 (lexicographic) for O(log n) binary search
-// ============================================================================
-
-const MAGIC_V3: &[u8; 8] = b"XYZPRO03";  // New sorted format
-const MAGIC_V2: &[u8; 8] = b"XYZPRO02";  // Legacy unsorted
-const MAGIC_V1: &[u8; 8] = b"XYZPRO01";  // Legacy unsorted
-const RECORD_SIZE: usize = 21; // 20 byte hash + 1 byte type
-const HEADER_SIZE: usize = 16; // 8 magic + 8 count
+const MAGIC: &[u8; 8] = b"XYZPRO03";  // Sorted binary format
+const RECORD_SIZE: usize = 21;         // 20 byte hash + 1 byte type
+const HEADER_SIZE: usize = 16;         // 8 magic + 8 count
 
 #[derive(Deserialize)]
 struct TargetFile {
@@ -94,86 +83,32 @@ impl TargetDatabase {
         Ok(results)
     }
 
-    /// Load via mmap - NO HashMap, direct binary search!
+    /// Load via mmap - direct binary search
     pub fn load_binary(path: &str) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Header kontrolü
-        if mmap.len() < HEADER_SIZE {
+        if mmap.len() < HEADER_SIZE || &mmap[0..8] != MAGIC {
             return Err(ScannerError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Binary file too small",
+                "Invalid binary format - delete .bin file and retry",
             )));
         }
 
-        // Detect version
-        let magic = &mmap[0..8];
-        let is_sorted = magic == MAGIC_V3;
-        
-        if !is_sorted && magic != MAGIC_V2 && magic != MAGIC_V1 {
-            return Err(ScannerError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid binary magic",
-            )));
-        }
+        let count = u64::from_le_bytes([
+            mmap[8], mmap[9], mmap[10], mmap[11],
+            mmap[12], mmap[13], mmap[14], mmap[15],
+        ]) as usize;
 
-        // Parse count (all versions use same position, v1 was u32, v2+ is u64)
-        let count = if magic == MAGIC_V1 {
-            u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize
-        } else {
-            u64::from_le_bytes([
-                mmap[8], mmap[9], mmap[10], mmap[11],
-                mmap[12], mmap[13], mmap[14], mmap[15],
-            ]) as usize
-        };
-
-        let header_size = if magic == MAGIC_V1 { 12 } else { 16 };
-        let expected_size = header_size + count * RECORD_SIZE;
-
+        let expected_size = HEADER_SIZE + count * RECORD_SIZE;
         if mmap.len() < expected_size {
             return Err(ScannerError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Binary file truncated: expected {} bytes, got {}", expected_size, mmap.len()),
+                "Binary file truncated",
             )));
         }
 
-        // If not sorted (v1/v2), convert to sorted format
-        if !is_sorted {
-            println!("[*] Converting to sorted format for mmap optimization...");
-            drop(mmap);
-            drop(file);
-            
-            // Re-read, sort, and save
-            let file = File::open(path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
-            
-            let data = &mmap[header_size..];
-            let mut entries: Vec<(Hash160, AddressType)> = (0..count)
-                .into_par_iter()
-                .filter_map(|i| {
-                    let offset = i * RECORD_SIZE;
-                    let hash = Hash160::from_slice(&data[offset..offset + 20]);
-                    let addr_type = AddressType::from_u8(data[offset + 20])?;
-                    Some((hash, addr_type))
-                })
-                .collect();
-            
-            entries.par_sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-            
-            drop(mmap);
-            drop(file);
-            
-            Self::save_sorted_binary(path, &entries)?;
-            println!("[✓] Converted to sorted format");
-            
-            // Re-load
-            return Self::load_binary(path);
-        }
-
-        let ram_mb = (count * RECORD_SIZE) as f64 / 1_000_000.0;
-        println!("[✓] Loaded {} targets via mmap ({:.1} MB virtual)", count, ram_mb);
-        println!("[*] RAM usage: ~200MB active (OS manages page cache)");
+        println!("[✓] Loaded {} targets ({:.1} MB)", count, (count * RECORD_SIZE) as f64 / 1e6);
 
         Ok(Self {
             mmap: Some(mmap),
@@ -182,13 +117,13 @@ impl TargetDatabase {
         })
     }
 
-    /// Save sorted binary (v3 format)
+    /// Save sorted binary
     fn save_sorted_binary(path: &str, entries: &[(Hash160, AddressType)]) -> Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, file);
 
         // Header v3
-        writer.write_all(MAGIC_V3)?;
+        writer.write_all(MAGIC)?;
         writer.write_all(&(entries.len() as u64).to_le_bytes())?;
 
         // Sorted records

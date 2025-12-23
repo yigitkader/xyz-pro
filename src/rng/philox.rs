@@ -60,19 +60,7 @@ impl PhiloxState {
         
         // If carry is still non-zero after processing all words,
         // we've overflowed the full 128-bit counter
-        if carry > 0 {
-            eprintln!("[CRITICAL] Philox counter 128-bit overflow detected!");
-            eprintln!("           This means we've exhausted 2^128 keys - astronomically unlikely!");
-            return false;
-        }
-        true
-    }
-    
-    /// Generate thread-specific state (for GPU)
-    pub fn for_thread(&self, thread_id: u64) -> Self {
-        let mut state = *self;
-        state.increment(thread_id);
-        state
+        carry == 0
     }
 }
 

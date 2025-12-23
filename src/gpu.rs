@@ -8,16 +8,9 @@ use crate::types::Hash160;
 use crate::rng::philox::{PhiloxCounter, PhiloxState, philox_to_privkey};
 use crate::filter::XorFilter32;
 
-/// GPU-CPU sync constant for batch size
-/// CRITICAL: This MUST match BATCH_SIZE in secp256k1_scanner.metal
-/// If Metal shader changes BATCH_SIZE, update this value!
-/// 
-/// M1 Base optimized: 16 (prevents register spilling on 7-8 core GPUs)
-/// M1 Pro alternative: 20 (for 14-16 core GPUs, change in .metal too!)
-/// M1 Max alternative: 24 (for 24+ core GPUs, change in .metal too!)
+/// Must match BATCH_SIZE in secp256k1_scanner.metal
 pub const GPU_BATCH_SIZE: u32 = 16;
 
-/// GPU configuration profile
 #[derive(Debug, Clone)]
 pub struct GpuConfig {
     #[allow(dead_code)]
@@ -30,48 +23,29 @@ pub struct GpuConfig {
 }
 
 impl GpuConfig {
-    /// Detect GPU and return optimal configuration
     pub fn detect(device: &Device) -> Self {
         let name = device.name().to_string();
-        let max_threadgroup = device.max_threads_per_threadgroup().width as usize;
+        let max_tg = device.max_threads_per_threadgroup().width as usize;
+        let mem_mb = device.recommended_max_working_set_size() / (1024 * 1024);
+        let (max_threads, keys_per_thread, tg_size, match_buf) = 
+            Self::config_for_gpu(&name, max_tg, mem_mb);
         
-        let gpu_memory = device.recommended_max_working_set_size();
-        let gpu_memory_mb = gpu_memory / (1024 * 1024);
-        let (max_threads, keys_per_thread, threadgroup_size, match_buffer_size) = 
-            Self::config_for_gpu(&name, max_threadgroup, gpu_memory_mb);
-        
-        GpuConfig {
-            name,
-            max_threads,
-            keys_per_thread,
-            threadgroup_size,
-            match_buffer_size,
-            gpu_memory_mb,
-        }
+        GpuConfig { name, max_threads, keys_per_thread, threadgroup_size: tg_size, 
+                   match_buffer_size: match_buf, gpu_memory_mb: mem_mb }
     }
     
-    /// Detect GPU core count on macOS via sysctl
     #[cfg(target_os = "macos")]
     fn detect_gpu_cores() -> Option<usize> {
         use std::process::Command;
-        if let Ok(output) = Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output() {
-            if output.status.success() {
-                let brand = String::from_utf8_lossy(&output.stdout);
-                if brand.to_lowercase().contains(" pro") {
-                    return Some(14);
-                } else if brand.to_lowercase().contains(" max") {
-                    return Some(32);
-                } else if brand.to_lowercase().contains(" ultra") {
-                    return Some(64);
-                }
-            }
+        if let Ok(out) = Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output() {
+            let brand = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            if brand.contains(" ultra") { return Some(64); }
+            if brand.contains(" max") { return Some(32); }
+            if brand.contains(" pro") { return Some(14); }
         }
-        if let Ok(output) = Command::new("sysctl").args(["-n", "hw.perflevel0.physicalcpu"]).output() {
-            if output.status.success() {
-                if let Ok(cores) = String::from_utf8_lossy(&output.stdout).trim().parse::<usize>() {
-                    if cores >= 12 { return Some(48); }
-                    if cores >= 8 { return Some(14); }
-                }
+        if let Ok(out) = Command::new("sysctl").args(["-n", "hw.perflevel0.physicalcpu"]).output() {
+            if let Ok(cores) = String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() {
+                return Some(if cores >= 12 { 48 } else if cores >= 8 { 14 } else { 8 });
             }
         }
         None
@@ -80,145 +54,51 @@ impl GpuConfig {
     #[cfg(not(target_os = "macos"))]
     fn detect_gpu_cores() -> Option<usize> { None }
     
-    fn config_for_gpu(name: &str, max_threadgroup: usize, memory_mb: u64) -> (usize, u32, usize, usize) {
+    fn config_for_gpu(name: &str, max_tg: usize, mem_mb: u64) -> (usize, u32, usize, usize) {
         let name_lower = name.to_lowercase();
-        let detected_cores = Self::detect_gpu_cores();
+        let cores = Self::detect_gpu_cores();
         
-        // ═══════════════════════════════════════════════════════════════════
-        // APPLE SILICON GPU CONFIGURATION TABLE (M1/M2/M3/M4 Series)
-        // ═══════════════════════════════════════════════════════════════════
-        // 
-        // Chip Class Detection Priority:
-        //   1. GPU name contains "ultra/max/pro"
-        //   2. GPU core count (detected via IOKit)
-        //   3. Memory size as fallback
-        //
-        // Thread Formula: gpu_cores × multiplier
-        //   - secp256k1 is register-heavy (~4KB/thread)
-        //   - Smaller threadgroup (64) = better occupancy
-        //   - Ultra/Max: aggressive (4096× cores)
-        //   - Pro: balanced (8192× cores, capped)
-        //   - Base: conservative (2048-3072× cores)
-        //
-        // ═══════════════════════════════════════════════════════════════════
-        
-        // ─────────────────────────────────────────────────────────────────
-        // ULTRA CLASS (M1/M2 Ultra: 48-76 GPU cores, 128-192GB RAM)
-        // ─────────────────────────────────────────────────────────────────
-        if name_lower.contains("ultra") || detected_cores.map(|c| c >= 48).unwrap_or(false) {
-            let cores = detected_cores.unwrap_or(60);
-            println!("[GPU] Detected: ULTRA-class ({} GPU cores)", cores);
-            let threads = (cores * 4096).min(262_144);
-            println!("[GPU] ULTRA config: {} threads × 128 = {:.1}M keys/batch", 
-                threads, (threads * 128) as f64 / 1_000_000.0);
-            (threads, 128, 64.min(max_threadgroup), 4_194_304)
+        // ULTRA: 48+ cores
+        if name_lower.contains("ultra") || cores.map(|c| c >= 48).unwrap_or(false) {
+            let c = cores.unwrap_or(60);
+            let threads = (c * 4096).min(262_144);
+            println!("[GPU] ULTRA: {} threads × 128 = {:.1}M keys/batch", threads, (threads * 128) as f64 / 1e6);
+            return (threads, 128, 64.min(max_tg), 4_194_304);
         }
-        // ─────────────────────────────────────────────────────────────────
-        // MAX CLASS (M1/M2/M3/M4 Max: 24-40 GPU cores, 64-128GB RAM)
-        // ─────────────────────────────────────────────────────────────────
-        else if name_lower.contains("max") || detected_cores.map(|c| c >= 24).unwrap_or(false) {
-            let cores = detected_cores.unwrap_or(32);
-            println!("[GPU] Detected: MAX-class ({} GPU cores)", cores);
-            let threads = (cores * 4096).min(163_840);
-            println!("[GPU] MAX config: {} threads × 128 = {:.1}M keys/batch", 
-                threads, (threads * 128) as f64 / 1_000_000.0);
-            (threads, 128, 64.min(max_threadgroup), 2_097_152)
+        // MAX: 24-47 cores
+        if name_lower.contains("max") || cores.map(|c| c >= 24).unwrap_or(false) {
+            let c = cores.unwrap_or(32);
+            let threads = (c * 4096).min(163_840);
+            println!("[GPU] MAX: {} threads × 128 = {:.1}M keys/batch", threads, (threads * 128) as f64 / 1e6);
+            return (threads, 128, 64.min(max_tg), 2_097_152);
         }
-        // ─────────────────────────────────────────────────────────────────
-        // PRO CLASS (M1/M2/M3/M4 Pro: 14-20 GPU cores, 16-48GB RAM)
-        // ─────────────────────────────────────────────────────────────────
-        else if name_lower.contains("pro") || detected_cores.map(|c| c >= 14).unwrap_or(false) {
-            let cores = detected_cores.unwrap_or(16);
-            println!("[GPU] Detected: PRO-class ({} GPU cores)", cores);
-            
-            // Pro chips: balance performance and stability
-            // M1 Pro (14-16 cores): cap at 131K threads
-            // M2/M3/M4 Pro (16-20 cores): cap at 163K threads
-            let threads = if cores >= 18 {
-                (cores * 8192).min(163_840)
-            } else {
-                (cores * 8192).min(131_072)
-            };
-            
-            let match_buffer = if memory_mb >= 32000 { 1_048_576 } else { 524_288 };
-            println!("[GPU] PRO config: {} threads × 128 = {:.1}M keys/batch", 
-                threads, (threads * 128) as f64 / 1_000_000.0);
-            (threads, 128, 64.min(max_threadgroup), match_buffer)
+        // PRO: 14-23 cores
+        if name_lower.contains("pro") || cores.map(|c| c >= 14).unwrap_or(false) {
+            let c = cores.unwrap_or(16);
+            let threads = if c >= 18 { (c * 8192).min(163_840) } else { (c * 8192).min(131_072) };
+            let match_buf = if mem_mb >= 32000 { 1_048_576 } else { 524_288 };
+            println!("[GPU] PRO: {} threads × 128 = {:.1}M keys/batch", threads, (threads * 128) as f64 / 1e6);
+            return (threads, 128, 64.min(max_tg), match_buf);
         }
-        // ─────────────────────────────────────────────────────────────────
-        // BASE CLASS (M1/M2/M3/M4: 7-10 GPU cores, 8-32GB RAM)
-        // ─────────────────────────────────────────────────────────────────
-        // 
-        // CRITICAL: Base chips share memory bandwidth with CPU!
-        // Too many GPU threads → system freeze
-        //
-        // Base chip specs:
-        //   M1:    7-8 GPU cores,  8-16GB, 4P+4E CPU
-        //   M2:   8-10 GPU cores,  8-24GB, 4P+4E CPU
-        //   M3:     10 GPU cores,  8-24GB, 4P+4E CPU
-        //   M4:     10 GPU cores, 16-32GB, 6P+4E CPU
-        //
-        // ═══════════════════════════════════════════════════════════════
-        // M1 BASE OPTIMIZATION (from analiz.md)
-        // ═══════════════════════════════════════════════════════════════
-        // - threadgroup_size: 32 (M1 SIMD-width) for better occupancy
-        // - Fewer threads to prevent register spilling
-        // - BATCH_SIZE=16 in Metal shader (vs 20 for Pro)
-        // - Expected: 40-80 M/s on M1 Base 8GB
-        // ═══════════════════════════════════════════════════════════════
-        else {
-            let cores = detected_cores.unwrap_or(8);
-            
-            // M1 Base specific: Use threadgroup_size=32 for SIMD efficiency
-            // 32 threads = 1 SIMD group = optimal for M1 Base GPU
-            let tg_size = 32.min(max_threadgroup);
-            
-            let (threads, match_buffer) = if memory_mb >= 24000 {
-                // M2/M3/M4 with 24-32GB: moderate settings
-                println!("[GPU] Detected: BASE chip with {}GB ({} GPU cores)", memory_mb / 1024, cores);
-                (
-                    (cores * 2048).min(24_576),  // ~16K-20K threads (reduced from 32K)
-                    196_608,                      // Reduced match buffer
-                )
-            } else if memory_mb >= 16000 {
-                // M1/M2/M3 with 16GB: conservative to prevent freeze
-                println!("[GPU] Detected: BASE chip with 16GB ({} GPU cores)", cores);
-                (
-                    (cores * 1536).min(16_384),  // ~12K-16K threads (reduced)
-                    131_072,                      // Smaller match buffer
-                )
-            } else {
-                // 8GB systems: minimal - leave room for system
-                println!("[GPU] Detected: BASE chip with {}GB ({} GPU cores)", memory_mb / 1024, cores);
-                (
-                    (cores * 1024).min(10_240),  // ~8K-10K threads
-                    65_536,                       // Minimal match buffer
-                )
-            };
-            
-            println!("[GPU] BASE config: {} threads × 128 = {:.1}M keys/batch", 
-                threads, (threads * 128) as f64 / 1_000_000.0);
-            println!("[GPU] threadgroup_size: {} (M1 SIMD-width optimized)", tg_size);
-            println!("[GPU] (Conservative to prevent system freeze & register spilling)");
-            (threads, 128, tg_size, match_buffer)
-        }
+        // BASE: 7-13 cores
+        let c = cores.unwrap_or(8);
+        let tg = 32.min(max_tg);
+        let (threads, match_buf) = match mem_mb {
+            m if m >= 24000 => ((c * 2048).min(24_576), 196_608),
+            m if m >= 16000 => ((c * 1536).min(16_384), 131_072),
+            _ => ((c * 1024).min(10_240), 65_536),
+        };
+        println!("[GPU] BASE: {} threads × 128 = {:.1}M keys/batch (tg={})", threads, (threads * 128) as f64 / 1e6, tg);
+        (threads, 128, tg, match_buf)
     }
     
-    /// Calculate keys per batch
     pub fn keys_per_batch(&self) -> u64 {
         (self.max_threads as u64) * (self.keys_per_thread as u64)
     }
     
-    /// Print configuration summary
     pub fn print_summary(&self) {
-        let keys_per_batch = self.keys_per_batch();
-        println!("[GPU] Configuration:");
-        println!("      • Threads: {} ({:.0}K)", self.max_threads, self.max_threads as f64 / 1000.0);
-        println!("      • Keys/thread: {}", self.keys_per_thread);
-        println!("      • Keys/batch: {:.1}M", keys_per_batch as f64 / 1_000_000.0);
-        println!("      • Threadgroup: {}", self.threadgroup_size);
-        println!("      • Match buffer: {:.1}M entries", self.match_buffer_size as f64 / 1_000_000.0);
-        println!("      • GPU Memory: {} MB", self.gpu_memory_mb);
+        println!("[GPU] {} | {}K threads | {:.1}M keys/batch | {}MB", 
+            self.name, self.max_threads / 1000, self.keys_per_batch() as f64 / 1e6, self.gpu_memory_mb);
     }
 }
 
@@ -269,62 +149,32 @@ struct BufferSet {
     queue: CommandQueue,
     philox_key_buf: Buffer,
     philox_counter_buf: Buffer,
-    base_privkey_buf: Buffer,  // Base private key (32 bytes) - kept for compatibility
-    base_pubkey_x_buf: Buffer, // Pre-computed pubkey X (32 bytes) - CPU calculates!
-    base_pubkey_y_buf: Buffer, // Pre-computed pubkey Y (32 bytes) - CPU calculates!
+    base_privkey_buf: Buffer,
+    base_pubkey_x_buf: Buffer,
+    base_pubkey_y_buf: Buffer,
     match_data_buf: Buffer,
     match_count_buf: Buffer,
 }
 
 pub struct OptimizedScanner {
     pipeline: ComputePipelineState,
-    // TRIPLE BUFFERING: Maximizes GPU utilization on M1 Pro
-    // Buffer A: GPU computing current batch
-    // Buffer B: CPU reading previous batch results (zero-copy)
-    // Buffer C: Rayon threads verifying older batch
-    // This ensures GPU command queue is NEVER empty!
-    buffer_sets: [BufferSet; 3],
+    buffer_sets: [BufferSet; 3],  // Triple buffering
     current_buffer: std::sync::atomic::AtomicUsize,
     wnaf_table_buf: Buffer,
-    
-    // Xor Filter32 buffers (Bloom Filter removed for better performance)
     xor_fingerprints_buf: Buffer,
     xor_seeds_buf: Buffer,
     xor_block_length_buf: Buffer,
-    
-    // Prefix table for GPU-side FP reduction (90% less CPU verification load)
     prefix_table_buf: Buffer,
     prefix_count_buf: Buffer,
-    
     kpt_buf: Buffer,
     hash_count_buf: Buffer,
-
     config: GpuConfig,
     total_scanned: AtomicU64,
     total_matches: AtomicU64,
     philox_counter: PhiloxCounter,
-    
-    // ZERO-COPY OPTIMIZATION: Pre-allocated match buffers (one per buffer set)
-    // Eliminates Vec allocation churn (~thousands of allocs/sec → 0)
-    // Each buffer is sized for worst-case match count
     match_vecs: [std::cell::UnsafeCell<Vec<PotentialMatch>>; 3],
-    
-    // BUFFER POOL: Reusable Vec buffers to eliminate allocation churn
-    // When matches are returned to caller, we give them a pooled Vec
-    // When they're done (drop), the buffer returns to pool via Arc<Mutex>
-    // This reduces allocations from ~30/sec to 0
-    buffer_pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<PotentialMatch>>>>,
-    
-    // LOOK-AHEAD PUBKEY: Pre-compute next batch's pubkey while GPU is busy
-    // Eliminates ~0.1ms dispatch latency (pubkey computation moved to background)
-    // Uses UnsafeCell because pubkey is computed/consumed from single thread
     lookahead_pubkey: std::cell::UnsafeCell<Option<(Vec<u8>, Vec<u8>)>>,
-    
-    // PHILOX STATE CACHE: Store state from next_base_key() for dispatch_batch()
-    // CRITICAL FIX: Prevents double next_batch() calls that caused 0 FP bug!
-    // When next_base_key() is called, it stores the state here.
-    // dispatch_batch() uses this cached state instead of calling next_batch() again.
-    last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,
+    last_philox_state: std::cell::UnsafeCell<Option<PhiloxState>>,  // Cached for dispatch_batch
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,42 +218,19 @@ lazy_static::lazy_static! {
         use k256::elliptic_curve::PrimeField;
         k256::Scalar::from_repr_vartime(GLV_LAMBDA.into()).unwrap()
     };
-    
-    // Pre-computed wNAF step tables for common keys_per_thread values
-    // This eliminates ~10ms initialization overhead per Scanner::new() call
-    // First access triggers computation, subsequent accesses are instant
     static ref WNAF_TABLE_128: [[u8; 64]; 75] = compute_wnaf_step_table(128);
 }
 
-/// Transform private key using GLV endomorphism: k → λ·k (mod n)
-/// 
-/// This computes the private key corresponding to the GLV-transformed public key.
-/// The GPU uses GLV endomorphism: φ(x, y) = (β·x mod p, y) which corresponds
-/// to private key λ·k where k is the original key.
-/// 
-/// Note: The Y coordinate is preserved in the endomorphism (y unchanged),
-/// so when reconstructing the public key from the transformed private key,
-/// the Y coordinate should match the original. Hash verification ensures correctness.
-/// 
-/// CORRECTNESS GUARANTEES:
-/// - k256::Scalar automatically reduces all values modulo n (curve order)
-/// - Multiplication is computed as (k × λ) mod n - no manual overflow handling needed
-/// - If key >= n, from_repr_vartime returns None and we fall back to original key
+/// GLV endomorphism: k → λ·k (mod n)
 pub fn glv_transform_key(key: &[u8; 32]) -> [u8; 32] {
     use k256::elliptic_curve::PrimeField;
     use k256::Scalar;
     
-    // Parse key as a scalar element of secp256k1
-    // Returns None if key >= n (curve order) - extremely rare edge case
-    // In that case, fall back to original key (will fail hash verification anyway)
     let key_scalar = match Scalar::from_repr_vartime((*key).into()) {
         Some(s) => s,
         None => return *key,
     };
-    
-    // Compute λ·k mod n - k256 automatically handles modular reduction
-    let result = key_scalar * *GLV_LAMBDA_SCALAR;
-    result.to_repr().into()
+    (key_scalar * *GLV_LAMBDA_SCALAR).to_repr().into()
 }
 
 #[derive(Clone, Debug)]
@@ -724,11 +551,6 @@ impl OptimizedScanner {
             total_matches: AtomicU64::new(0),
             philox_counter,
             match_vecs,
-            // Initialize buffer pool with 6 pre-allocated buffers (2× triple buffering)
-            // This eliminates all allocation during steady-state operation
-            buffer_pool: std::sync::Arc::new(std::sync::Mutex::new(
-                (0..6).map(|_| Vec::with_capacity(match_buffer_size)).collect()
-            )),
             lookahead_pubkey: std::cell::UnsafeCell::new(None),
             last_philox_state: std::cell::UnsafeCell::new(None),
         })

@@ -65,11 +65,7 @@ impl AddressType {
     }
 }
 
-// ============================================================================
-// ADDRESS RECONSTRUCTION (sadece eşleşme bulunduğunda kullanılır)
-// ============================================================================
-
-/// Hash160'dan adres oluştur (String saklama yerine runtime'da üret)
+/// Convert Hash160 to address string
 pub fn hash160_to_address(hash: &Hash160, addr_type: AddressType) -> String {
     match addr_type {
         AddressType::P2PKH => encode_base58_check(0x00, hash.as_bytes()),
