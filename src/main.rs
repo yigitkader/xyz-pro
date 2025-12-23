@@ -518,24 +518,27 @@ fn init_async_logger() -> crossbeam_channel::Sender<ReportEntry> {
 }
 
 fn report(privkey: &[u8; 32], addr: &str, atype: types::AddressType, compressed: bool) {
-    let tx = REPORT_TX.get_or_init(init_async_logger);
+    let hex = hex::encode(privkey);
+    let wif = to_wif_compressed(privkey, compressed);
     
-    if tx.send(ReportEntry {
+    // CRITICAL: Immediate sync write - crash-safe, key never lost
+    use std::fs::OpenOptions;
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("found.txt") {
+        use chrono::Local;
+        let time = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let key_type = if compressed { "compressed" } else { "uncompressed" };
+        let _ = writeln!(f, "[{}] {} | {} | {} | {} | {}", time, addr, atype.as_str(), key_type, hex, wif);
+        let _ = f.sync_all();
+    }
+    
+    // Async pretty print (non-critical, can be lost on crash)
+    let tx = REPORT_TX.get_or_init(init_async_logger);
+    let _ = tx.send(ReportEntry {
         privkey: *privkey,
         addr: addr.to_string(),
         atype,
         compressed,
-    }).is_err() {
-        let hex = hex::encode(privkey);
-        let wif = to_wif_compressed(privkey, compressed);
-        println!("\n🔑 FOUND: {} | {} | {}", addr, hex, wif);
-        
-        use std::fs::OpenOptions;
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("found.txt") {
-            let _ = writeln!(f, "{} | {} | {} | {}", addr, atype.as_str(), hex, wif);
-            let _ = f.sync_all();
-        }
-    }
+    });
 }
 
 fn format_num(n: u64) -> String {
