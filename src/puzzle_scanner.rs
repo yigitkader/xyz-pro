@@ -149,11 +149,40 @@ impl PuzzleScanner {
     
     /// Check if a match was found for our target
     /// `batch_start_pos` is the position when the batch was dispatched
+    /// 
+    /// CRITICAL: GPU uses XorFilter which has false positive rate ~0.0015%
+    /// We MUST verify the match on CPU before reporting!
     pub fn check_matches(&self, matches: &PooledBuffer, batch_start_pos: u64) -> Option<[u8; 32]> {
+        use k256::SecretKey;
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        
         for m in matches.as_ref().iter() {
             if m.hash == self.target_hash {
-                // FOUND IT!
-                return Some(self.reconstruct_key(batch_start_pos, m.key_index));
+                // Reconstruct the private key
+                let priv_key = self.reconstruct_key(batch_start_pos, m.key_index);
+                
+                // CPU VERIFICATION: Compute hash160 and verify it matches
+                if let Ok(secret) = SecretKey::from_slice(&priv_key) {
+                    let pubkey = secret.public_key();
+                    
+                    // Check compressed public key hash
+                    let comp_hash = crate::crypto::hash160(
+                        pubkey.to_encoded_point(true).as_bytes()
+                    );
+                    if comp_hash == *self.target_hash.as_bytes() {
+                        // VERIFIED! This is the real key!
+                        return Some(priv_key);
+                    }
+                    
+                    // Check uncompressed public key hash (just in case)
+                    let uncomp_hash = crate::crypto::hash160(
+                        pubkey.to_encoded_point(false).as_bytes()
+                    );
+                    if uncomp_hash == *self.target_hash.as_bytes() {
+                        return Some(priv_key);
+                    }
+                }
+                // If we get here, it was a false positive - continue searching
             }
         }
         None
