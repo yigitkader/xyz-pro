@@ -18,8 +18,7 @@ mod math;
 #[cfg(feature = "pid-thermal")]
 mod thermal;
 
-#[cfg(feature = "zero-copy")]
-mod scanner;
+// scanner module removed - dead code (gpu.rs handles match buffers directly)
 
 // Self-tests moved to tests/integration/ - startup verification inline below
 

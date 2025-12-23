@@ -20,8 +20,8 @@ pub mod math;
 #[cfg(feature = "pid-thermal")]
 pub mod thermal;
 
-#[cfg(feature = "zero-copy")]
-pub mod scanner;
+// scanner module removed - dead code, ZeroCopyMatchBuffer was never used externally
+// gpu.rs handles all match buffer operations directly
 
 // Re-export commonly used types
 pub use error::{Result, ScannerError};
