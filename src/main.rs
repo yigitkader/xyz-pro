@@ -37,7 +37,7 @@ use targets::TargetDatabase;
 use rng::philox::{PhiloxState, philox_to_privkey};
 
 const TARGETS_FILE: &str = "targets.json";
-const PIPELINE_DEPTH: usize = 8;
+const PIPELINE_DEPTH: usize = 2;  // Minimal: prevents memory bus saturation
 
 type VerifyBatch = ([u8; 32], PhiloxState, PooledBuffer);
 
@@ -298,7 +298,23 @@ fn run_pipelined(
                             } else { 70.0 }
                         });
                         
-                        pid.update(temp);
+                        // CRITICAL: Apply PID throttling + GPU breathing room
+                        // This prevents: 1) Thermal runaway 2) UI starvation 3) Memory bus saturation
+                        let speed = if let Some(_) = pid.update(temp) {
+                            pid.current_speed()
+                        } else {
+                            pid.current_speed()
+                        };
+                        
+                        // ALWAYS give GPU breathing room for macOS WindowServer
+                        // Base: 1ms minimum (prevents UI freeze)
+                        // + PID throttle when hot (up to 10ms at 50% speed)
+                        let base_breath_ms = 1u64;
+                        let throttle_ms = if speed < 0.95 {
+                            ((1.0 - speed) * 20.0) as u64  // 0.5 speed → 10ms extra
+                        } else { 0 };
+                        std::thread::sleep(Duration::from_millis(base_breath_ms + throttle_ms));
+                        
                         gpu_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
                         
                         if !matches.is_empty() {
@@ -306,7 +322,6 @@ fn run_pipelined(
                                 gpu_shutdown.store(true, Ordering::SeqCst);
                             }
                         }
-                        std::thread::yield_now();
                     },
                     &gpu_shutdown,
                 );
@@ -328,7 +343,8 @@ fn run_pipelined(
                                 gpu_shutdown.store(true, Ordering::SeqCst);
                             }
                         }
-                        std::thread::yield_now();
+                        // GPU breathing room - prevents UI starvation
+                        std::thread::sleep(Duration::from_millis(1));
                     },
                     &gpu_shutdown,
                 );
