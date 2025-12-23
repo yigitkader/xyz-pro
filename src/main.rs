@@ -196,21 +196,19 @@ fn main() {
     };
 
     if !fast_start {
-    if !run_gpu_correctness_test(&gpu, &targets) {
+        if !run_gpu_correctness_test(&gpu, &targets) {
             eprintln!("[FATAL] GPU correctness test failed.");
-        std::process::exit(1);
-    }
-    if !run_gpu_pipeline_test(&gpu) {
+            std::process::exit(1);
+        }
+        if !run_gpu_pipeline_test(&gpu) {
             eprintln!("[FATAL] GPU pipeline test failed.");
-        std::process::exit(1);
-    }
-    #[cfg(feature = "philox-rng")]
-            if !run_startup_verification(&gpu) {
+            std::process::exit(1);
+        }
+        #[cfg(feature = "philox-rng")]
+        if !run_startup_verification(&gpu) {
             eprintln!("[FATAL] Startup verification failed.");
             std::process::exit(1);
-    }
-    
-    // END-TO-END MATCH TEST: Verify we can find a known private key
+        }
         if !run_end_to_end_match_test(&gpu, &targets) {
             eprintln!("[FATAL] End-to-end match test failed.");
             std::process::exit(1);
@@ -225,7 +223,7 @@ fn main() {
             Err(e) => {
                 println!("FAILED");
                 eprintln!("[FATAL] GPU: {}", e);
-            std::process::exit(1);
+                std::process::exit(1);
             }
         }
     }
@@ -370,7 +368,8 @@ fn run_pipelined(
                         
                         // CRITICAL: Apply PID throttling + GPU breathing room
                         // This prevents: 1) Thermal runaway 2) UI starvation 3) Memory bus saturation
-                        let speed = pid.update(temp).map(|_| pid.current_speed()).unwrap_or_else(|| pid.current_speed());
+                        let _ = pid.update(temp); // Update PID state
+                        let speed = pid.current_speed();
                         
                         // GPU breathing room (config-driven)
                         let throttle_ms = if speed < 0.95 {
