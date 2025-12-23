@@ -26,6 +26,32 @@ impl PhiloxState {
         }
     }
     
+    /// Create state for specific thread/key offset from base state
+    /// This matches GPU's philox_for_thread() exactly!
+    pub fn for_thread(&self, thread_id: u32) -> Self {
+        let mut state = *self;
+        // 128-bit counter + thread_id (same as GPU Metal shader)
+        let sum = (state.counter[0] as u64) + (thread_id as u64);
+        state.counter[0] = sum as u32;
+        
+        let mut carry = sum >> 32;
+        if carry > 0 {
+            let sum1 = (state.counter[1] as u64) + carry;
+            state.counter[1] = sum1 as u32;
+            carry = sum1 >> 32;
+        }
+        if carry > 0 {
+            let sum2 = (state.counter[2] as u64) + carry;
+            state.counter[2] = sum2 as u32;
+            carry = sum2 >> 32;
+        }
+        if carry > 0 {
+            state.counter[3] = state.counter[3].wrapping_add(carry as u32);
+        }
+        
+        state
+    }
+    
     /// Increment counter (for next batch)
     /// Returns true if increment succeeded, false if 128-bit overflow occurred
     /// 

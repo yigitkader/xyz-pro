@@ -34,11 +34,16 @@ use startup_tests::{run_self_test, run_gpu_correctness_test, run_gpu_pipeline_te
 #[cfg(feature = "philox-rng")]
 use startup_tests::run_startup_verification;
 use targets::TargetDatabase;
+#[cfg(feature = "philox-rng")]
+use rng::philox::{PhiloxState, philox_to_privkey};
 
 const TARGETS_FILE: &str = "targets.json";
 
 const PIPELINE_DEPTH: usize = 8;
-type VerifyBatch = ([u8; 32], Vec<PotentialMatch>);
+// CRITICAL: Include PhiloxState for proper CPU key reconstruction
+// GPU uses: Key(i) = Philox(base_counter + thread_id)
+// CPU must use: Key(i) = Philox(state.for_thread(key_index))
+type VerifyBatch = ([u8; 32], PhiloxState, Vec<PotentialMatch>);
 
 /// Memory pressure via native sysctlbyname (no fork overhead)
 #[cfg(target_os = "macos")]
@@ -442,8 +447,8 @@ fn run_pipelined(
                 let mut batch_count = 0u32;
                 
                 let result = gpu.scan_pipelined(
-                    || gpu.next_base_key(),
-                    |base_key, matches| {
+                    || gpu.next_base_key(),  // Now returns (key, state)
+                    |base_key, base_state, matches| {
                         let batch_duration = last_batch_time.elapsed();
                         last_batch_time = Instant::now();
                         batch_count += 1;
@@ -501,7 +506,7 @@ fn run_pipelined(
                         }
                         
                         if !matches.is_empty() {
-                            if let Err(e) = tx.send((base_key, matches)) {
+                            if let Err(e) = tx.send((base_key, base_state, matches)) {
                                 eprintln!("[!] CRITICAL: Verifier thread disconnected: {}", e);
                                 gpu_shutdown.store(true, Ordering::SeqCst);
                             }
@@ -550,7 +555,7 @@ fn run_pipelined(
         
         while !verify_shutdown.load(Ordering::Relaxed) {
             // Wait for a batch with short timeout (responsive shutdown)
-            let (base_key, matches) = match rx.recv_timeout(Duration::from_millis(10)) {
+            let (base_key, base_state, matches) = match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(batch) => batch,
                 Err(_) => continue, // Timeout, check shutdown
             };
@@ -562,7 +567,10 @@ fn run_pipelined(
             const PARALLEL_THRESHOLD: usize = 32;
             
             let process_match = |pm: &PotentialMatch| {
-                if let Some((addr, atype, privkey)) = verify_match(&base_key, pm, &targets) {
+                // CRITICAL FIX: Use PhiloxState for proper key reconstruction!
+                // GPU: Key(i) = Philox(base_counter + thread_id)
+                // CPU: Key(i) = Philox(base_state.for_thread(key_index))
+                if let Some((addr, atype, privkey)) = verify_match(&base_state, pm, &targets) {
                             let compressed = pm.match_type != gpu::MatchType::Uncompressed 
                                 && pm.match_type != gpu::MatchType::GlvUncompressed;
                     
@@ -679,37 +687,23 @@ fn run_pipelined(
 // ============================================================================
 
 /// Reconstructs and verifies a potential match from GPU
-/// Uses modular arithmetic (k256::Scalar) for key reconstruction
+/// 
+/// CRITICAL: Uses Philox RNG to reconstruct exact private key.
+/// GPU generates keys using: Key(i) = Philox(base_counter + thread_id)
+/// CPU must use the SAME method: Key(i) = Philox(base_state.for_thread(key_index))
+/// 
+/// Previous bug: Used base_key + offset (scalar addition) which is WRONG!
+/// This caused ALL real matches to be discarded as "false positives".
 fn verify_match(
-    base_key: &[u8; 32],
+    base_state: &PhiloxState,
     pm: &PotentialMatch,
     targets: &TargetDatabase,
 ) -> Option<(String, types::AddressType, [u8; 32])> {
-    use k256::elliptic_curve::PrimeField;
-    use k256::Scalar;
-    
-    // Reconstruct private key using modular arithmetic (mod curve order n)
-    // GPU uses point addition which is inherently modular
-    let priv_key = match Scalar::from_repr_vartime((*base_key).into()) {
-        Some(base_scalar) => {
-            let offset_scalar = Scalar::from(pm.key_index as u64);
-            let result: [u8; 32] = (base_scalar + offset_scalar).to_repr().into();
-            result
-        }
-        None => {
-            // base_key >= curve order - extremely rare edge case
-            // Fall back to linear addition
-            let mut key = *base_key;
-            let mut carry = pm.key_index as u64;
-            for byte in key.iter_mut().rev() {
-                let sum = *byte as u64 + (carry & 0xFF);
-                *byte = sum as u8;
-                carry = (carry >> 8) + (sum >> 8);
-            }
-            if carry != 0 { return None; }
-            key
-        }
-    };
+    // CRITICAL FIX: Reconstruct key using Philox (matches GPU exactly!)
+    // GPU: philox_for_thread(base_key, base_counter, thread_id)
+    // CPU: base_state.for_thread(key_index) → philox_to_privkey()
+    let thread_state = base_state.for_thread(pm.key_index);
+    let priv_key = philox_to_privkey(&thread_state);
 
     // For GLV matches, compute λ·k (mod n)
     let actual_key = if pm.match_type.is_glv() {

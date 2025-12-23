@@ -10,6 +10,8 @@ use crate::crypto;
 use crate::gpu::{self, OptimizedScanner, MatchType};
 use crate::targets::TargetDatabase;
 use crate::types;
+#[cfg(feature = "philox-rng")]
+use crate::rng::philox::PhiloxState;
 
 // Test constants
 const TEST_KEY_1: [u8; 32] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1];
@@ -602,21 +604,21 @@ pub fn run_gpu_pipeline_test(scanner: &OptimizedScanner) -> bool {
     let start = Instant::now();
     let batch_count = AtomicU32::new(0);
     let total_matches = AtomicU64::new(0);
-    let test_key_counter = AtomicU64::new(1);
-    let keys_per_batch = scanner.keys_per_batch();
+    let _test_key_counter = AtomicU64::new(1);
+    let _keys_per_batch = scanner.keys_per_batch();
     
     let result = scanner.scan_pipelined(
         || {
-            let counter = test_key_counter.fetch_add(keys_per_batch, Ordering::Relaxed);
-            let mut key = [0u8; 32];
-            key[24..32].copy_from_slice(&counter.to_be_bytes());
+            // For pipeline test, use scanner's real next_base_key()
+            // This ensures we're testing the actual Philox integration
+            let (key, state) = scanner.next_base_key();
             
             if batch_count.load(Ordering::Relaxed) >= 5 {
                 shutdown.store(true, Ordering::SeqCst);
             }
-            key
+            (key, state)
         },
-        |_base_key, matches| {
+        |_base_key, _base_state, matches| {
             batch_count.fetch_add(1, Ordering::Relaxed);
             total_matches.fetch_add(matches.len() as u64, Ordering::Relaxed);
         },

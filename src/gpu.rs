@@ -867,18 +867,23 @@ impl OptimizedScanner {
     /// This ensures GPU command queue is NEVER empty!
     /// Previous (double): GPU idle during CPU verification
     /// Now (triple): GPU always has work queued (+10-15% throughput)
+    /// Pipelined GPU scanning with PhiloxState for proper CPU verification
+    /// 
+    /// CRITICAL: The callback receives PhiloxState so CPU can reconstruct
+    /// exact private keys using Philox(base_state + key_index).
+    /// Previous bug: CPU used base_key + offset which is WRONG!
     pub fn scan_pipelined<F, G>(&self, mut key_gen: F, mut on_batch: G, shutdown: &std::sync::atomic::AtomicBool) -> Result<()>
     where
-        F: FnMut() -> [u8; 32],
-        G: FnMut([u8; 32], Vec<PotentialMatch>),
+        F: FnMut() -> ([u8; 32], PhiloxState),  // Returns both key and state
+        G: FnMut([u8; 32], PhiloxState, Vec<PotentialMatch>),  // Callback gets state too
     {
-        // Track 2 previous batches for triple buffering
-        let mut batch_queue: std::collections::VecDeque<([u8; 32], usize)> = std::collections::VecDeque::with_capacity(2);
+        // Track 2 previous batches for triple buffering (now with PhiloxState)
+        let mut batch_queue: std::collections::VecDeque<([u8; 32], PhiloxState, usize)> = std::collections::VecDeque::with_capacity(2);
         let mut current_buf = 0usize;
         let mut pipeline_iter = 0u64;
         
         // LOOK-AHEAD: Generate first key and its pubkey
-        let mut next_key = key_gen();
+        let (mut next_key, mut next_state) = key_gen();
         self.precompute_pubkey(&next_key);
         
         eprintln!("[DEBUG] scan_pipelined: Starting pipeline, first key[0..4]={:02x}{:02x}{:02x}{:02x}",
@@ -887,6 +892,7 @@ impl OptimizedScanner {
         while !shutdown.load(Ordering::Relaxed) {
             // Use current key (pubkey already pre-computed!)
             let base_key = next_key;
+            let base_state = next_state;
             
             if pipeline_iter < 5 {
                 eprintln!("[DEBUG] scan_pipelined iter {}: BEFORE dispatch, base_key[0..4]={:02x}{:02x}{:02x}{:02x} buf={}",
@@ -897,7 +903,9 @@ impl OptimizedScanner {
             
             // LOOK-AHEAD: Generate NEXT key while GPU is running
             // Pre-compute pubkey now so it's ready for next dispatch
-            next_key = key_gen();
+            let (new_key, new_state) = key_gen();
+            next_key = new_key;
+            next_state = new_state;
             self.precompute_pubkey(&next_key);
             
             // If we have 2 pending batches, process the oldest one
@@ -906,25 +914,25 @@ impl OptimizedScanner {
             //   - batch_queue[1]: ready for CPU read
             //   - batch_queue[0]: being verified by caller (Rayon)
             if batch_queue.len() >= 2 {
-                if let Some((old_key, old_buf)) = batch_queue.pop_front() {
+                if let Some((old_key, old_state, old_buf)) = batch_queue.pop_front() {
                     if pipeline_iter < 10 {
                         eprintln!("[DEBUG] scan_pipelined iter {}: collecting from buf={} queue_len_before={}",
                             pipeline_iter, old_buf, batch_queue.len() + 1);
                     }
                     let matches = self.wait_and_collect(old_buf)?;
-                    on_batch(old_key, matches);
+                    on_batch(old_key, old_state, matches);
                 }
             }
             
-            batch_queue.push_back((base_key, current_buf));
+            batch_queue.push_back((base_key, base_state, current_buf));
             current_buf = (current_buf + 1) % 3;  // Rotate through 3 buffers
             pipeline_iter += 1;
         }
         
         // Drain remaining batches on shutdown
-        while let Some((key, buf)) = batch_queue.pop_front() {
+        while let Some((key, state, buf)) = batch_queue.pop_front() {
             let matches = self.wait_and_collect(buf)?;
-            on_batch(key, matches);
+            on_batch(key, state, matches);
         }
         
         Ok(())
@@ -934,7 +942,13 @@ impl OptimizedScanner {
         self.config.keys_per_batch()
     }
     
-    pub fn next_base_key(&self) -> [u8; 32] {
+    /// Generate next base key AND return PhiloxState for CPU verification
+    /// 
+    /// CRITICAL: The PhiloxState must be passed to verify_match() so it can
+    /// reconstruct the exact private key using Philox(state + key_index).
+    /// GPU uses: Key(i) = Philox(base_counter + thread_id)
+    /// CPU must use: Key(i) = Philox(base_state.for_thread(key_index))
+    pub fn next_base_key(&self) -> ([u8; 32], PhiloxState) {
         let batch_size = self.keys_per_batch();
         let state = self.philox_counter.next_batch(batch_size);
         
@@ -954,7 +968,7 @@ impl OptimizedScanner {
             *self.last_philox_state.get() = Some(state);
         }
         
-        philox_to_privkey(&state)
+        (philox_to_privkey(&state), state)
     }
     
     #[allow(dead_code)]
