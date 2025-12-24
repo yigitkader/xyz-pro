@@ -1037,7 +1037,19 @@ impl GpuKeyGenerator {
         
         let mut current_buf = 0;
         let mut pending_keys: usize = 0;
-        let mut raw_buffer: Vec<u8> = Vec::with_capacity(self.config.keys_per_file as usize * OUTPUT_SIZE);
+        
+        // MEMORY SAFETY: Cap buffer size to prevent OOM
+        // Even if keys_per_file is 1 billion (72GB), we use a reasonable buffer
+        // and flush to disk in chunks. 100MB buffer = ~1.4M keys.
+        const MAX_RAW_BUFFER_SIZE: usize = 100 * 1024 * 1024; // 100MB max
+        let max_keys_in_buffer = MAX_RAW_BUFFER_SIZE / OUTPUT_SIZE;
+        let buffer_capacity = std::cmp::min(
+            self.config.keys_per_file as usize * OUTPUT_SIZE,
+            MAX_RAW_BUFFER_SIZE
+        );
+        let mut raw_buffer: Vec<u8> = Vec::with_capacity(buffer_capacity);
+        
+        println!("   ✓ Memory-bounded raw buffer (max {} MB)", MAX_RAW_BUFFER_SIZE / (1024 * 1024));
         
         while !self.should_stop.load(Ordering::SeqCst) {
             if let Some(target) = target_keys {
@@ -1065,7 +1077,12 @@ impl GpuKeyGenerator {
             
             let bs = &self.buffer_sets[process_idx];
             
+            // RACE CONDITION PREVENTION: Mark buffer as in-use while reading
+            // This prevents GPU from dispatching to this buffer via in_use spin-wait
+            bs.in_use.store(true, Ordering::Release);
+            
             // Direct copy from GPU buffer (zero-copy on unified memory)
+            // Memory fence is implicit in wait_until_completed + Ordering::Release
             let output_ptr = bs.output_buffer.contents() as *const u8;
             let output_slice = unsafe {
                 std::slice::from_raw_parts(output_ptr, output_size_per_dispatch)
@@ -1073,19 +1090,27 @@ impl GpuKeyGenerator {
             
             // Accumulate raw data
             raw_buffer.extend_from_slice(output_slice);
+            
+            // Mark buffer as available for next dispatch
+            bs.in_use.store(false, Ordering::Release);
+            
             pending_keys += self.tier.keys_per_dispatch;
             self.total_generated.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
             
             // Next batch already dispatched - true pipelining!
             current_buf += 1;
             
-            // Async write when buffer is full
-            if pending_keys >= self.config.keys_per_file as usize {
+            // Async write when buffer is full (either memory limit or file limit)
+            // MEMORY SAFETY: Flush at whichever limit is reached first
+            let should_flush = pending_keys >= self.config.keys_per_file as usize 
+                            || pending_keys >= max_keys_in_buffer;
+            
+            if should_flush {
                 let data = std::mem::take(&mut raw_buffer);
                 async_writer.write_async(data, pending_keys)?;
                 println!("📁 Async write queued: {} keys ({} MB)", 
                          pending_keys, pending_keys * OUTPUT_SIZE / (1024 * 1024));
-                raw_buffer = Vec::with_capacity(self.config.keys_per_file as usize * OUTPUT_SIZE);
+                raw_buffer = Vec::with_capacity(buffer_capacity);
                 pending_keys = 0;
             }
             
