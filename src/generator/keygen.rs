@@ -1,20 +1,16 @@
-//! High-performance private key generation
+//! High-performance private key generation (GPU-compatible)
 //! 
-//! ## Modes
+//! ## Sequential Mode (GPU-compatible)
 //! 
-//! ### Sequential Mode (GPU-compatible) - DEFAULT
 //! Generates keys as `base_privkey + offset`, matching GPU behavior exactly.
-//! This is the recommended mode for range scanning.
-//! 
-//! ### Random Mode (Philox RNG) - LEGACY
-//! Uses Philox RNG for pseudo-random key generation.
-//! WARNING: Not compatible with GPU mode - searches different key space!
+//! This ensures CPU and GPU scan the SAME key space.
 //!
 //! ## GLV Endomorphism Support
 //! 
-//! Both modes support GLV endomorphism for 2x throughput:
+//! Supports GLV endomorphism for 2x/3x throughput:
 //! - k (base key)
 //! - λ·k mod n (GLV transformed key)
+//! - λ²·k mod n (GLV² transformed key)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -105,12 +101,12 @@ impl CpuKeyGenerator {
         }
     }
     
-    /// Backwards-compatible constructor with seed (interpreted as start_offset)
+    /// Convenience constructor with start_offset
     /// 
-    /// For easy migration from PhiloxKeyGenerator.
-    /// The 'seed' parameter is now used as start_offset for sequential generation.
-    pub fn with_seed(seed: u64) -> Self {
-        Self::new(seed.max(1), None, 2)  // GLV2 mode by default
+    /// Quick way to create a generator starting from a specific offset.
+    /// Uses GLV2 mode by default for optimal throughput.
+    pub fn with_seed(start_offset: u64) -> Self {
+        Self::new(start_offset.max(1), None, 2)  // GLV2 mode by default
     }
     
     /// Create with explicit base private key (256-bit)
@@ -304,219 +300,6 @@ fn compute_glv2_key(private_key: &[u8; 32]) -> Option<[u8; 32]> {
     Some(result)
 }
 
-// ============================================================================
-// LEGACY PHILOX KEY GENERATOR (Random Mode)
-// ============================================================================
-
-/// Philox 4x32 constants
-const PHILOX_M0: u32 = 0xD2511F53;
-const PHILOX_M1: u32 = 0xCD9E8D57;
-const PHILOX_W0: u32 = 0x9E3779B9;
-const PHILOX_W1: u32 = 0xBB67AE85;
-
-/// LEGACY Philox-based random key generator
-/// 
-/// WARNING: This generates RANDOM keys using Philox RNG, which is
-/// NOT compatible with GPU's sequential mode. Use CpuKeyGenerator
-/// for GPU-compatible sequential key generation.
-/// 
-/// For each base key k, generates two keys:
-/// - k (base key)
-/// - λ·k mod n (GLV transformed key)
-#[deprecated(since = "0.4.0", note = "Use CpuKeyGenerator for GPU-compatible sequential mode")]
-pub struct PhiloxKeyGenerator {
-    /// Global counter for unique key generation
-    counter: AtomicU64,
-    /// Seed for RNG
-    seed: [u32; 2],
-    /// Enable GLV mode (2x keys per base key) - default true for GPU compatibility
-    glv_enabled: bool,
-}
-
-impl PhiloxKeyGenerator {
-    /// Create a new key generator with cryptographically strong random seed
-    /// Uses OS-provided entropy via `rand::thread_rng()` (backed by getrandom)
-    /// GLV mode is enabled by default for GPU compatibility
-    pub fn new() -> Self {
-        use rand::Rng;
-        
-        // Use cryptographically secure random source from the OS
-        // This is backed by /dev/urandom on Unix, BCryptGenRandom on Windows
-        let mut rng = rand::thread_rng();
-        let seed: u64 = rng.gen();
-        
-        Self {
-            counter: AtomicU64::new(0),
-            seed: [(seed & 0xFFFFFFFF) as u32, ((seed >> 32) & 0xFFFFFFFF) as u32],
-            glv_enabled: true, // Match GPU default
-        }
-    }
-    
-    /// Create with specific seed for reproducibility
-    pub fn with_seed(seed: u64) -> Self {
-        Self {
-            counter: AtomicU64::new(0),
-            seed: [(seed & 0xFFFFFFFF) as u32, ((seed >> 32) & 0xFFFFFFFF) as u32],
-            glv_enabled: true,
-        }
-    }
-    
-    /// Create without GLV (for testing or legacy compatibility)
-    pub fn without_glv(seed: u64) -> Self {
-        Self {
-            counter: AtomicU64::new(0),
-            seed: [(seed & 0xFFFFFFFF) as u32, ((seed >> 32) & 0xFFFFFFFF) as u32],
-            glv_enabled: false,
-        }
-    }
-    
-    /// Check if GLV mode is enabled
-    pub fn is_glv_enabled(&self) -> bool {
-        self.glv_enabled
-    }
-    
-    /// Generate a batch of raw key data in parallel
-    /// With GLV enabled, returns 2x keys (base + GLV transformed)
-    #[inline]
-    pub fn generate_batch(&self, count: usize) -> Vec<RawKeyData> {
-        let start_counter = self.counter.fetch_add(count as u64, Ordering::Relaxed);
-        
-        if self.glv_enabled {
-            // GLV mode: each counter produces 2 keys
-            (0..count)
-                .into_par_iter()
-                .flat_map(|i| {
-                    let counter = start_counter + i as u64;
-                    self.generate_with_glv(counter)
-                })
-                .collect()
-        } else {
-            // Legacy mode: one key per counter
-            (0..count)
-                .into_par_iter()
-                .filter_map(|i| {
-                    let counter = start_counter + i as u64;
-                    self.generate_single(counter)
-                })
-                .collect()
-        }
-    }
-    
-    /// Generate base key + GLV key pair from counter value
-    /// Returns 0, 1, or 2 keys depending on validity
-    #[inline]
-    fn generate_with_glv(&self, counter: u64) -> Vec<RawKeyData> {
-        let mut results = Vec::with_capacity(2);
-        
-        // Generate base private key using Philox
-        let mut private_key = [0u8; 32];
-        
-        let counter_lo = (counter & 0xFFFFFFFF) as u32;
-        let counter_hi = ((counter >> 32) & 0xFFFFFFFF) as u32;
-        
-        // First 16 bytes: use stream 0
-        let ctr0 = [counter_lo, counter_hi, 0, 0];
-        let out0 = philox4x32(ctr0, self.seed);
-        private_key[0..4].copy_from_slice(&out0[0].to_le_bytes());
-        private_key[4..8].copy_from_slice(&out0[1].to_le_bytes());
-        private_key[8..12].copy_from_slice(&out0[2].to_le_bytes());
-        private_key[12..16].copy_from_slice(&out0[3].to_le_bytes());
-        
-        // Second 16 bytes: use stream 1
-        let ctr1 = [counter_lo, counter_hi, 1, 0];
-        let out1 = philox4x32(ctr1, self.seed);
-        private_key[16..20].copy_from_slice(&out1[0].to_le_bytes());
-        private_key[20..24].copy_from_slice(&out1[1].to_le_bytes());
-        private_key[24..28].copy_from_slice(&out1[2].to_le_bytes());
-        private_key[28..32].copy_from_slice(&out1[3].to_le_bytes());
-        
-        // Validate base key
-        if !is_valid_private_key(&private_key) {
-            return results;
-        }
-        
-        // Try to generate base key data
-        if let Some((pubkey_hash, p2sh_hash)) = compute_pubkey_hash(&private_key) {
-            results.push(RawKeyData {
-                private_key,
-                pubkey_hash,
-                p2sh_hash,
-            });
-        }
-        
-        // Generate GLV key: λ·k mod n
-        if let Some(glv_key) = compute_glv_key(&private_key) {
-            if is_valid_private_key(&glv_key) {
-                if let Some((glv_pubkey_hash, glv_p2sh_hash)) = compute_pubkey_hash(&glv_key) {
-                    results.push(RawKeyData {
-                        private_key: glv_key,
-                        pubkey_hash: glv_pubkey_hash,
-                        p2sh_hash: glv_p2sh_hash,
-                    });
-                }
-            }
-        }
-        
-        results
-    }
-    
-    /// Generate a single key from counter value (legacy, non-GLV)
-    #[inline(always)]
-    fn generate_single(&self, counter: u64) -> Option<RawKeyData> {
-        // Generate 32 bytes using Philox
-        // OPTIMIZED: 2 Philox calls (16 bytes each) instead of 8 calls (4 bytes each)
-        // Philox-4x32 produces 4 x 32-bit = 128 bits = 16 bytes per call
-        let mut private_key = [0u8; 32];
-        
-        let counter_lo = (counter & 0xFFFFFFFF) as u32;
-        let counter_hi = ((counter >> 32) & 0xFFFFFFFF) as u32;
-        
-        // First 16 bytes: use stream 0
-        let ctr0 = [counter_lo, counter_hi, 0, 0];
-        let out0 = philox4x32(ctr0, self.seed);
-        private_key[0..4].copy_from_slice(&out0[0].to_le_bytes());
-        private_key[4..8].copy_from_slice(&out0[1].to_le_bytes());
-        private_key[8..12].copy_from_slice(&out0[2].to_le_bytes());
-        private_key[12..16].copy_from_slice(&out0[3].to_le_bytes());
-        
-        // Second 16 bytes: use stream 1
-        let ctr1 = [counter_lo, counter_hi, 1, 0];
-        let out1 = philox4x32(ctr1, self.seed);
-        private_key[16..20].copy_from_slice(&out1[0].to_le_bytes());
-        private_key[20..24].copy_from_slice(&out1[1].to_le_bytes());
-        private_key[24..28].copy_from_slice(&out1[2].to_le_bytes());
-        private_key[28..32].copy_from_slice(&out1[3].to_le_bytes());
-        
-        // Validate key
-        if !is_valid_private_key(&private_key) {
-            return None;
-        }
-        
-        // Compute public key hash and p2sh hash
-        let (pubkey_hash, p2sh_hash) = match compute_pubkey_hash(&private_key) {
-            Some(h) => h,
-            None => return None,
-        };
-        
-        Some(RawKeyData {
-            private_key,
-            pubkey_hash,
-            p2sh_hash,
-        })
-    }
-    
-    /// Get current counter value
-    pub fn current_count(&self) -> u64 {
-        self.counter.load(Ordering::Relaxed)
-    }
-    
-    /// Get effective keys generated (counter * 2 if GLV enabled)
-    pub fn effective_keys_generated(&self) -> u64 {
-        let base = self.counter.load(Ordering::Relaxed);
-        if self.glv_enabled { base * 2 } else { base }
-    }
-}
-
 /// Compute GLV transformed key: λ·k mod n
 /// 
 /// Uses secp256k1's endomorphism property where:
@@ -537,44 +320,6 @@ fn compute_glv_key(private_key: &[u8; 32]) -> Option<[u8; 32]> {
     result.copy_from_slice(&glv_bytes);
     
     Some(result)
-}
-
-impl Default for PhiloxKeyGenerator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Philox 4x32 random number generator - single round
-#[inline(always)]
-fn philox4x32(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
-    let mut ctr = counter;
-    let mut k = key;
-    
-    // 10 rounds
-    for _ in 0..10 {
-        let (hi0, lo0) = mulhilo(PHILOX_M0, ctr[0]);
-        let (hi1, lo1) = mulhilo(PHILOX_M1, ctr[2]);
-        
-        ctr = [
-            hi1 ^ ctr[1] ^ k[0],
-            lo1,
-            hi0 ^ ctr[3] ^ k[1],
-            lo0,
-        ];
-        
-        k[0] = k[0].wrapping_add(PHILOX_W0);
-        k[1] = k[1].wrapping_add(PHILOX_W1);
-    }
-    
-    ctr
-}
-
-/// Multiply and return high/low 32-bit results
-#[inline(always)]
-fn mulhilo(a: u32, b: u32) -> (u32, u32) {
-    let product = (a as u64) * (b as u64);
-    ((product >> 32) as u32, product as u32)
 }
 
 /// Check if private key is valid (non-zero and less than curve order)
@@ -719,20 +464,68 @@ mod tests {
     }
     
     // ========================================================================
-    // PhiloxKeyGenerator (Legacy Random) Tests
+    // CPU-GPU Compatibility Tests
     // ========================================================================
     
     #[test]
-    #[allow(deprecated)]
-    fn test_philox_key_generation() {
-        let gen = PhiloxKeyGenerator::with_seed(12345);
-        let batch = gen.generate_batch(100);
-        assert!(!batch.is_empty());
+    fn test_cpu_gpu_sequential_compatibility() {
+        // Verifies that CPU generates keys in the same order as GPU would
+        // GPU generates: base + 0, base + 1, base + 2, ...
+        let start_offset = 1u64;
+        let gen = CpuKeyGenerator::new(start_offset, None, 1);
         
-        // All keys should be unique
-        let mut seen = std::collections::HashSet::new();
-        for key in &batch {
-            assert!(seen.insert(key.private_key));
+        let batch = gen.generate_batch(5);
+        
+        // Each key should be exactly start_offset + i
+        for (i, key) in batch.iter().enumerate() {
+            let expected_privkey = (start_offset + i as u64).to_be_bytes();
+            
+            // Private key should have the offset in the low 8 bytes
+            assert_eq!(&key.private_key[24..32], &expected_privkey,
+                "CPU key {} should match GPU sequential pattern", i);
+        }
+    }
+    
+    #[test]
+    fn test_cpu_glv_matches_gpu_glv() {
+        // Verifies that GLV transformation matches GPU's implementation
+        // GLV: k → λ·k mod n
+        let gen = CpuKeyGenerator::new(1, None, 2);
+        let batch = gen.generate_batch(1);
+        
+        // Should get 2 keys: base and GLV
+        assert_eq!(batch.len(), 2, "GLV2 should produce 2 keys from 1 offset");
+        
+        // First key should be the base key (offset=1)
+        let base_key = batch[0].private_key;
+        let mut expected_base = [0u8; 32];
+        expected_base[31] = 1;
+        assert_eq!(base_key, expected_base, "Base key should be offset 1");
+        
+        // Second key should be λ·1 = λ (GLV_LAMBDA)
+        let glv_key = batch[1].private_key;
+        assert_eq!(glv_key, GLV_LAMBDA, "GLV(1) should equal λ");
+    }
+    
+    #[test]
+    fn test_cpu_deterministic_across_calls() {
+        // Verifies that restarting from same offset produces same keys
+        // This is critical for checkpointing/resuming scans
+        let gen1 = CpuKeyGenerator::new(1000, None, 2);
+        let batch1 = gen1.generate_batch(10);
+        
+        let gen2 = CpuKeyGenerator::new(1000, None, 2);
+        let batch2 = gen2.generate_batch(10);
+        
+        assert_eq!(batch1.len(), batch2.len(), "Same config should produce same count");
+        
+        for (i, (k1, k2)) in batch1.iter().zip(batch2.iter()).enumerate() {
+            assert_eq!(k1.private_key, k2.private_key,
+                "Key {} should be identical across generators", i);
+            assert_eq!(k1.pubkey_hash, k2.pubkey_hash,
+                "Pubkey hash {} should be identical", i);
+            assert_eq!(k1.p2sh_hash, k2.p2sh_hash,
+                "P2SH hash {} should be identical", i);
         }
     }
     
@@ -757,36 +550,6 @@ mod tests {
         assert_eq!(p2sh_hash.len(), 20);
         // Verify hashes are different
         assert_ne!(pubkey_hash, p2sh_hash);
-    }
-    
-    #[test]
-    #[allow(deprecated)]
-    fn test_glv_key_generation() {
-        let gen = PhiloxKeyGenerator::with_seed(12345);
-        assert!(gen.is_glv_enabled());
-        
-        // With GLV, we should get ~2x keys
-        let batch = gen.generate_batch(50);
-        // Most base keys should produce 2 keys (base + GLV)
-        // Some might be invalid, so we check for > 50
-        assert!(batch.len() > 50, "GLV should produce more than 50 keys from 50 counters, got {}", batch.len());
-        
-        // All keys should still be unique
-        let mut seen = std::collections::HashSet::new();
-        for key in &batch {
-            assert!(seen.insert(key.private_key), "Duplicate key found");
-        }
-    }
-    
-    #[test]
-    #[allow(deprecated)]
-    fn test_glv_disabled() {
-        let gen = PhiloxKeyGenerator::without_glv(12345);
-        assert!(!gen.is_glv_enabled());
-        
-        let batch = gen.generate_batch(100);
-        // Without GLV, should get <= 100 keys
-        assert!(batch.len() <= 100);
     }
     
     #[test]
