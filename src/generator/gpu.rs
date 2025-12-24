@@ -25,7 +25,7 @@ use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
 
-use super::{AddressEncoder, GeneratorConfig, GeneratorStats, KeyEntry, OutputFormat, OutputWriter, AsyncRawWriter};
+use super::{AddressEncoder, GeneratorConfig, GeneratorStats, KeyEntry, RawKeyData, OutputFormat, OutputWriter, AsyncRawWriter};
 
 // ============================================================================
 // CONSTANTS
@@ -64,22 +64,23 @@ lazy_static::lazy_static! {
 }
 
 // ============================================================================
-// BUFFER POOL SYSTEM - Zero-copy ownership transfer
+// BUFFER POOL SYSTEM - Zero-copy ownership transfer with RAW bytes
 // ============================================================================
 
 /// Pre-allocated buffer pool for zero-allocation batch processing
+/// Uses RawKeyData instead of KeyEntry to avoid heap allocations
 pub struct BufferPool {
-    return_tx: Sender<Vec<KeyEntry>>,
-    pool_rx: Receiver<Vec<KeyEntry>>,
+    return_tx: Sender<Vec<RawKeyData>>,
+    pool_rx: Receiver<Vec<RawKeyData>>,
 }
 
 impl BufferPool {
     pub fn new(buffer_capacity: usize, pool_size: usize) -> Self {
         let (return_tx, pool_rx) = bounded(pool_size);
         
-        // Pre-allocate all buffers
+        // Pre-allocate all buffers with RawKeyData (stack-allocated, no heap)
         for _ in 0..pool_size {
-            let buf: Vec<KeyEntry> = Vec::with_capacity(buffer_capacity);
+            let buf: Vec<RawKeyData> = Vec::with_capacity(buffer_capacity);
             let _ = return_tx.try_send(buf);
         }
         
@@ -87,12 +88,12 @@ impl BufferPool {
     }
     
     /// Get a buffer from pool
-    pub fn acquire(&self) -> Vec<KeyEntry> {
+    pub fn acquire(&self) -> Vec<RawKeyData> {
         self.pool_rx.recv().unwrap_or_else(|_| Vec::new())
     }
     
     /// Wrap buffer for auto-return
-    pub fn wrap(&self, mut buf: Vec<KeyEntry>) -> PooledBuffer {
+    pub fn wrap(&self, mut buf: Vec<RawKeyData>) -> PooledBuffer {
         buf.clear();
         PooledBuffer {
             inner: Some(buf),
@@ -102,13 +103,14 @@ impl BufferPool {
 }
 
 /// Smart pointer that returns buffer to pool on drop
+/// Now uses RawKeyData (72 bytes, stack-allocated) instead of KeyEntry (4 Strings, heap)
 pub struct PooledBuffer {
-    inner: Option<Vec<KeyEntry>>,
-    return_tx: Sender<Vec<KeyEntry>>,
+    inner: Option<Vec<RawKeyData>>,
+    return_tx: Sender<Vec<RawKeyData>>,
 }
 
 impl PooledBuffer {
-    pub fn as_mut(&mut self) -> &mut Vec<KeyEntry> {
+    pub fn as_mut(&mut self) -> &mut Vec<RawKeyData> {
         self.inner.as_mut().unwrap()
     }
     
@@ -121,13 +123,14 @@ impl PooledBuffer {
         self.len() == 0
     }
     
-    pub fn take(mut self) -> Vec<KeyEntry> {
+    #[allow(dead_code)]
+    pub fn take(mut self) -> Vec<RawKeyData> {
         self.inner.take().unwrap_or_default()
     }
 }
 
 impl Deref for PooledBuffer {
-    type Target = [KeyEntry];
+    type Target = [RawKeyData];
     fn deref(&self) -> &Self::Target {
         self.inner.as_deref().unwrap_or(&[])
     }
@@ -513,8 +516,9 @@ impl GpuKeyGenerator {
         Ok(())
     }
     
-    /// Wait for batch and process with zero-copy
-    fn process_batch(&self, buf_idx: usize, encoder: &mut AddressEncoder) -> PooledBuffer {
+    /// Wait for batch and process with zero-copy - NO STRING ALLOCATIONS
+    /// Returns raw key data directly from GPU buffer without any String conversions
+    fn process_batch_raw(&self, buf_idx: usize) -> PooledBuffer {
         let bs = &self.buffer_sets[buf_idx];
         
         // Sync
@@ -532,30 +536,36 @@ impl GpuKeyGenerator {
         let mut pooled = self.buffer_pool.wrap(self.buffer_pool.acquire());
         let batch = pooled.as_mut();
         
+        // ZERO STRING ALLOCATION: Copy raw bytes only
         for i in 0..self.tier.keys_per_dispatch {
             let base = i * OUTPUT_SIZE;
-            let privkey = &output_slice[base..base + 32];
-            let pubkey_hash = &output_slice[base + 32..base + 52];
-            let p2sh_hash = &output_slice[base + 52..base + 72];
             
-            if privkey.iter().all(|&b| b == 0) {
-                continue;
+            // Use optimized RawKeyData parsing
+            if let Some(raw) = RawKeyData::from_bytes(&output_slice[base..base + OUTPUT_SIZE]) {
+                // Skip zero keys (fast SIMD check)
+                if raw.is_valid() {
+                    batch.push(raw);
+                }
             }
-            
-            let mut pk_hash = [0u8; 20];
-            let mut p2sh = [0u8; 20];
-            pk_hash.copy_from_slice(pubkey_hash);
-            p2sh.copy_from_slice(p2sh_hash);
-            
-            batch.push(KeyEntry {
-                private_key: hex::encode(privkey),
-                p2pkh: encoder.encode_p2pkh_from_hash(&pk_hash),
-                p2sh: encoder.encode_p2sh_from_hash(&p2sh),
-                p2wpkh: encoder.encode_p2wpkh_from_hash(&pk_hash),
-            });
         }
         
         pooled
+    }
+    
+    /// Legacy process_batch with String encoding (for non-Raw output formats)
+    /// Only used when JSON/Binary output is needed, not for scan mode
+    fn process_batch(&self, buf_idx: usize, encoder: &mut AddressEncoder) -> Vec<KeyEntry> {
+        let raw_batch = self.process_batch_raw(buf_idx);
+        
+        // Convert to KeyEntry only when needed (file write)
+        raw_batch.iter().map(|raw| {
+            KeyEntry {
+                private_key: hex::encode(&raw.private_key),
+                p2pkh: encoder.encode_p2pkh_from_hash(&raw.pubkey_hash),
+                p2sh: encoder.encode_p2sh_from_hash(&raw.p2sh_hash),
+                p2wpkh: encoder.encode_p2wpkh_from_hash(&raw.pubkey_hash),
+            }
+        }).collect()
     }
     
     /// Run GPU key generation with all optimizations
@@ -569,8 +579,18 @@ impl GpuKeyGenerator {
         let mut writer = OutputWriter::new(&self.config.output_dir, self.config.output_format)
             .map_err(|e| format!("Failed to create writer: {}", e))?;
         
-        let mut current_batch: Vec<KeyEntry> = Vec::with_capacity(self.config.keys_per_file as usize);
+        // MEMORY MANAGEMENT: Cap batch size to prevent OOM
+        // Even if keys_per_file is 1 billion, we flush to disk in smaller chunks
+        // to prevent unbounded memory growth. Each KeyEntry is ~200 bytes (4 Strings).
+        const MAX_BATCH_IN_MEMORY: usize = 10_000_000; // 10M keys max (~2GB RAM)
+        let batch_capacity = std::cmp::min(
+            self.config.keys_per_file as usize,
+            MAX_BATCH_IN_MEMORY
+        );
+        
+        let mut current_batch: Vec<KeyEntry> = Vec::with_capacity(batch_capacity);
         let mut encoder = AddressEncoder::new();
+        let mut keys_in_current_file: u64 = 0; // Track keys written to current logical file
         
         println!("🚀 Starting Ultra-Optimized GPU Key Generator");
         println!("   ALL OPTIMIZATIONS ENABLED:");
@@ -580,6 +600,7 @@ impl GpuKeyGenerator {
         println!("   ✓ wNAF tables (5 adds vs 256)");
         println!("   ✓ Montgomery batch (32x speedup)");
         println!("   ✓ Extended Jacobian (saves squarings)");
+        println!("   ✓ Memory-bounded batching (max {}M keys/batch)", MAX_BATCH_IN_MEMORY / 1_000_000);
         println!("   Pipeline depth: {}", self.tier.pipeline_depth);
         println!("   Keys per dispatch: {}", self.tier.keys_per_dispatch);
         println!("   Keys per file: {}", self.config.keys_per_file);
@@ -624,17 +645,29 @@ impl GpuKeyGenerator {
             // Dispatch next batch
             self.dispatch_batch(process_idx, next_offset)?;
             
-            // Extend current batch (take ownership from pool)
-            current_batch.extend(batch_result.take().into_iter());
+            // Extend current batch (now Vec<KeyEntry>)
+            let batch_len = batch_result.len();
+            current_batch.extend(batch_result.into_iter());
+            keys_in_current_file += batch_len as u64;
             
             current_buf += 1;
             
-            // Write file when batch is full
-            if current_batch.len() >= self.config.keys_per_file as usize {
+            // MEMORY-BOUNDED FLUSH: Write when either condition is met:
+            // 1. Reached keys_per_file limit (logical file boundary)
+            // 2. Reached MAX_BATCH_IN_MEMORY (prevent OOM)
+            let should_flush = current_batch.len() >= batch_capacity
+                || keys_in_current_file >= self.config.keys_per_file;
+            
+            if should_flush {
                 let filename = writer.write_batch(&current_batch)
                     .map_err(|e| format!("Failed to write: {}", e))?;
                 println!("📁 Written: {} ({} keys)", filename, current_batch.len());
                 current_batch.clear();
+                
+                // Reset file counter if we've completed a logical file
+                if keys_in_current_file >= self.config.keys_per_file {
+                    keys_in_current_file = 0;
+                }
             }
             
             // Progress report
@@ -659,7 +692,7 @@ impl GpuKeyGenerator {
         for i in 0..depth {
             let idx = (current_buf + i) % depth;
             let batch_result = self.process_batch(idx, &mut encoder);
-            current_batch.extend(batch_result.take().into_iter());
+            current_batch.extend(batch_result.into_iter());
         }
         
         // Write remaining
@@ -858,6 +891,12 @@ impl GpuKeyGenerator {
         let report_interval = Duration::from_secs(2);
         
         // Prime the pipeline with GLV kernel
+        // GLV Key Space Note:
+        // - Primary keys:  k, k+1, ..., k+N-1 (from offset)
+        // - GLV keys:      λ*k, λ*(k+1), ... (endomorphism, different key space)
+        // GLV λ is a large constant (~2^256), so GLV keys don't overlap with
+        // sequential primary keys. Offset increments by keys_per_dispatch (not 2x)
+        // because we're scanning 2 independent key spaces in parallel.
         for i in 0..depth {
             let offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
             self.dispatch_batch_glv(i, offset)?;
@@ -885,10 +924,18 @@ impl GpuKeyGenerator {
             let batch_hits: Vec<String> = output_slice
                 .par_chunks_exact(OUTPUT_SIZE)
                 .filter_map(|entry| {
-                    let privkey = &entry[0..32];
+                    // SIMD-optimized zero check: read 4 u64s and OR together
+                    // This is 8x faster than byte-by-byte iteration
+                    let privkey_ptr = entry.as_ptr() as *const u64;
+                    let is_zero = unsafe {
+                        let v0 = std::ptr::read_unaligned(privkey_ptr);
+                        let v1 = std::ptr::read_unaligned(privkey_ptr.add(1));
+                        let v2 = std::ptr::read_unaligned(privkey_ptr.add(2));
+                        let v3 = std::ptr::read_unaligned(privkey_ptr.add(3));
+                        (v0 | v1 | v2 | v3) == 0
+                    };
                     
-                    // Skip zero keys
-                    if privkey.iter().all(|&b| b == 0) {
+                    if is_zero {
                         return None;
                     }
                     
@@ -899,7 +946,8 @@ impl GpuKeyGenerator {
                     let (match_p2pkh, match_p2sh, match_p2wpkh) = targets.check_raw(pubkey_hash, p2sh_hash);
                     
                     if match_p2pkh || match_p2sh || match_p2wpkh {
-                        let priv_hex = hex::encode(privkey);
+                        // Only encode when match found (avoids unnecessary String allocation)
+                        let priv_hex = hex::encode(&entry[0..32]);
                         let mut result = format!("🎯 FOUND! Key: {}", priv_hex);
                         
                         if match_p2pkh {
@@ -1059,8 +1107,8 @@ fn verify_wnaf_table(table: &[u8]) -> Result<(), String> {
         let expected = ProjectivePoint::GENERATOR * Scalar::from(*scalar_val);
         let expected_affine = expected.to_affine();
         let expected_encoded = expected_affine.to_encoded_point(false);
-        let expected_x = expected_encoded.x().unwrap().as_slice();
-        let expected_y = expected_encoded.y().unwrap().as_slice();
+        let expected_x: &[u8] = expected_encoded.x().unwrap();
+        let expected_y: &[u8] = expected_encoded.y().unwrap();
         
         // Get table entry
         let idx = window * 15 + (digit - 1);

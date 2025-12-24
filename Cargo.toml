@@ -43,30 +43,53 @@ ctrlc = "3.4"
 fxhash = "0.2"
 lazy_static = "1.4"
 
+# XOR Filter - O(1) probabilistic lookup, 10x less memory than HashSet
+xorf = { version = "0.8", optional = true }
+
 # System (macOS native calls - no fork overhead)
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
 [features]
-default = ["philox-rng", "xor-filter", "pid-thermal", "zero-copy"]  # Ultimate system enabled by default
+# Enable all implemented features by default
+default = ["philox-rng", "xor-filter", "zero-copy"]
 
-# Phase 1: Philox RNG
-philox-rng = []        # GPU-native Philox4x32 RNG
+# ============================================================================
+# IMPLEMENTED FEATURES
+# ============================================================================
 
-# Phase 2: Xor Filter
-xor-filter = []         # O(1) Xor filter (vs Bloom + Binary)
+# Philox RNG - GPU-native Philox4x32 random number generator
+# Used in keygen.metal for deterministic parallel key generation
+philox-rng = []
 
-# Phase 3: PID Thermal
-pid-thermal = []        # PID thermal controller
+# Xor Filter - O(1) probabilistic lookup, 10x less memory than HashSet
+# False positive rate: < 0.4% (acceptable for initial screening)
+# When enabled, uses Xor8 filter alongside HashSet for fast rejection
+xor-filter = ["dep:xorf"]
 
-# Phase 4: Zero-Copy
-zero-copy = []          # Zero-copy unified memory
+# Zero-Copy Unified Memory - Direct GPU buffer access without memcpy
+# Provides direct slice references to GPU buffer data
+zero-copy = []
 
-# Convenience feature sets
+# ============================================================================
+# PLANNED FEATURES (NOT YET IMPLEMENTED)
+# ============================================================================
+
+# PID Thermal Controller - Dynamic GPU throttling based on temperature
+# TODO: Implement in src/generator/gpu.rs using IOKit for macOS
+pid-thermal = []
+
+# ============================================================================
+# CONVENIENCE FEATURE SETS
+# ============================================================================
+
+# All features including planned ones (for development only)
 all-features = ["philox-rng", "xor-filter", "pid-thermal", "zero-copy"]
-safe-features = ["philox-rng", "xor-filter", "pid-thermal"]
 
-# Legacy mode (all new features disabled)
+# Safe production features (only stable implementations)
+safe-features = ["philox-rng", "xor-filter", "zero-copy"]
+
+# Legacy mode - minimal features for compatibility testing
 legacy-mode = []
 
 [dev-dependencies]

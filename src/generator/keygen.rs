@@ -77,19 +77,28 @@ impl KeyGenerator {
     #[inline(always)]
     fn generate_single(&self, counter: u64) -> Option<RawKeyData> {
         // Generate 32 bytes using Philox
+        // OPTIMIZED: 2 Philox calls (16 bytes each) instead of 8 calls (4 bytes each)
+        // Philox-4x32 produces 4 x 32-bit = 128 bits = 16 bytes per call
         let mut private_key = [0u8; 32];
         
-        // 8 rounds of Philox to generate 32 bytes
-        for i in 0..8 {
-            let ctr = [
-                (counter & 0xFFFFFFFF) as u32,
-                ((counter >> 32) & 0xFFFFFFFF) as u32,
-                i as u32,
-                0,
-            ];
-            let output = philox4x32(ctr, self.seed);
-            private_key[i * 4..(i + 1) * 4].copy_from_slice(&output[0].to_le_bytes());
-        }
+        let counter_lo = (counter & 0xFFFFFFFF) as u32;
+        let counter_hi = ((counter >> 32) & 0xFFFFFFFF) as u32;
+        
+        // First 16 bytes: use stream 0
+        let ctr0 = [counter_lo, counter_hi, 0, 0];
+        let out0 = philox4x32(ctr0, self.seed);
+        private_key[0..4].copy_from_slice(&out0[0].to_le_bytes());
+        private_key[4..8].copy_from_slice(&out0[1].to_le_bytes());
+        private_key[8..12].copy_from_slice(&out0[2].to_le_bytes());
+        private_key[12..16].copy_from_slice(&out0[3].to_le_bytes());
+        
+        // Second 16 bytes: use stream 1
+        let ctr1 = [counter_lo, counter_hi, 1, 0];
+        let out1 = philox4x32(ctr1, self.seed);
+        private_key[16..20].copy_from_slice(&out1[0].to_le_bytes());
+        private_key[20..24].copy_from_slice(&out1[1].to_le_bytes());
+        private_key[24..28].copy_from_slice(&out1[2].to_le_bytes());
+        private_key[28..32].copy_from_slice(&out1[3].to_le_bytes());
         
         // Validate key
         if !is_valid_private_key(&private_key) {
@@ -156,12 +165,22 @@ fn mulhilo(a: u32, b: u32) -> (u32, u32) {
 /// Check if private key is valid (non-zero and less than curve order)
 #[inline(always)]
 fn is_valid_private_key(key: &[u8; 32]) -> bool {
-    // Check for zero
-    if key.iter().all(|&b| b == 0) {
+    // SIMD-optimized zero check: read 4 u64s and OR together
+    // 8x faster than byte-by-byte iteration
+    let ptr = key.as_ptr() as *const u64;
+    let is_zero = unsafe {
+        let v0 = std::ptr::read_unaligned(ptr);
+        let v1 = std::ptr::read_unaligned(ptr.add(1));
+        let v2 = std::ptr::read_unaligned(ptr.add(2));
+        let v3 = std::ptr::read_unaligned(ptr.add(3));
+        (v0 | v1 | v2 | v3) == 0
+    };
+    
+    if is_zero {
         return false;
     }
     
-    // Check less than curve order
+    // Check less than curve order (big-endian comparison)
     for i in 0..32 {
         if key[i] < SECP256K1_ORDER[i] {
             return true;

@@ -72,6 +72,37 @@ pub struct RawKeyData {
 
 impl RawKeyData {
     pub const SIZE: usize = 72;
+    
+    /// Create from raw bytes slice (zero-copy)
+    #[inline(always)]
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::SIZE {
+            return None;
+        }
+        let mut raw = Self {
+            private_key: [0u8; 32],
+            pubkey_hash: [0u8; 20],
+            p2sh_hash: [0u8; 20],
+        };
+        raw.private_key.copy_from_slice(&data[0..32]);
+        raw.pubkey_hash.copy_from_slice(&data[32..52]);
+        raw.p2sh_hash.copy_from_slice(&data[52..72]);
+        Some(raw)
+    }
+    
+    /// Check if private key is non-zero (valid)
+    #[inline(always)]
+    pub fn is_valid(&self) -> bool {
+        // Check 8 bytes at a time for SIMD optimization
+        let ptr = self.private_key.as_ptr() as *const u64;
+        unsafe {
+            let v0 = std::ptr::read_unaligned(ptr);
+            let v1 = std::ptr::read_unaligned(ptr.add(1));
+            let v2 = std::ptr::read_unaligned(ptr.add(2));
+            let v3 = std::ptr::read_unaligned(ptr.add(3));
+            (v0 | v1 | v2 | v3) != 0
+        }
+    }
 }
 
 /// Generator configuration

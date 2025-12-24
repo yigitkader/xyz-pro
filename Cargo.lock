@@ -524,6 +524,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "libm"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1090,6 +1096,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xorf"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57901b00e3f8e14f4d20b8955bf8087ecb545cfe2ed8741c2a2dbc89847a1a29"
+dependencies = [
+ "libm",
+ "rand",
+]
+
+[[package]]
 name = "xyz-pro"
 version = "0.3.0"
 dependencies = [
@@ -1116,6 +1132,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "xorf",
 ]
 
 [[package]]

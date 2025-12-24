@@ -2,6 +2,11 @@
 //!
 //! These types are the contract between Generator and Reader.
 //! Neither module should depend on the other's implementation details.
+//!
+//! ## Zero-Copy Support
+//! When `zero-copy` feature is enabled, provides direct GPU buffer access
+//! without any memory copies. The `KeyBatch` struct provides a lifetime-safe
+//! view into unified memory.
 
 /// Raw key data - the minimal unit of data exchanged
 /// Layout: [privkey: 32 bytes][pubkey_hash: 20 bytes][p2sh_hash: 20 bytes]
@@ -85,6 +90,21 @@ impl<'a> KeyBatch<'a> {
         Self { data, count }
     }
     
+    /// ZERO-COPY: Create batch from raw pointer and length
+    /// This is the core zero-copy primitive - no data is copied.
+    /// 
+    /// # Safety
+    /// - `ptr` must be valid for reads of `len` bytes
+    /// - `ptr` must be aligned to at least 1 byte
+    /// - The memory must remain valid for lifetime `'a`
+    /// - The memory must not be mutated for lifetime `'a`
+    #[cfg(feature = "zero-copy")]
+    #[inline]
+    pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
+        let data = std::slice::from_raw_parts(ptr, len);
+        Self::new(data)
+    }
+    
     /// Number of keys in this batch
     #[inline]
     pub fn len(&self) -> usize {
@@ -97,7 +117,7 @@ impl<'a> KeyBatch<'a> {
         self.count == 0
     }
     
-    /// Get key at index
+    /// Get key at index (copies the key data)
     #[inline]
     pub fn get(&self, index: usize) -> Option<RawKeyData> {
         if index >= self.count {
@@ -105,6 +125,42 @@ impl<'a> KeyBatch<'a> {
         }
         let offset = index * RawKeyData::SIZE;
         RawKeyData::from_bytes(&self.data[offset..offset + RawKeyData::SIZE])
+    }
+    
+    /// ZERO-COPY: Get raw slice reference at index (no copy)
+    /// Returns the raw bytes for a single key entry
+    #[cfg(feature = "zero-copy")]
+    #[inline]
+    pub fn get_raw(&self, index: usize) -> Option<&'a [u8]> {
+        if index >= self.count {
+            return None;
+        }
+        let offset = index * RawKeyData::SIZE;
+        Some(&self.data[offset..offset + RawKeyData::SIZE])
+    }
+    
+    /// ZERO-COPY: Get pubkey_hash slice directly (no copy)
+    /// Returns bytes [32..52] of the entry
+    #[cfg(feature = "zero-copy")]
+    #[inline]
+    pub fn get_pubkey_hash(&self, index: usize) -> Option<&'a [u8; 20]> {
+        if index >= self.count {
+            return None;
+        }
+        let offset = index * RawKeyData::SIZE + 32;
+        self.data[offset..offset + 20].try_into().ok()
+    }
+    
+    /// ZERO-COPY: Get p2sh_hash slice directly (no copy)
+    /// Returns bytes [52..72] of the entry
+    #[cfg(feature = "zero-copy")]
+    #[inline]
+    pub fn get_p2sh_hash(&self, index: usize) -> Option<&'a [u8; 20]> {
+        if index >= self.count {
+            return None;
+        }
+        let offset = index * RawKeyData::SIZE + 52;
+        self.data[offset..offset + 20].try_into().ok()
     }
     
     /// Iterate over all keys
@@ -126,6 +182,14 @@ impl<'a> KeyBatch<'a> {
         self.data
             .chunks(chunk_size * RawKeyData::SIZE)
             .map(|chunk| KeyBatch::new(chunk))
+    }
+    
+    /// ZERO-COPY: Get parallel iterator over raw key slices
+    /// Each slice is exactly 72 bytes (one key entry)
+    #[cfg(feature = "zero-copy")]
+    pub fn par_raw_iter(&self) -> impl rayon::iter::ParallelIterator<Item = &'a [u8]> + 'a {
+        use rayon::prelude::*;
+        self.data.par_chunks_exact(RawKeyData::SIZE)
     }
 }
 
