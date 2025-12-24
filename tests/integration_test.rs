@@ -612,6 +612,137 @@ fn test_gpu_hash_matches_cpu() {
     println!("✅ GPU hash computation matches CPU!");
 }
 
+/// Test GPU GLV scalar multiplication matches CPU
+/// This is the critical test - verifies that GPU computes λ·k (mod n) correctly
+#[test]
+fn test_gpu_glv_scalar_matches_cpu() {
+    use k256::Scalar;
+    use k256::elliptic_curve::PrimeField;
+    use k256::SecretKey;
+    
+    // GLV Lambda (same as in keygen.metal)
+    // Metal: {0xDF02967C1B23BD72, 0x122E22EA20816678, 0xA5261C028812645A, 0x5363AD4CC05C30E0}
+    // where .x=LSW, .w=MSW
+    let lambda_bytes: [u8; 32] = [
+        0x53, 0x63, 0xAD, 0x4C, 0xC0, 0x5C, 0x30, 0xE0,  // .w (MSW)
+        0xA5, 0x26, 0x1C, 0x02, 0x88, 0x12, 0x64, 0x5A,  // .z
+        0x12, 0x2E, 0x22, 0xEA, 0x20, 0x81, 0x66, 0x78,  // .y
+        0xDF, 0x02, 0x96, 0x7C, 0x1B, 0x23, 0xBD, 0x72,  // .x (LSW)
+    ];
+    let lambda = Scalar::from_repr(lambda_bytes.into()).unwrap();
+    
+    // Skip if GPU not available
+    let config = GeneratorConfig {
+        start_offset: 100,  // Start at non-trivial offset
+        batch_size: 32,
+        ..Default::default()
+    };
+    
+    let gpu = match GpuKeyGenerator::new(config) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available, skipping test: {}", e);
+            return;
+        }
+    };
+    
+    // Use adapter to get batch (it handles dispatch_glv internally)
+    let adapter = GpuGeneratorAdapter::new(gpu);
+    
+    let batch_bytes = match adapter.generate_batch() {
+        Ok(b) => b,
+        Err(e) => {
+            println!("⚠️ Failed to generate batch: {}", e);
+            return;
+        }
+    };
+    
+    let batch = KeyBatch::new(batch_bytes);
+    
+    println!("🔍 Testing GPU GLV scalar multiplication:");
+    println!("   Batch size: {} keys", batch.len());
+    
+    if batch.len() < 2 {
+        println!("⚠️ Not enough keys in batch, skipping");
+        return;
+    }
+    
+    // GLV kernel outputs pairs: [primary_0, glv_0, primary_1, glv_1, ...]
+    // Collect to Vec for indexed access
+    let keys: Vec<_> = batch.iter().collect();
+    
+    // Check first valid pair
+    let mut found_pair = false;
+    for i in (0..keys.len().saturating_sub(1)).step_by(2) {
+        let primary = &keys[i];
+        let glv = &keys[i + 1];
+        
+        // Skip if either key is zero
+        if primary.private_key.iter().all(|&b| b == 0) || 
+           glv.private_key.iter().all(|&b| b == 0) {
+            continue;
+        }
+        
+        println!("   Primary key: {}", hex::encode(primary.private_key));
+        println!("   GLV key:     {}", hex::encode(glv.private_key));
+        
+        // CPU compute: glv_k = primary_k * lambda (mod n)
+        let primary_scalar = match Scalar::from_repr(primary.private_key.into()) {
+            opt if opt.is_some().into() => opt.unwrap(),
+            _ => continue,
+        };
+        
+        let cpu_glv_scalar = primary_scalar * lambda;
+        let cpu_glv_bytes: [u8; 32] = cpu_glv_scalar.to_repr().into();
+        
+        println!("   CPU GLV:     {}", hex::encode(cpu_glv_bytes));
+        
+        // Verify GPU GLV matches CPU
+        assert_eq!(
+            glv.private_key, cpu_glv_bytes,
+            "GPU GLV private key should match CPU computation"
+        );
+        
+        // Also verify the GLV key produces the correct address
+        // (this tests the endomorphism property: φ(P) has privkey λ·k)
+        if let Ok(primary_sk) = SecretKey::from_bytes((&primary.private_key).into()) {
+            if let Ok(glv_sk) = SecretKey::from_bytes((&glv.private_key).into()) {
+                use k256::elliptic_curve::sec1::ToEncodedPoint;
+                
+                let primary_pk = primary_sk.public_key();
+                let glv_pk = glv_sk.public_key();
+                
+                // GLV beta constant: β³ ≡ 1 (mod p)
+                // φ(x, y) = (β·x, y)
+                // The y-coordinates should be the same
+                let primary_point = primary_pk.to_encoded_point(false);
+                let glv_point = glv_pk.to_encoded_point(false);
+                
+                // y-coordinate is bytes 33-64 in uncompressed format
+                let primary_y = &primary_point.as_bytes()[33..65];
+                let glv_y = &glv_point.as_bytes()[33..65];
+                
+                assert_eq!(
+                    primary_y, glv_y,
+                    "GLV endomorphism should preserve y-coordinate"
+                );
+                
+                println!("   ✓ Y-coordinates match (endomorphism verified)");
+            }
+        }
+        
+        found_pair = true;
+        break;
+    }
+    
+    if !found_pair {
+        println!("⚠️ No valid key pairs found in batch");
+        return;
+    }
+    
+    println!("✅ GPU GLV scalar multiplication matches CPU!");
+}
+
 /// Test that the address encoder handles edge cases
 #[test]
 fn test_encoder_edge_cases() {

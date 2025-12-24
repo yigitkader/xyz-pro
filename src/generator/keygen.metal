@@ -247,6 +247,17 @@ inline ulong4 secp256k1_reduce(ulong r0, ulong r1, ulong r2, ulong r3,
     return res;
 }
 
+// Add with carry, returns (sum, carry_out)
+// NOTE: Defined here (before mod_mul) because Metal requires forward declaration
+inline ulong add_with_carry(ulong a, ulong b, ulong carry_in, thread ulong* carry_out) {
+    ulong sum = a + b;
+    ulong c1 = (sum < a) ? 1ULL : 0ULL;
+    sum += carry_in;
+    ulong c2 = (sum < carry_in) ? 1ULL : 0ULL;
+    *carry_out = c1 + c2;
+    return sum;
+}
+
 ulong4 mod_mul(ulong4 a, ulong4 b) {
     ulong r[8] = {0,0,0,0,0,0,0,0};
     for (int i = 0; i < 4; i++) {
@@ -571,15 +582,7 @@ constant ulong REDUCE_C0 = 0x402DA1732FC9BEBFULL;  // bits 0-63
 constant ulong REDUCE_C1 = 0x4551231950B75FC4ULL;  // bits 64-127  
 constant ulong REDUCE_C2 = 0x0000000000000001ULL;  // bit 128
 
-// Add with carry, returns (sum, carry_out)
-inline ulong add_with_carry(ulong a, ulong b, ulong carry_in, thread ulong* carry_out) {
-    ulong sum = a + b;
-    ulong c1 = (sum < a) ? 1ULL : 0ULL;
-    sum += carry_in;
-    ulong c2 = (sum < carry_in) ? 1ULL : 0ULL;
-    *carry_out = c1 + c2;
-    return sum;
-}
+// NOTE: add_with_carry is defined earlier (before mod_mul) for forward declaration
 
 // Multiply 256-bit number by reduction constant C (129 bits)
 // Input: a (256 bits in 4 words)
