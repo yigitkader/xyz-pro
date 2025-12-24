@@ -178,15 +178,27 @@ fn parse_string_arg(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+/// Parse u64 argument with explicit error handling
+/// Returns None if flag not found, exits with error if value is invalid
 fn parse_u64_arg(args: &[String], name: &str) -> Option<u64> {
     for i in 0..args.len().saturating_sub(1) {
         if args[i] == name {
-            // Support hex (0x...) and decimal
             let val = &args[i + 1];
-            if val.starts_with("0x") || val.starts_with("0X") {
-                return u64::from_str_radix(&val[2..], 16).ok();
+            
+            // Support hex (0x...) and decimal
+            let result = if val.starts_with("0x") || val.starts_with("0X") {
+                u64::from_str_radix(&val[2..], 16)
             } else {
-                return val.parse().ok();
+                val.parse()
+            };
+            
+            match result {
+                Ok(n) => return Some(n),
+                Err(e) => {
+                    eprintln!("❌ Invalid value for {}: '{}' - {}", name, val, e);
+                    eprintln!("   Expected: decimal (123456) or hex (0x1E240)");
+                    std::process::exit(1);
+                }
             }
         }
     }

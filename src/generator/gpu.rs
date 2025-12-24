@@ -357,9 +357,39 @@ impl GpuKeyGenerator {
         })
     }
     
-    /// Set the stop signal
+    /// Set the stop signal and wait for GPU to finish current work
+    /// 
+    /// GRACEFUL SHUTDOWN:
+    /// 1. Set stop flag so loops exit after current batch
+    /// 2. Wait for all pending GPU command buffers to complete
+    /// 3. GPU memory is automatically cleaned up by Metal
     pub fn stop(&self) {
         self.should_stop.store(true, Ordering::SeqCst);
+        
+        // Wait for all pending GPU work to complete
+        // This prevents GPU memory corruption and ensures clean shutdown
+        self.wait_for_all_pending();
+    }
+    
+    /// Wait for all pending GPU command buffers to complete
+    /// Called during stop() for graceful shutdown
+    fn wait_for_all_pending(&self) {
+        for (idx, bs) in self.buffer_sets.iter().enumerate() {
+            if let Ok(pending) = bs.pending_command.lock() {
+                if let Some(ref cb) = *pending {
+                    cb.wait_until_completed();
+                }
+            }
+            // Also ensure any in-flight commands on the queue are done
+            // by creating and waiting on a sync command
+            let sync_cb = bs.queue.new_command_buffer();
+            sync_cb.commit();
+            sync_cb.wait_until_completed();
+            
+            if idx == 0 {
+                println!("🛑 GPU graceful shutdown: waiting for {} buffer sets...", self.buffer_sets.len());
+            }
+        }
     }
     
     // ========================================================================
@@ -887,7 +917,7 @@ impl GpuKeyGenerator {
     /// - GPU generates 2 keys per EC operation (primary + GLV)
     /// - Uses Unified Memory (zero-copy)
     /// - Only writes when match found
-    pub fn run_scan(&self, targets: std::sync::Arc<crate::reader::TargetSet>) -> Result<ScanStats, String> {
+    pub fn run_scan(&self, targets: Arc<crate::reader::TargetSet>) -> Result<ScanStats, String> {
         use rayon::prelude::*;
         use std::sync::atomic::AtomicU64;
         use std::fs::OpenOptions;
@@ -1218,4 +1248,40 @@ fn format_number(n: u64) -> String {
     }
     
     result
+}
+
+// ============================================================================
+// DROP IMPLEMENTATION - GRACEFUL GPU SHUTDOWN
+// ============================================================================
+
+impl Drop for GpuKeyGenerator {
+    /// Graceful shutdown: wait for all pending GPU work before releasing resources
+    /// 
+    /// This prevents:
+    /// - GPU memory corruption from premature buffer deallocation
+    /// - Metal validation errors on debug builds
+    /// - Orphaned GPU kernel execution
+    fn drop(&mut self) {
+        // Only do cleanup if we haven't already stopped
+        if !self.should_stop.load(Ordering::SeqCst) {
+            self.should_stop.store(true, Ordering::SeqCst);
+        }
+        
+        // Wait for all GPU command buffers to complete
+        for bs in &self.buffer_sets {
+            // Wait for pending command
+            if let Ok(pending) = bs.pending_command.lock() {
+                if let Some(ref cb) = *pending {
+                    cb.wait_until_completed();
+                }
+            }
+            // Sync the queue
+            let sync_cb = bs.queue.new_command_buffer();
+            sync_cb.commit();
+            sync_cb.wait_until_completed();
+        }
+        
+        // Metal automatically releases GPU buffers when they go out of scope
+        // via Arc<Buffer> reference counting
+    }
 }
