@@ -240,8 +240,11 @@ impl TargetSet {
         file.sync_all()
             .map_err(|e| format!("Failed to sync cache file: {}", e))?;
         
-        // Atomic rename (on Unix, this is atomic)
-        fs::rename(&temp_path, cache_path)
+        // Drop file handle before rename (important on Windows)
+        drop(file);
+        
+        // Platform-specific atomic rename
+        atomic_rename_file(&temp_path, cache_path)
             .map_err(|e| format!("Failed to rename cache file: {}", e))?;
         
         let cache_size_mb = encoded.len() as f64 / (1024.0 * 1024.0);
@@ -470,13 +473,85 @@ impl TargetSet {
     }
 }
 
-/// Convert 20-byte hash to u64 key for XOR filter
-/// Uses first 8 bytes as u64 (sufficient entropy for filter)
+/// Convert 20-byte hash160 to u64 key for XOR filter
+/// 
+/// Uses XOR-fold to incorporate ALL 20 bytes, not just the first 8.
+/// This eliminates hash collisions where different hash160 values
+/// would map to the same XOR filter key.
+/// 
+/// Without XOR-fold: Only first 8 bytes used → collision if bytes 8-19 differ
+/// With XOR-fold: All 20 bytes contribute → collision only if XOR-fold matches
+/// 
+/// Layout: [8 bytes] XOR [8 bytes] XOR [4 bytes as u64]
 #[cfg(feature = "xor-filter")]
 #[inline(always)]
 fn hash160_to_u64(hash: &[u8; 20]) -> u64 {
-    let ptr = hash.as_ptr() as *const u64;
-    unsafe { std::ptr::read_unaligned(ptr) }
+    // XOR-fold all 20 bytes into 64 bits
+    // This ensures every byte of the hash160 contributes to the key
+    let p1 = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+    let p2 = u64::from_le_bytes(hash[8..16].try_into().unwrap());
+    let p3 = u32::from_le_bytes(hash[16..20].try_into().unwrap()) as u64;
+    p1 ^ p2 ^ p3
+}
+
+/// Atomic file rename - platform-specific implementation
+/// 
+/// On Unix: rename() is atomic by POSIX specification
+/// On Windows: Uses MoveFileExW with MOVEFILE_REPLACE_EXISTING for atomic operation
+/// 
+/// This prevents cache corruption when multiple processes write simultaneously.
+#[cfg(unix)]
+fn atomic_rename_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    // POSIX rename() is atomic - if target exists, it's replaced atomically
+    fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn atomic_rename_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::iter::once;
+    
+    // Windows FFI for MoveFileExW
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+    
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+    
+    fn to_wide_null(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(once(0)).collect()
+    }
+    
+    let temp_wide = to_wide_null(temp.as_os_str());
+    let target_wide = to_wide_null(target.as_os_str());
+    
+    // MOVEFILE_REPLACE_EXISTING: Replace target if exists (atomic)
+    // MOVEFILE_WRITE_THROUGH: Ensure data is written to disk before returning
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    
+    let result = unsafe {
+        MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags)
+    };
+    
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+// Fallback for other platforms (should not be reached in practice)
+#[cfg(not(any(unix, windows)))]
+fn atomic_rename_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    // Best effort: try remove then rename
+    let _ = fs::remove_file(target);
+    fs::rename(temp, target)
 }
 
 /// Decode P2PKH address to hash160

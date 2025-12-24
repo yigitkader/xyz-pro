@@ -7,9 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
-
+use once_cell::sync::Lazy;
 use rayon::prelude::*;
+
+/// Global reference instant for lock-free elapsed time calculation
+/// All timestamps are stored as nanoseconds since this reference point
+static INSTANT_REFERENCE: Lazy<Instant> = Lazy::new(Instant::now);
 
 use super::{KeyBatch, KeyGenerator, Match, MatchOutput, Matcher, RawKeyData};
 
@@ -82,10 +85,11 @@ where
     output: Arc<O>,
     config: PipelineConfig,
     
-    // Stats
+    // Stats (all lock-free atomics)
     matches_found: AtomicU64,
-    /// Start time for elapsed calculation (reset on each run)
-    start_time: Mutex<Instant>,
+    /// Start time as nanoseconds since INSTANT_REFERENCE (lock-free)
+    /// Using AtomicU64 instead of Mutex<Instant> for lock-free stats() access
+    start_nanos: AtomicU64,
 }
 
 impl<G, M, O> IntegratedPipeline<G, M, O>
@@ -101,13 +105,18 @@ where
     
     /// Create a new pipeline with custom config
     pub fn with_config(generator: G, matcher: M, output: O, config: PipelineConfig) -> Self {
+        // Initialize start_nanos relative to global reference
+        let start_nanos = Instant::now()
+            .duration_since(*INSTANT_REFERENCE)
+            .as_nanos() as u64;
+        
         Self {
             generator: Arc::new(generator),
             matcher: Arc::new(matcher),
             output: Arc::new(output),
             config,
             matches_found: AtomicU64::new(0),
-            start_time: Mutex::new(Instant::now()),
+            start_nanos: AtomicU64::new(start_nanos),
         }
     }
     
@@ -117,8 +126,9 @@ where
     pub fn run(&self) -> Result<PipelineStats, String> {
         let now = Instant::now();
         
-        // Reset start time for this run (allows multiple run() calls)
-        *self.start_time.lock() = now;
+        // Reset start time for this run (lock-free atomic update)
+        let start_nanos = now.duration_since(*INSTANT_REFERENCE).as_nanos() as u64;
+        self.start_nanos.store(start_nanos, Ordering::Release);
         // Reset match counter for this run
         self.matches_found.store(0, Ordering::SeqCst);
         
@@ -321,8 +331,18 @@ where
     }
     
     /// Get current stats (can be called during a run from another thread)
+    /// 
+    /// This is completely lock-free - uses atomic reads only.
+    /// No mutex contention even under high-frequency polling.
+    #[inline]
     pub fn stats(&self) -> PipelineStats {
-        let elapsed_secs = self.start_time.lock().elapsed().as_secs_f64();
+        // Lock-free elapsed time calculation
+        let start_nanos = self.start_nanos.load(Ordering::Acquire);
+        let now_nanos = Instant::now()
+            .duration_since(*INSTANT_REFERENCE)
+            .as_nanos() as u64;
+        let elapsed_nanos = now_nanos.saturating_sub(start_nanos);
+        let elapsed_secs = elapsed_nanos as f64 / 1_000_000_000.0;
         
         PipelineStats {
             keys_scanned: self.generator.total_generated(),

@@ -1124,6 +1124,7 @@ dependencies = [
  "libc",
  "memmap2",
  "metal",
+ "once_cell",
  "parking_lot",
  "rand",
  "rayon",

@@ -20,3 +20,11 @@ cargo run -- --gen --gpu --format raw
 │                                                                 │
 │   Zero Disk I/O  •  GLV 2x  •  O(1) Lookup                     │
 └─────────────────────────────────────────────────────────────────┘
+
+
+Desteklenen Tipler:
+
+Tip	Prefix	Encoding
+P2PKH	1...	Base58Check
+P2SH	3...	Base58Check
+P2WPKH	bc1q...	Bech32 (witness v0)

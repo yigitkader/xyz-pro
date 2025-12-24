@@ -672,19 +672,25 @@ ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
             ulong hi, lo;
             mul64(ai, bj, hi, lo);
             
-            ulong old = r[i + j];
-            r[i + j] += lo;
-            ulong c1 = (r[i + j] < old) ? 1 : 0;
+            // FIX: Use add_with_carry for all additions to prevent overflow bugs
+            // Previous bug: "hi + c1 + c" could overflow without proper carry tracking
+            // when both (hi + c1) and ((hi + c1) + c) overflow
             
-            old = r[i + j + 1];
-            r[i + j + 1] += hi + c1 + c;
-            c = (r[i + j + 1] < old) ? 1 : 0;
-            if (hi + c1 < hi) c++;
+            // r[i+j] += lo
+            ulong c1;
+            r[i + j] = add_with_carry(r[i + j], lo, 0, &c1);
+            
+            // r[i+j+1] += hi + c1 + c (three-way add, safely decomposed)
+            ulong c2, c3;
+            r[i + j + 1] = add_with_carry(r[i + j + 1], hi, c1, &c2);
+            r[i + j + 1] = add_with_carry(r[i + j + 1], c, 0, &c3);
+            c = c2 + c3;  // Combined carry (can be 0, 1, or 2)
         }
+        // Propagate remaining carry through higher words
         for (int k = i + 4; k < 8 && c; k++) {
-            ulong old = r[k];
-            r[k] += c;
-            c = (r[k] < old) ? 1 : 0;
+            ulong ck;
+            r[k] = add_with_carry(r[k], c, 0, &ck);
+            c = ck;
         }
     }
     
