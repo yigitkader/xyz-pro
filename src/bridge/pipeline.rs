@@ -20,6 +20,10 @@ pub struct PipelineConfig {
     pub parallel_matching: bool,
     /// Chunk size for parallel processing
     pub parallel_chunk_size: usize,
+    /// Maximum retries for generate_batch failures (0 = no retries)
+    pub max_retries: u32,
+    /// Initial retry delay in milliseconds (doubles on each retry)
+    pub retry_delay_ms: u64,
 }
 
 impl Default for PipelineConfig {
@@ -29,6 +33,9 @@ impl Default for PipelineConfig {
             parallel_matching: true,
             // 100K chunks minimize rayon overhead for high-throughput matching
             parallel_chunk_size: 100_000,
+            // Retry configuration for transient GPU errors
+            max_retries: 3,
+            retry_delay_ms: 10,
         }
     }
 }
@@ -108,8 +115,8 @@ where
         self.print_banner();
         
         while !self.generator.should_stop() {
-            // 1. Generate batch (zero-copy from GPU)
-            let batch_data = self.generator.generate_batch()?;
+            // 1. Generate batch (zero-copy from GPU) with retry logic
+            let batch_data = self.generate_with_retry()?;
             let batch = KeyBatch::new(batch_data);
             
             // 2. Match batch (parallel or sequential)
@@ -142,6 +149,31 @@ where
             matches_found: self.matches_found.load(Ordering::Relaxed),
             elapsed_secs: elapsed,
         })
+    }
+    
+    /// Generate batch with retry logic for transient GPU errors
+    /// Uses exponential backoff: delay_ms * 2^attempt
+    fn generate_with_retry(&self) -> Result<&[u8], String> {
+        let mut last_error = String::new();
+        let mut delay = Duration::from_millis(self.config.retry_delay_ms);
+        
+        for attempt in 0..=self.config.max_retries {
+            match self.generator.generate_batch() {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    last_error = e;
+                    if attempt < self.config.max_retries {
+                        eprintln!("⚠️ GPU error (attempt {}/{}): {}, retrying in {:?}...",
+                                  attempt + 1, self.config.max_retries + 1, last_error, delay);
+                        std::thread::sleep(delay);
+                        delay *= 2; // Exponential backoff
+                    }
+                }
+            }
+        }
+        
+        Err(format!("GPU failed after {} retries: {}", 
+                    self.config.max_retries + 1, last_error))
     }
     
     /// Match batch using parallel processing

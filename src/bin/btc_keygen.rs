@@ -124,6 +124,7 @@ fn run_scan_mode(args: &[String]) {
         report_interval_secs: 2,
         parallel_matching: true,
         parallel_chunk_size: 10_000,
+        ..Default::default()  // Use defaults for retry settings
     };
     
     let pipeline = Arc::new(IntegratedPipeline::with_config(

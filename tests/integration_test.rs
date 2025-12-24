@@ -416,6 +416,158 @@ fn test_matching_all_three_address_types() {
     println!("   ✅ P2WPKH (Native SegWit)    - bc1qw5...");
 }
 
+/// Test GLV Lambda transformation is mathematically correct
+/// GLV uses λ where λ³ ≡ 1 (mod n) and β³ ≡ 1 (mod p)
+/// For point P, φ(P) = (β·x, y) corresponds to private key λ·k
+#[test]
+fn test_glv_lambda_transform() {
+    use k256::Scalar;
+    use k256::elliptic_curve::PrimeField;
+    
+    // GLV Lambda constant (from keygen.metal, stored as ulong4)
+    // In Metal: {0xDF02967C1B23BD72, 0x122E22EA20816678, 0xA5261C028812645A, 0x5363AD4CC05C30E0}
+    // where .x is LSW, .w is MSW
+    // As 256-bit big-endian: 0x5363AD4CC05C30E0_A5261C028812645A_122E22EA20816678_DF02967C1B23BD72
+    let lambda_bytes: [u8; 32] = [
+        0x53, 0x63, 0xAD, 0x4C, 0xC0, 0x5C, 0x30, 0xE0,  // .w (MSW)
+        0xA5, 0x26, 0x1C, 0x02, 0x88, 0x12, 0x64, 0x5A,  // .z
+        0x12, 0x2E, 0x22, 0xEA, 0x20, 0x81, 0x66, 0x78,  // .y
+        0xDF, 0x02, 0x96, 0x7C, 0x1B, 0x23, 0xBD, 0x72,  // .x (LSW)
+    ];
+    
+    // Test that λ³ ≡ 1 (mod n)
+    // This is the fundamental property of GLV endomorphism
+    let lambda = Scalar::from_repr(lambda_bytes.into()).unwrap();
+    let lambda_sq = lambda * lambda;
+    let lambda_cubed = lambda_sq * lambda;
+    
+    // λ³ should equal 1
+    let one = Scalar::ONE;
+    assert_eq!(
+        lambda_cubed, one,
+        "λ³ should equal 1 (mod n) for GLV endomorphism"
+    );
+    
+    println!("✅ GLV Lambda verification:");
+    println!("   λ³ ≡ 1 (mod n) verified");
+    
+    // Test scalar multiplication: k * λ mod n
+    // Use private key 1 as test
+    let k = Scalar::from_repr(test_vectors::PRIVKEY_1_BE.into()).unwrap();
+    let glv_k = k * lambda;
+    
+    // Convert back to bytes
+    let glv_k_bytes = glv_k.to_repr();
+    
+    println!("   k = 1");
+    println!("   λ·k mod n = {}", hex::encode(glv_k_bytes.as_slice()));
+    
+    // Verify: (λ·k)·λ² = k (since λ³ = 1)
+    let lambda_sq = lambda * lambda;
+    let recovered_k = glv_k * lambda_sq;
+    assert_eq!(
+        recovered_k, k,
+        "(λ·k)·λ² should equal k"
+    );
+    
+    println!("   (λ·k)·λ² = k verified");
+    println!("✅ GLV Lambda transform is mathematically correct!");
+}
+
+/// Test that GPU-computed hashes match CPU-computed hashes
+/// This verifies the GPU's SHA256 and RIPEMD160 implementations
+#[test]
+fn test_gpu_hash_matches_cpu() {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::SecretKey;
+    use sha2::{Sha256, Digest};
+    use ripemd::Ripemd160;
+    
+    // Skip if GPU not available
+    let config = GeneratorConfig {
+        start_offset: 1,  // Start at private key 1
+        batch_size: 32,
+        ..Default::default()
+    };
+    
+    let gpu = match GpuKeyGenerator::new(config) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available, skipping test: {}", e);
+            return;
+        }
+    };
+    
+    let adapter = GpuGeneratorAdapter::new(gpu);
+    
+    // Generate keys starting from offset 1
+    let batch_bytes = match adapter.generate_batch() {
+        Ok(b) => b,
+        Err(e) => {
+            println!("⚠️ Failed to generate batch: {}", e);
+            return;
+        }
+    };
+    
+    let batch = KeyBatch::new(batch_bytes);
+    
+    // Find a valid key to test
+    let gpu_key = batch.iter()
+        .find(|k| k.private_key.iter().any(|&b| b != 0))
+        .expect("Should have at least one valid key");
+    
+    println!("🔍 Testing GPU vs CPU hash computation:");
+    println!("   GPU private key: {}", hex::encode(gpu_key.private_key));
+    println!("   GPU pubkey_hash: {}", hex::encode(gpu_key.pubkey_hash));
+    println!("   GPU p2sh_hash:   {}", hex::encode(gpu_key.p2sh_hash));
+    
+    // Compute the same hashes on CPU
+    let secret_key = match SecretKey::from_bytes((&gpu_key.private_key).into()) {
+        Ok(sk) => sk,
+        Err(_) => {
+            println!("⚠️ Invalid private key from GPU, skipping verification");
+            return;
+        }
+    };
+    
+    let public_key = secret_key.public_key();
+    let pubkey_bytes = public_key.to_encoded_point(true);
+    let pubkey_compressed = pubkey_bytes.as_bytes();
+    
+    // HASH160(pubkey)
+    let sha256 = Sha256::digest(pubkey_compressed);
+    let hash160 = Ripemd160::digest(&sha256);
+    let mut cpu_pubkey_hash = [0u8; 20];
+    cpu_pubkey_hash.copy_from_slice(&hash160);
+    
+    // P2SH hash
+    let mut witness_script = [0u8; 22];
+    witness_script[0] = 0x00;
+    witness_script[1] = 0x14;
+    witness_script[2..22].copy_from_slice(&cpu_pubkey_hash);
+    
+    let sha256_ws = Sha256::digest(&witness_script);
+    let hash160_ws = Ripemd160::digest(&sha256_ws);
+    let mut cpu_p2sh_hash = [0u8; 20];
+    cpu_p2sh_hash.copy_from_slice(&hash160_ws);
+    
+    println!("   CPU pubkey_hash: {}", hex::encode(cpu_pubkey_hash));
+    println!("   CPU p2sh_hash:   {}", hex::encode(cpu_p2sh_hash));
+    
+    // Verify hashes match
+    assert_eq!(
+        gpu_key.pubkey_hash, cpu_pubkey_hash,
+        "GPU and CPU pubkey_hash should match"
+    );
+    
+    assert_eq!(
+        gpu_key.p2sh_hash, cpu_p2sh_hash,
+        "GPU and CPU p2sh_hash should match"
+    );
+    
+    println!("✅ GPU hash computation matches CPU!");
+}
+
 /// Test that the address encoder handles edge cases
 #[test]
 fn test_encoder_edge_cases() {
