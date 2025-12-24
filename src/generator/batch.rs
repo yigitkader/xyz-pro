@@ -33,12 +33,15 @@ pub struct BatchProcessor {
 impl BatchProcessor {
     /// Create a new batch processor
     pub fn new(config: GeneratorConfig) -> Self {
-        // Configure thread pool
+        // Configure thread pool with explicit error handling
         if config.threads > 0 {
-            rayon::ThreadPoolBuilder::new()
+            if let Err(e) = rayon::ThreadPoolBuilder::new()
                 .num_threads(config.threads)
-                .build_global()
-                .ok();
+                .build_global() 
+            {
+                // Log warning but continue - rayon will use defaults
+                eprintln!("⚠️ Warning: Could not configure thread pool: {}. Using defaults.", e);
+            }
         }
         
         Self {
@@ -54,10 +57,12 @@ impl BatchProcessor {
     /// Create with specific seed for reproducibility
     pub fn with_seed(config: GeneratorConfig, seed: u64) -> Self {
         if config.threads > 0 {
-            rayon::ThreadPoolBuilder::new()
+            if let Err(e) = rayon::ThreadPoolBuilder::new()
                 .num_threads(config.threads)
-                .build_global()
-                .ok();
+                .build_global() 
+            {
+                eprintln!("⚠️ Warning: Could not configure thread pool: {}. Using defaults.", e);
+            }
         }
         
         Self {

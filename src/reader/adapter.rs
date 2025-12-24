@@ -61,27 +61,29 @@ impl Matcher for TargetMatcher {
         let mut matches = Vec::new();
         
         // P2PKH and P2WPKH use the same hash160 (pubkey_hash)
-        // We need to check which address types are in targets
-        // The TargetSet already separates P2PKH (1...) and P2WPKH (bc1q...) during loading
-        // So we check the hash once - if it matches, it could be either type
+        // Check if this hash exists in our target set
         let hash_match = self.targets.contains_hash160(pubkey_hash);
         
         if hash_match {
-            // Could be P2PKH (1...) or P2WPKH (bc1q...) - report both
-            // The target loading already tracks which types were loaded
+            // The hash matches - but we need to report the correct address type(s)
+            // that were actually loaded from targets.json
+            // If a P2PKH address was in targets, it would have been decoded to hash160
+            // If a P2WPKH address was in targets, it would have been decoded to hash160
+            // Both decode to the SAME hash for the same public key
+            
+            // Only report the types that actually exist in targets
             if self.targets.stats.p2pkh > 0 {
                 matches.push(MatchType::P2PKH);
             }
             if self.targets.stats.p2wpkh > 0 {
                 matches.push(MatchType::P2WPKH);
             }
-            // If neither was specifically loaded but hash matches, report P2PKH
-            if matches.is_empty() {
-                matches.push(MatchType::P2PKH);
-            }
+            // Note: We removed the fallback to P2PKH because:
+            // If hash_match is true but no P2PKH/P2WPKH targets exist,
+            // the match is spurious (shouldn't happen with correct loading)
         }
         
-        // Check P2SH (p2sh_hash is RIPEMD160(SHA256(witness_script)))
+        // Check P2SH separately (different hash: RIPEMD160(SHA256(witness_script)))
         if self.targets.contains_p2sh(p2sh_hash) {
             matches.push(MatchType::P2SH);
         }

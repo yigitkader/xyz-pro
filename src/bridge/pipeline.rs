@@ -27,7 +27,8 @@ impl Default for PipelineConfig {
         Self {
             report_interval_secs: 2,
             parallel_matching: true,
-            parallel_chunk_size: 10_000,
+            // 100K chunks minimize rayon overhead for high-throughput matching
+            parallel_chunk_size: 100_000,
         }
     }
 }

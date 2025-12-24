@@ -78,9 +78,9 @@ impl TargetSet {
                         stats.p2wpkh += 1;
                         match decode_bech32(&addr) {
                             Some(hash) => { hash160_set.insert(hash); }
-                            None => { 
-                                #[cfg(debug_assertions)]
-                                eprintln!("   ⚠️ Failed to decode bech32: {}", addr); 
+                            None => {
+                                // Log decode failures - important for debugging invalid target addresses
+                                eprintln!("   ⚠️ Failed to decode bech32 address (skipped): {}", addr); 
                             }
                         }
                     } else {

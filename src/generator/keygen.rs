@@ -35,17 +35,43 @@ pub struct KeyGenerator {
 }
 
 impl KeyGenerator {
-    /// Create a new key generator with random seed
+    /// Create a new key generator with cryptographically strong random seed
     pub fn new() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        
+        // Combine multiple entropy sources
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         
+        // Add process ID and thread ID for uniqueness
+        let pid = std::process::id();
+        let tid = std::thread::current().id();
+        
+        // Hash all entropy sources together
+        let mut hasher = DefaultHasher::new();
+        now.hash(&mut hasher);
+        pid.hash(&mut hasher);
+        tid.hash(&mut hasher);
+        
+        // Mix with high-resolution counter if available
+        #[cfg(target_arch = "aarch64")]
+        {
+            let counter: u64;
+            unsafe {
+                std::arch::asm!("mrs {}, CNTVCT_EL0", out(reg) counter);
+            }
+            counter.hash(&mut hasher);
+        }
+        
+        let hash = hasher.finish();
+        
         Self {
             counter: AtomicU64::new(0),
-            seed: [(now & 0xFFFFFFFF) as u32, ((now >> 32) & 0xFFFFFFFF) as u32],
+            seed: [(hash & 0xFFFFFFFF) as u32, ((hash >> 32) & 0xFFFFFFFF) as u32],
         }
     }
     

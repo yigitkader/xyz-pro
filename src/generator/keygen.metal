@@ -588,9 +588,10 @@ ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
         // This is equivalent to subtracting n from the view [lo, hi]
         // After each subtraction, the high part decreases
         
-        // Maximum iterations needed: since product < n^2, we need at most n iterations
-        // But in practice, for λ * k where λ and k are both < n, much fewer
-        for (int iter = 0; iter < 512 && has_high; iter++) {
+        // Maximum iterations needed: since product < n^2, theoretically up to ~256 iterations
+        // For λ * k where both are < n, the high part is at most 256 bits
+        // Using 1024 iterations for safety margin
+        for (int iter = 0; iter < 1024 && has_high; iter++) {
             // Subtract n from low part, borrow from high part
             ulong bw = 0;
             ulong4 new_lo;

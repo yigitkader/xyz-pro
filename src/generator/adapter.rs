@@ -8,7 +8,7 @@
 //! - First call: dispatch batch 0, wait, return
 //! - Subsequent: dispatch batch N+1, wait for batch N, return batch N
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bridge::KeyGenerator;
@@ -17,21 +17,33 @@ use super::GpuKeyGenerator;
 /// Adapter that wraps GpuKeyGenerator and implements KeyGenerator trait
 /// 
 /// # Thread Safety
-/// - Uses Mutex to protect buffer operations
+/// - Uses `UnsafeCell` with manual synchronization for zero-copy buffer access
 /// - `generate_batch` is designed for sequential use (process batch before next call)
+/// - The returned slice remains valid until the next `generate_batch` call
+/// 
+/// # Memory Safety
+/// The batch_buffer uses UnsafeCell + AtomicBool for lock-free single-producer access.
+/// This is safe because:
+/// 1. Only one thread can be generating at a time (enforced by pipeline design)
+/// 2. The buffer has a stable heap address (Box allocation)
+/// 3. Data is fully written before the slice is returned
 pub struct GpuGeneratorAdapter {
     inner: Arc<GpuKeyGenerator>,
-    /// Batch buffer with stable address (Box provides heap allocation)
-    batch_buffer: Mutex<Box<[u8]>>,
+    /// Batch buffer with stable heap address
+    /// UnsafeCell is used for zero-copy access (no MutexGuard lifetime issues)
+    batch_buffer: std::cell::UnsafeCell<Box<[u8]>>,
     /// Buffer size for quick access
     buffer_size: usize,
     /// Current buffer index for round-robin
     current_buf_idx: AtomicUsize,
     /// Whether pipeline has been primed
     pipeline_primed: AtomicBool,
+    /// Lock for buffer access (prevents concurrent modification)
+    buffer_lock: AtomicBool,
 }
 
-// Safety: All mutable state is protected by Mutex or atomics
+// Safety: UnsafeCell is protected by AtomicBool lock
+// Only one thread can access the buffer at a time
 unsafe impl Send for GpuGeneratorAdapter {}
 unsafe impl Sync for GpuGeneratorAdapter {}
 
@@ -44,11 +56,28 @@ impl GpuGeneratorAdapter {
         
         Self {
             inner: Arc::new(generator),
-            batch_buffer: Mutex::new(vec![0u8; buffer_size].into_boxed_slice()),
+            batch_buffer: std::cell::UnsafeCell::new(vec![0u8; buffer_size].into_boxed_slice()),
             buffer_size,
             current_buf_idx: AtomicUsize::new(0),
             pipeline_primed: AtomicBool::new(false),
+            buffer_lock: AtomicBool::new(false),
         }
+    }
+    
+    /// Acquire buffer lock (spin-lock for simplicity)
+    #[inline]
+    fn acquire_lock(&self) {
+        while self.buffer_lock.compare_exchange_weak(
+            false, true, Ordering::Acquire, Ordering::Relaxed
+        ).is_err() {
+            std::hint::spin_loop();
+        }
+    }
+    
+    /// Release buffer lock
+    #[inline]
+    fn release_lock(&self) {
+        self.buffer_lock.store(false, Ordering::Release);
     }
     
     /// Get inner generator (for direct access if needed)
@@ -78,9 +107,15 @@ impl KeyGenerator for GpuGeneratorAdapter {
     }
     
     fn generate_batch(&self) -> Result<&[u8], String> {
+        // Acquire lock to prevent concurrent buffer access
+        self.acquire_lock();
+        
         // Prime pipeline on first call
         if !self.pipeline_primed.load(Ordering::SeqCst) {
-            self.prime_pipeline()?;
+            if let Err(e) = self.prime_pipeline() {
+                self.release_lock();
+                return Err(e);
+            }
         }
         
         let depth = self.inner.pipeline_depth();
@@ -96,35 +131,38 @@ impl KeyGenerator for GpuGeneratorAdapter {
         cb.commit();
         cb.wait_until_completed();
         
-        // Dispatch next batch to this buffer (for next iteration)
-        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
-        self.inner.dispatch_glv(read_idx, next_offset)?;
-        
+        // IMPORTANT: Copy data BEFORE dispatching next batch to avoid race condition
         // Zero-copy access to GPU buffer via Unified Memory
         let output_ptr = bs.output_buffer.contents() as *const u8;
         
-        // Copy GPU data to our buffer
-        {
-            let mut buffer = self.batch_buffer.lock()
-                .map_err(|_| "Mutex poisoned")?;
-            
-            unsafe {
-                std::ptr::copy_nonoverlapping(output_ptr, buffer.as_mut_ptr(), self.buffer_size);
-            }
+        // Copy GPU data to our buffer FIRST
+        // SAFETY: UnsafeCell access is protected by our spinlock
+        let buffer = unsafe { &mut *self.batch_buffer.get() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(output_ptr, buffer.as_mut_ptr(), self.buffer_size);
+        }
+        
+        // NOW dispatch next batch (after copy is complete)
+        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
+        if let Err(e) = self.inner.dispatch_glv(read_idx, next_offset) {
+            self.release_lock();
+            return Err(e);
         }
         
         // Update stats
         self.inner.add_generated(self.batch_size() as u64);
         
+        // Release lock - buffer is now ready to read
+        self.release_lock();
+        
         // Return reference to batch_buffer
         // SAFETY: This is sound because:
-        // 1. The Box provides a stable heap address
-        // 2. The buffer won't be modified until this method is called again
+        // 1. The Box<[u8]> is heap-allocated with a stable address
+        // 2. The data was fully written before releasing the lock
         // 3. The pipeline is designed for sequential access (generate → process → generate)
-        let buffer = self.batch_buffer.lock()
-            .map_err(|_| "Mutex poisoned")?;
-        
+        // 4. The returned slice is valid until the next generate_batch call
         Ok(unsafe {
+            let buffer = &*self.batch_buffer.get();
             std::slice::from_raw_parts(buffer.as_ptr(), self.buffer_size)
         })
     }
