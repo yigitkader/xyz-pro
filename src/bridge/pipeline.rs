@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
+
 use rayon::prelude::*;
 
 use super::{KeyBatch, KeyGenerator, Match, MatchOutput, Matcher, RawKeyData};
@@ -82,6 +84,8 @@ where
     
     // Stats
     matches_found: AtomicU64,
+    /// Start time for elapsed calculation (set on first run)
+    start_time: Mutex<Option<Instant>>,
 }
 
 impl<G, M, O> IntegratedPipeline<G, M, O>
@@ -103,12 +107,23 @@ where
             output: Arc::new(output),
             config,
             matches_found: AtomicU64::new(0),
+            start_time: Mutex::new(None),
         }
     }
     
     /// Run the pipeline
     pub fn run(&self) -> Result<PipelineStats, String> {
-        let start_time = Instant::now();
+        let now = Instant::now();
+        
+        // Set start time if not already set (for stats())
+        {
+            let mut st = self.start_time.lock();
+            if st.is_none() {
+                *st = Some(now);
+            }
+        }
+        
+        let start_time = now;
         let mut last_report = Instant::now();
         let report_interval = Duration::from_secs(self.config.report_interval_secs);
         
@@ -251,10 +266,14 @@ where
     
     /// Get current stats
     pub fn stats(&self) -> PipelineStats {
+        let elapsed_secs = self.start_time.lock()
+            .map(|st| st.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        
         PipelineStats {
             keys_scanned: self.generator.total_generated(),
             matches_found: self.matches_found.load(Ordering::Relaxed),
-            elapsed_secs: 0.0, // Would need to track start time
+            elapsed_secs,
         }
     }
     

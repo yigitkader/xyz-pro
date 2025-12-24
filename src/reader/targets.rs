@@ -149,7 +149,8 @@ impl TargetSet {
         })
     }
     
-    /// Save current data to cache
+    /// Save current data to cache using atomic write (temp file + rename)
+    /// This prevents corruption if multiple processes write simultaneously
     fn save_cache(&self, source_path: &Path, cache_path: &Path) -> Result<(), String> {
         let source_meta = fs::metadata(source_path)
             .map_err(|e| format!("Failed to get source metadata: {}", e))?;
@@ -174,11 +175,23 @@ impl TargetSet {
         let encoded = bincode::serialize(&cached)
             .map_err(|e| format!("Serialization error: {}", e))?;
         
-        let mut file = File::create(cache_path)
-            .map_err(|e| format!("Failed to create cache file: {}", e))?;
+        // Atomic write: write to temp file, then rename
+        // This prevents corruption from concurrent writes
+        let temp_path = cache_path.with_extension("json.cache.tmp");
+        
+        let mut file = File::create(&temp_path)
+            .map_err(|e| format!("Failed to create temp cache file: {}", e))?;
         
         file.write_all(&encoded)
             .map_err(|e| format!("Failed to write cache: {}", e))?;
+        
+        // Ensure data is flushed to disk before rename
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync cache file: {}", e))?;
+        
+        // Atomic rename (on Unix, this is atomic)
+        fs::rename(&temp_path, cache_path)
+            .map_err(|e| format!("Failed to rename cache file: {}", e))?;
         
         let cache_size_mb = encoded.len() as f64 / (1024.0 * 1024.0);
         println!("💾 Cache saved: {} ({:.1} MB)", cache_path.display(), cache_size_mb);
