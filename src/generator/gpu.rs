@@ -997,7 +997,12 @@ impl ScanStats {
     }
 }
 
-/// Generate wNAF lookup table
+/// Generate wNAF lookup table with verification
+/// 
+/// Table structure:
+/// - 5 windows × 15 entries × 64 bytes = 4800 bytes total
+/// - Window i contains: (2^(4i) * G) * digit for digit in 1..=15
+/// - Entry format: [X: 32 bytes][Y: 32 bytes] (affine coordinates, big-endian)
 fn generate_wnaf_table() -> Vec<u8> {
     let mut table = vec![0u8; WNAF_TABLE_SIZE];
     
@@ -1020,7 +1025,110 @@ fn generate_wnaf_table() -> Vec<u8> {
         }
     }
     
+    // Verify table against known test vectors
+    verify_wnaf_table(&table).expect("wNAF table verification failed!");
+    
     table
+}
+
+/// Verify wNAF table against known secp256k1 test vectors
+/// 
+/// This catches bugs in:
+/// - Scalar multiplication
+/// - Point encoding
+/// - Table indexing
+fn verify_wnaf_table(table: &[u8]) -> Result<(), String> {
+    // Known test vectors for secp256k1
+    // 1*G (Generator point)
+    const G_X: [u8; 32] = [
+        0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC,
+        0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+        0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+        0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+    ];
+    const G_Y: [u8; 32] = [
+        0x48, 0x3A, 0xDA, 0x77, 0x26, 0xA3, 0xC4, 0x65,
+        0x5D, 0xA4, 0xFB, 0xFC, 0x0E, 0x11, 0x08, 0xA8,
+        0xFD, 0x17, 0xB4, 0x48, 0xA6, 0x85, 0x54, 0x19,
+        0x9C, 0x47, 0xD0, 0x8F, 0xFB, 0x10, 0xD4, 0xB8,
+    ];
+    
+    // 2*G
+    const G2_X: [u8; 32] = [
+        0xC6, 0x04, 0x7F, 0x94, 0x41, 0xED, 0x7D, 0x6D,
+        0x30, 0x45, 0x40, 0x6E, 0x95, 0xC0, 0x7C, 0xD8,
+        0x5C, 0x77, 0x8E, 0x4B, 0x8C, 0xEF, 0x3C, 0xA7,
+        0xAB, 0xAC, 0x09, 0xB9, 0x5C, 0x70, 0x9E, 0xE5,
+    ];
+    const G2_Y: [u8; 32] = [
+        0x1A, 0xE1, 0x68, 0xFE, 0xA6, 0x3D, 0xC3, 0x39,
+        0xA3, 0xC5, 0x8A, 0x94, 0x17, 0x0B, 0x99, 0x83,
+        0x61, 0x11, 0x7B, 0xE1, 0xCE, 0x7D, 0x02, 0xA6,
+        0xF5, 0xF3, 0x01, 0xB8, 0xB1, 0x19, 0x8A, 0x53,
+    ];
+    
+    // 3*G
+    const G3_X: [u8; 32] = [
+        0xF9, 0x30, 0x8A, 0x01, 0x92, 0x58, 0xC3, 0x10,
+        0x49, 0x34, 0x4F, 0x85, 0xF8, 0x9D, 0x52, 0x29,
+        0xB5, 0x31, 0xC8, 0x45, 0x83, 0x6F, 0x99, 0xB0,
+        0x86, 0x01, 0xF1, 0x13, 0xBC, 0xE0, 0x36, 0xF9,
+    ];
+    const G3_Y: [u8; 32] = [
+        0x38, 0x83, 0x14, 0x34, 0x4D, 0xD4, 0xB1, 0x4B,
+        0x19, 0xBC, 0xBE, 0x1A, 0xB5, 0xCC, 0xE4, 0xEB,
+        0xD7, 0x18, 0x4E, 0x37, 0x45, 0xD9, 0xB3, 0x92,
+        0xD1, 0xFE, 0xAB, 0xCE, 0x8F, 0x09, 0xB9, 0x72,
+    ];
+    
+    // Verify first 3 entries of window 0 (1*G, 2*G, 3*G)
+    let test_vectors = [
+        (0, &G_X, &G_Y, "1*G"),
+        (1, &G2_X, &G2_Y, "2*G"),
+        (2, &G3_X, &G3_Y, "3*G"),
+    ];
+    
+    for (idx, expected_x, expected_y, label) in test_vectors.iter() {
+        let offset = idx * 64;
+        let table_x = &table[offset..offset + 32];
+        let table_y = &table[offset + 32..offset + 64];
+        
+        if table_x != *expected_x {
+            return Err(format!(
+                "wNAF table entry {} X mismatch!\n  Expected: {}\n  Got:      {}",
+                label,
+                hex::encode(expected_x),
+                hex::encode(table_x)
+            ));
+        }
+        
+        if table_y != *expected_y {
+            return Err(format!(
+                "wNAF table entry {} Y mismatch!\n  Expected: {}\n  Got:      {}",
+                label,
+                hex::encode(expected_y),
+                hex::encode(table_y)
+            ));
+        }
+    }
+    
+    // Also verify window 1, entry 0 (16*G) to catch window calculation bugs
+    let g16 = ProjectivePoint::GENERATOR * Scalar::from(16u64);
+    let g16_affine = g16.to_affine();
+    let g16_encoded = g16_affine.to_encoded_point(false);
+    
+    let window1_offset = 15 * 64; // Window 1 starts after 15 entries
+    let table_g16_x = &table[window1_offset..window1_offset + 32];
+    let table_g16_y = &table[window1_offset + 32..window1_offset + 64];
+    
+    if table_g16_x != g16_encoded.x().unwrap().as_slice() {
+        return Err("wNAF table 16*G X mismatch (window indexing bug?)".to_string());
+    }
+    if table_g16_y != g16_encoded.y().unwrap().as_slice() {
+        return Err("wNAF table 16*G Y mismatch (window indexing bug?)".to_string());
+    }
+    
+    Ok(())
 }
 
 fn format_number(n: u64) -> String {

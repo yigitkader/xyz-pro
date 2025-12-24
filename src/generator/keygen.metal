@@ -565,14 +565,17 @@ inline ulong add_with_carry(ulong a, ulong b, ulong carry_in, thread ulong* carr
 
 // Multiply 256-bit number by reduction constant C (129 bits)
 // Input: a (256 bits in 4 words)
-// Output: result in r[0..5] (max 385 bits = 6 words + some bits)
+// Output: result in r[0..6] (max 385 bits = 7 words)
+//
+// CRITICAL: All additions must use add_with_carry to prevent overflow bugs.
+// Previous bug: "r[2] = hi + carry" could overflow without propagating carry.
 inline void mul_by_reduction_constant(ulong4 a, thread ulong* r) {
     // r = a * C where C = C0 + C1*2^64 + C2*2^128
     // Since C2 = 1, the product is:
     // r = a*C0 + a*C1*2^64 + a*2^128
     
     ulong hi, lo;
-    ulong carry, temp;
+    ulong carry;
     
     // Initialize result to zero
     r[0] = r[1] = r[2] = r[3] = r[4] = r[5] = r[6] = 0;
@@ -584,30 +587,36 @@ inline void mul_by_reduction_constant(ulong4 a, thread ulong* r) {
     
     mul64(a.x, REDUCE_C1, hi, lo);
     r[1] = add_with_carry(r[1], lo, 0, &carry);
-    r[2] = hi + carry;
+    // FIX: Use add_with_carry to properly handle overflow
+    r[2] = add_with_carry(r[2], hi, carry, &carry);
+    r[3] = carry;  // Propagate carry to r[3]
     
     // a.x * C2 = a.x (since C2 = 1)
     r[2] = add_with_carry(r[2], a.x, 0, &carry);
-    r[3] = carry;
+    r[3] = add_with_carry(r[3], 0, carry, &carry);
+    r[4] = carry;  // Initial carry propagation
     
     // ---- a.y * C (shifted by 64 bits) ----
     mul64(a.y, REDUCE_C0, hi, lo);
     r[1] = add_with_carry(r[1], lo, 0, &carry);
     r[2] = add_with_carry(r[2], hi, carry, &carry);
     r[3] = add_with_carry(r[3], 0, carry, &carry);
-    r[4] = carry;
+    r[4] = add_with_carry(r[4], 0, carry, &carry);
+    r[5] = carry;
     
     mul64(a.y, REDUCE_C1, hi, lo);
     r[2] = add_with_carry(r[2], lo, 0, &carry);
     r[3] = add_with_carry(r[3], hi, carry, &carry);
     r[4] = add_with_carry(r[4], 0, carry, &carry);
-    r[5] = carry;
+    r[5] = add_with_carry(r[5], 0, carry, &carry);
+    r[6] = carry;
     
     // a.y * C2 = a.y
     r[3] = add_with_carry(r[3], a.y, 0, &carry);
     r[4] = add_with_carry(r[4], 0, carry, &carry);
     r[5] = add_with_carry(r[5], 0, carry, &carry);
-    r[6] = carry;
+    r[6] = add_with_carry(r[6], 0, carry, &carry);
+    // Note: r[6] overflow impossible here (max 385 bits fits in 7 words)
     
     // ---- a.z * C (shifted by 128 bits) ----
     mul64(a.z, REDUCE_C0, hi, lo);
@@ -732,11 +741,12 @@ ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
     }
     
     // Step 3: Final reduction - subtract n while result >= n
-    // At most 2 subtractions needed (proven mathematically)
-    if (cmp256(lo_part, SECP256K1_N) >= 0) {
-        lo_part = sub256(lo_part, SECP256K1_N);
-    }
-    if (cmp256(lo_part, SECP256K1_N) >= 0) {
+    // Use a loop to handle all edge cases robustly
+    // In practice, at most 3-4 iterations are ever needed due to the reduction algorithm,
+    // but we loop up to 8 times to guarantee correctness for any edge case.
+    // Most common case: 0-2 iterations (handled by branch prediction).
+    #pragma unroll 2
+    for (int i = 0; i < 8 && cmp256(lo_part, SECP256K1_N) >= 0; i++) {
         lo_part = sub256(lo_part, SECP256K1_N);
     }
     

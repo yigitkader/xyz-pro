@@ -6,6 +6,16 @@
 //! - Direct GPU→Disk pipeline (Raw format)
 //! - Async writer thread (GPU never waits)
 //! - Pre-allocated files (no fragmentation)
+//!
+//! ## File Format Versioning
+//! 
+//! All binary formats use a versioned header for forward compatibility:
+//! - magic:    4 bytes (format identifier)
+//! - version:  1 byte  (format version, currently 1)
+//! - reserved: 3 bytes (must be 0, for future use)
+//! - count:    8 bytes (little-endian u64, number of entries)
+//! 
+//! Total header: 16 bytes
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -15,6 +25,11 @@ use std::thread::{self, JoinHandle};
 use serde::{Deserialize, Serialize};
 
 use super::{KeyEntry, KeyOutput};
+
+/// Current format version (increment when format changes)
+const FORMAT_VERSION: u8 = 1;
+/// Header size: magic(4) + version(1) + reserved(3) + count(8) = 16 bytes
+const HEADER_SIZE: usize = 16;
 
 /// Output format options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,16 +106,20 @@ impl OutputWriter {
     
     /// NASA-grade: Write raw GPU buffer directly to disk via mmap
     /// Zero CPU processing, zero-copy I/O
-    /// Format: [magic: 4][count: 8][raw_entries: 72 * count]
-    /// Entry: [privkey: 32][pubkey_hash: 20][p2sh_hash: 20]
+    /// 
+    /// Format v1 (16-byte header):
+    /// - magic:    4 bytes ("BTCR")
+    /// - version:  1 byte  (current: 1)
+    /// - reserved: 3 bytes (0x00, for future use)
+    /// - count:    8 bytes (little-endian u64)
+    /// - entries:  72 bytes each (privkey:32 + pubkey_hash:20 + p2sh_hash:20)
     pub fn write_raw_batch(&mut self, raw_data: &[u8], key_count: usize) -> std::io::Result<String> {
         self.file_counter += 1;
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let filename = format!("{}/keys_{}_{:06}.raw", self.output_dir, timestamp, self.file_counter);
         
         // Pre-allocate file to exact size (avoids fragmentation)
-        let header_size = 12; // magic(4) + count(8)
-        let total_size = header_size + raw_data.len();
+        let total_size = HEADER_SIZE + raw_data.len();
         
         let file = OpenOptions::new()
             .read(true)
@@ -117,12 +136,14 @@ impl OutputWriter {
             memmap2::MmapMut::map_mut(&file)?
         };
         
-        // Write header
-        mmap[0..4].copy_from_slice(b"BTCR"); // Raw magic
-        mmap[4..12].copy_from_slice(&(key_count as u64).to_le_bytes());
+        // Write versioned header (16 bytes)
+        mmap[0..4].copy_from_slice(b"BTCR");              // magic
+        mmap[4] = FORMAT_VERSION;                         // version
+        mmap[5..8].copy_from_slice(&[0u8; 3]);           // reserved (must be 0)
+        mmap[8..16].copy_from_slice(&(key_count as u64).to_le_bytes()); // count
         
         // Direct memcpy from GPU buffer to mmap (zero-copy on unified memory!)
-        mmap[12..].copy_from_slice(raw_data);
+        mmap[HEADER_SIZE..].copy_from_slice(raw_data);
         
         // Async flush (non-blocking)
         mmap.flush_async()?;
@@ -183,16 +204,18 @@ impl OutputWriter {
     }
     
     /// ULTRA-COMPACT binary format (52 bytes per key)
-    /// Format: [magic: 4][count: 8][entries: 52 * count]
+    /// Format v1: [magic: 4][version: 1][reserved: 3][count: 8][entries: 52 * count]
     /// Entry: [privkey: 32][pubkey_hash: 20]
     fn write_compact(&self, keys: &[KeyEntry], base_name: &str) -> std::io::Result<String> {
         let filename = format!("{}/{}.cbin", self.output_dir, base_name);
         let file = File::create(&filename)?;
         let mut writer = BufWriter::with_capacity(64 * 1024 * 1024, file);
         
-        // Magic + count
-        writer.write_all(b"BTCC")?; // Compact magic
-        writer.write_all(&(keys.len() as u64).to_le_bytes())?;
+        // Versioned header (16 bytes)
+        writer.write_all(b"BTCC")?;                              // magic
+        writer.write_all(&[FORMAT_VERSION])?;                    // version
+        writer.write_all(&[0u8; 3])?;                           // reserved
+        writer.write_all(&(keys.len() as u64).to_le_bytes())?;  // count
         
         // Pre-allocate decode buffer
         let mut pk_bytes = [0u8; 32];
@@ -223,16 +246,18 @@ impl OutputWriter {
     }
     
     /// Write keys as binary format with addresses
-    /// Format: [magic: 4][count: 8][entries...]
+    /// Format v1: [magic: 4][version: 1][reserved: 3][count: 8][entries...]
     /// Entry: [private_key: 32 bytes][p2pkh: len+data][p2sh: len+data][p2wpkh: len+data]
     fn write_binary(&self, keys: &[KeyEntry], base_name: &str) -> std::io::Result<String> {
         let filename = format!("{}/{}.bin", self.output_dir, base_name);
         let file = File::create(&filename)?;
         let mut writer = BufWriter::with_capacity(128 * 1024 * 1024, file); // 128MB buffer
         
-        // Write header: magic + count
-        writer.write_all(b"BTCK")?;
-        writer.write_all(&(keys.len() as u64).to_le_bytes())?;
+        // Versioned header (16 bytes)
+        writer.write_all(b"BTCK")?;                              // magic
+        writer.write_all(&[FORMAT_VERSION])?;                    // version
+        writer.write_all(&[0u8; 3])?;                           // reserved
+        writer.write_all(&(keys.len() as u64).to_le_bytes())?;  // count
         
         // Pre-allocate decode buffer
         let mut pk_bytes = [0u8; 32];
@@ -374,10 +399,9 @@ impl AsyncRawWriter {
         file_counter
     }
     
-    /// Memory-mapped write
+    /// Memory-mapped write with versioned header
     fn write_raw_mmap(filename: &str, data: &[u8], key_count: usize) -> std::io::Result<()> {
-        let header_size = 12;
-        let total_size = header_size + data.len();
+        let total_size = HEADER_SIZE + data.len();
         
         let file = OpenOptions::new()
             .read(true)
@@ -390,9 +414,12 @@ impl AsyncRawWriter {
         
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
         
-        mmap[0..4].copy_from_slice(b"BTCR");
-        mmap[4..12].copy_from_slice(&(key_count as u64).to_le_bytes());
-        mmap[12..].copy_from_slice(data);
+        // Versioned header (16 bytes)
+        mmap[0..4].copy_from_slice(b"BTCR");              // magic
+        mmap[4] = FORMAT_VERSION;                         // version
+        mmap[5..8].copy_from_slice(&[0u8; 3]);           // reserved
+        mmap[8..16].copy_from_slice(&(key_count as u64).to_le_bytes()); // count
+        mmap[HEADER_SIZE..].copy_from_slice(data);
         
         // Sync write for durability
         mmap.flush()?;
@@ -402,6 +429,7 @@ impl AsyncRawWriter {
 }
 
 /// Read binary file back (for verification)
+/// Supports both legacy (v0) and versioned (v1+) formats
 #[allow(dead_code)]
 pub fn read_binary_file(path: &Path) -> std::io::Result<Vec<KeyEntry>> {
     use std::io::{BufReader, Read};
@@ -419,10 +447,35 @@ pub fn read_binary_file(path: &Path) -> std::io::Result<Vec<KeyEntry>> {
         ));
     }
     
-    // Read count
-    let mut count_bytes = [0u8; 8];
-    reader.read_exact(&mut count_bytes)?;
-    let count = u64::from_le_bytes(count_bytes);
+    // Read version byte to determine format
+    let mut version_byte = [0u8; 1];
+    reader.read_exact(&mut version_byte)?;
+    let version = version_byte[0];
+    
+    let count = if version == 0 {
+        // Legacy format: version byte is actually first byte of count
+        // Re-read as part of count (we already read 1 byte)
+        let mut remaining_count = [0u8; 7];
+        reader.read_exact(&mut remaining_count)?;
+        
+        let mut count_bytes = [0u8; 8];
+        count_bytes[0] = version;
+        count_bytes[1..8].copy_from_slice(&remaining_count);
+        u64::from_le_bytes(count_bytes)
+    } else if version <= FORMAT_VERSION {
+        // Versioned format: skip reserved bytes, then read count
+        let mut reserved = [0u8; 3];
+        reader.read_exact(&mut reserved)?;
+        
+        let mut count_bytes = [0u8; 8];
+        reader.read_exact(&mut count_bytes)?;
+        u64::from_le_bytes(count_bytes)
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Unsupported file version {} (max: {})", version, FORMAT_VERSION),
+        ));
+    };
     
     let mut entries = Vec::with_capacity(count as usize);
     

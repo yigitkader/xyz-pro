@@ -17,8 +17,16 @@ use rayon::prelude::*;
 use super::{TargetSet, AddressEncoder};
 
 /// RAW file format constants (must match generator)
+/// 
+/// Header format v1:
+/// - magic:    4 bytes ("BTCR")
+/// - version:  1 byte  (current: 1)
+/// - reserved: 3 bytes (for future use, must be 0)
+/// - count:    8 bytes (little-endian u64)
+/// Total header: 16 bytes
 const MAGIC: &[u8; 4] = b"BTCR";
-const HEADER_SIZE: usize = 12; // magic(4) + count(8)
+const FORMAT_VERSION: u8 = 1;
+const HEADER_SIZE: usize = 16; // magic(4) + version(1) + reserved(3) + count(8)
 const ENTRY_SIZE: usize = 72; // privkey(32) + hash160(20) + p2sh_hash(20)
 
 /// Address type enum - avoids String allocation
@@ -168,11 +176,38 @@ impl RawFileScanner {
             return Err("File too small".to_string());
         }
         
+        // Check magic bytes
         if &mmap[0..4] != MAGIC {
             return Err("Invalid magic bytes".to_string());
         }
         
-        let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
+        // Check version (offset 4, 1 byte)
+        let version = mmap[4];
+        if version == 0 {
+            // Legacy format (v0): magic(4) + count(8) = 12 bytes
+            // For backward compatibility with old files
+            let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
+            let expected_size = 12 + (count as usize * ENTRY_SIZE);
+            if mmap.len() >= expected_size {
+                // This looks like a legacy file, process it
+                return self.scan_file_legacy(path, &mmap, count);
+            }
+        }
+        
+        if version > FORMAT_VERSION {
+            return Err(format!(
+                "Unsupported file version {} (max supported: {}). Please update the software.",
+                version, FORMAT_VERSION
+            ));
+        }
+        
+        // Check reserved bytes are zero (offset 5-7)
+        if mmap[5] != 0 || mmap[6] != 0 || mmap[7] != 0 {
+            return Err("Invalid header: reserved bytes must be zero".to_string());
+        }
+        
+        // Read count (offset 8-15, 8 bytes)
+        let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
         let expected_size = HEADER_SIZE + (count as usize * ENTRY_SIZE);
         
         if mmap.len() < expected_size {
@@ -280,6 +315,108 @@ impl RawFileScanner {
         if !matches.is_empty() {
             println!("🎯 Found {} matches in {}", matches.len(), filename_arc);
         }
+        
+        Ok((count, matches))
+    }
+    
+    /// Scan a legacy format file (v0, without version field)
+    /// Legacy header: magic(4) + count(8) = 12 bytes
+    fn scan_file_legacy(&self, path: &Path, mmap: &memmap2::Mmap, count: u64) -> Result<(u64, Vec<Match>), String> {
+        const LEGACY_HEADER_SIZE: usize = 12;
+        let expected_size = LEGACY_HEADER_SIZE + (count as usize * ENTRY_SIZE);
+        
+        if mmap.len() < expected_size {
+            return Err(format!("Legacy file truncated: expected {}, got {}", expected_size, mmap.len()));
+        }
+        
+        eprintln!("⚠️  Reading legacy format file (no version). Consider re-generating.");
+        
+        let filename = path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let filename_arc = std::sync::Arc::new(filename);
+        
+        // Process with legacy header offset
+        let data = &mmap[LEGACY_HEADER_SIZE..];
+        let chunk_size = 10_000;
+        let num_chunks = (count as usize + chunk_size - 1) / chunk_size;
+        
+        let matches: Vec<Match> = (0..num_chunks)
+            .into_par_iter()
+            .flat_map(|chunk_idx| {
+                // Convert Arc<String> to String once per chunk
+                let chunk_filename = filename_arc.to_string();
+                let start_key = chunk_idx * chunk_size;
+                let end_key = std::cmp::min(start_key + chunk_size, count as usize);
+                let mut chunk_matches = Vec::new();
+                
+                for key_idx in start_key..end_key {
+                    let offset = key_idx * ENTRY_SIZE;
+                    let entry = &data[offset..offset + ENTRY_SIZE];
+                    
+                    let privkey: [u8; 32] = entry[0..32].try_into().unwrap();
+                    let pubkey_hash: [u8; 20] = entry[32..52].try_into().unwrap();
+                    let p2sh_hash: [u8; 20] = entry[52..72].try_into().unwrap();
+                    
+                    if privkey.iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    
+                    let (p2pkh_match, p2sh_match, p2wpkh_match) = 
+                        self.targets.check_raw(&pubkey_hash, &p2sh_hash);
+                    
+                    if p2pkh_match || p2sh_match || p2wpkh_match {
+                        let mut privkey_hex = hex::encode(privkey);
+                        
+                        thread_local! {
+                            static ENCODER: std::cell::RefCell<AddressEncoder> = 
+                                std::cell::RefCell::new(AddressEncoder::new());
+                        }
+                        
+                        let match_count = p2pkh_match as u8 + p2sh_match as u8 + p2wpkh_match as u8;
+                        let mut matches_remaining = match_count;
+                        
+                        if p2pkh_match {
+                            matches_remaining -= 1;
+                            let privkey = if matches_remaining > 0 { privkey_hex.clone() } else { std::mem::take(&mut privkey_hex) };
+                            chunk_matches.push(Match {
+                                private_key: privkey,
+                                address: ENCODER.with(|enc| enc.borrow_mut().encode_p2pkh(&pubkey_hash)),
+                                address_type: AddressType::P2PKH,
+                                file: chunk_filename.clone(),
+                                offset: key_idx as u64,
+                            });
+                        }
+                        
+                        if p2sh_match {
+                            matches_remaining -= 1;
+                            let privkey = if matches_remaining > 0 { privkey_hex.clone() } else { std::mem::take(&mut privkey_hex) };
+                            chunk_matches.push(Match {
+                                private_key: privkey,
+                                address: ENCODER.with(|enc| enc.borrow_mut().encode_p2sh(&p2sh_hash)),
+                                address_type: AddressType::P2SH,
+                                file: chunk_filename.clone(),
+                                offset: key_idx as u64,
+                            });
+                        }
+                        
+                        if p2wpkh_match {
+                            let privkey = std::mem::take(&mut privkey_hex);
+                            chunk_matches.push(Match {
+                                private_key: privkey,
+                                address: ENCODER.with(|enc| enc.borrow_mut().encode_p2wpkh(&pubkey_hash)),
+                                address_type: AddressType::P2WPKH,
+                                file: chunk_filename.clone(),
+                                offset: key_idx as u64,
+                            });
+                        }
+                    }
+                }
+                
+                chunk_matches
+            })
+            .collect();
         
         Ok((count, matches))
     }

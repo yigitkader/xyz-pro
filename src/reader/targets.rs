@@ -349,12 +349,23 @@ fn decode_p2sh(addr: &str) -> Option<[u8; 20]> {
 }
 
 /// Decode bech32 address to hash
+/// 
+/// Bitcoin address encoding rules:
+/// - Witness version 0 (P2WPKH/P2WSH): MUST use Bech32 encoding
+/// - Witness version 1+ (Taproot/P2TR): MUST use Bech32m encoding
+/// 
+/// This function only handles P2WPKH (witness version 0), so we 
+/// explicitly require Bech32 variant and reject Bech32m.
 fn decode_bech32(addr: &str) -> Option<[u8; 20]> {
-    use bech32::FromBase32;
+    use bech32::{FromBase32, Variant};
     
-    // Decode bech32/bech32m address
-    let decoded = bech32::decode(addr).ok()?;
-    let data_5bit = decoded.1;
+    // Decode bech32/bech32m address - returns (hrp, data, variant)
+    let (hrp, data_5bit, variant) = bech32::decode(addr).ok()?;
+    
+    // Validate HRP for mainnet Bitcoin
+    if hrp != "bc" {
+        return None;
+    }
     
     if data_5bit.is_empty() {
         return None;
@@ -363,8 +374,13 @@ fn decode_bech32(addr: &str) -> Option<[u8; 20]> {
     // First 5-bit value is witness version (0 for P2WPKH)
     // The rest is the witness program in 5-bit encoding
     let witness_version = data_5bit[0].to_u8();
-    if witness_version != 0 {
-        // Only handle witness version 0 (P2WPKH/P2WSH)
+    
+    // Validate variant matches witness version per BIP-350:
+    // - Witness version 0: MUST use Bech32 (not Bech32m)
+    // - Witness version 1+: MUST use Bech32m (not Bech32)
+    // We only handle witness version 0 (P2WPKH/P2WSH)
+    if witness_version != 0 || variant != Variant::Bech32 {
+        // Either wrong witness version or wrong encoding variant
         return None;
     }
     

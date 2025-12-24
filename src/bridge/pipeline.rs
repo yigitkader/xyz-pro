@@ -84,8 +84,8 @@ where
     
     // Stats
     matches_found: AtomicU64,
-    /// Start time for elapsed calculation (set on first run)
-    start_time: Mutex<Option<Instant>>,
+    /// Start time for elapsed calculation (reset on each run)
+    start_time: Mutex<Instant>,
 }
 
 impl<G, M, O> IntegratedPipeline<G, M, O>
@@ -107,21 +107,20 @@ where
             output: Arc::new(output),
             config,
             matches_found: AtomicU64::new(0),
-            start_time: Mutex::new(None),
+            start_time: Mutex::new(Instant::now()),
         }
     }
     
     /// Run the pipeline
+    /// 
+    /// Note: Can be called multiple times. Each call resets stats tracking.
     pub fn run(&self) -> Result<PipelineStats, String> {
         let now = Instant::now();
         
-        // Set start time if not already set (for stats())
-        {
-            let mut st = self.start_time.lock();
-            if st.is_none() {
-                *st = Some(now);
-            }
-        }
+        // Reset start time for this run (allows multiple run() calls)
+        *self.start_time.lock() = now;
+        // Reset match counter for this run
+        self.matches_found.store(0, Ordering::SeqCst);
         
         let start_time = now;
         let mut last_report = Instant::now();
@@ -168,6 +167,12 @@ where
     
     /// Generate batch with retry logic for transient GPU errors
     /// Uses exponential backoff: delay_ms * 2^attempt
+    /// 
+    /// Fatal errors are NOT retried - they indicate unrecoverable conditions:
+    /// - GPU device lost / hung
+    /// - Out of memory
+    /// - Shader compilation failure
+    /// - Buffer corruption
     fn generate_with_retry(&self) -> Result<&[u8], String> {
         let mut last_error = String::new();
         let mut delay = Duration::from_millis(self.config.retry_delay_ms);
@@ -176,6 +181,12 @@ where
             match self.generator.generate_batch() {
                 Ok(data) => return Ok(data),
                 Err(e) => {
+                    // Check if error is fatal (non-recoverable)
+                    if Self::is_fatal_error(&e) {
+                        eprintln!("❌ FATAL GPU error (not retrying): {}", e);
+                        return Err(format!("Fatal GPU error: {}", e));
+                    }
+                    
                     last_error = e;
                     if attempt < self.config.max_retries {
                         eprintln!("⚠️ GPU error (attempt {}/{}): {}, retrying in {:?}...",
@@ -189,6 +200,51 @@ where
         
         Err(format!("GPU failed after {} retries: {}", 
                     self.config.max_retries + 1, last_error))
+    }
+    
+    /// Check if an error is fatal (non-recoverable)
+    /// 
+    /// Fatal errors indicate hardware/driver issues that won't resolve with retries:
+    /// - Device lost: GPU crashed or was reset
+    /// - Out of memory: System memory exhausted
+    /// - Compilation failed: Shader is broken
+    /// - Invalid buffer: Memory corruption detected
+    /// - Command encoder: Metal command buffer creation failed
+    #[inline]
+    fn is_fatal_error(error: &str) -> bool {
+        const FATAL_PATTERNS: &[&str] = &[
+            // Metal device errors
+            "device lost",
+            "device removed", 
+            "gpu hang",
+            "gpu reset",
+            // Memory errors
+            "out of memory",
+            "memory allocation failed",
+            "buffer too large",
+            "storage allocation failed",
+            // Shader/compilation errors
+            "compilation failed",
+            "shader error",
+            "function not found",
+            "library error",
+            // Buffer/data corruption
+            "invalid buffer",
+            "buffer overrun",
+            "corruption detected",
+            "null pointer",
+            // Command buffer errors
+            "command encoder",
+            "command buffer",
+            "execution aborted",
+            // Generic fatal indicators
+            "fatal",
+            "unrecoverable",
+            "panic",
+        ];
+        
+        let error_lower = error.to_lowercase();
+        FATAL_PATTERNS.iter().any(|pattern| error_lower.contains(pattern))
     }
     
     /// Match batch using parallel processing
@@ -264,11 +320,9 @@ where
         );
     }
     
-    /// Get current stats
+    /// Get current stats (can be called during a run from another thread)
     pub fn stats(&self) -> PipelineStats {
-        let elapsed_secs = self.start_time.lock()
-            .map(|st| st.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let elapsed_secs = self.start_time.lock().elapsed().as_secs_f64();
         
         PipelineStats {
             keys_scanned: self.generator.total_generated(),
