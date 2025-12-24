@@ -272,8 +272,12 @@ where
                 
                 for i in 0..key_count {
                     let offset = i * RawKeyData::SIZE;
-                    // SAFETY: We know the chunk is aligned to RawKeyData::SIZE
-                    let key = unsafe { RawKeyData::from_bytes_unchecked(&chunk[offset..]) };
+                    let end = offset + RawKeyData::SIZE;
+                    
+                    // SAFETY: offset..end is within bounds because:
+                    // - i < key_count = chunk.len() / SIZE
+                    // - end = (i+1) * SIZE <= key_count * SIZE <= chunk.len()
+                    let key = unsafe { RawKeyData::from_bytes_unchecked(&chunk[offset..end]) };
                     
                     if !key.is_valid() {
                         continue;

@@ -46,10 +46,29 @@ impl RawKeyData {
     /// Create from raw bytes with bounds check elided (caller guarantees size)
     /// 
     /// # Safety
-    /// Caller must ensure `data.len() >= SIZE`
+    /// Caller must ensure `data.len() >= SIZE` (72 bytes).
+    /// Violating this precondition is undefined behavior.
+    /// 
+    /// # Optimization
+    /// The bounds check is elided in release builds via `unreachable_unchecked`,
+    /// allowing the optimizer to remove redundant checks when the caller
+    /// already validated the buffer size.
     #[inline(always)]
     pub unsafe fn from_bytes_unchecked(data: &[u8]) -> Self {
-        debug_assert!(data.len() >= Self::SIZE);
+        debug_assert!(
+            data.len() >= Self::SIZE,
+            "from_bytes_unchecked: buffer too small ({} < {})",
+            data.len(),
+            Self::SIZE
+        );
+        
+        // SAFETY: Caller guarantees data.len() >= SIZE.
+        // This hint allows the optimizer to elide bounds checks in release builds
+        // when the caller has already validated the buffer size.
+        if data.len() < Self::SIZE {
+            std::hint::unreachable_unchecked();
+        }
+        
         std::ptr::read_unaligned(data.as_ptr() as *const Self)
     }
     
