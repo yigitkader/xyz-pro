@@ -1,18 +1,24 @@
 //! Target address loader and matcher
 //!
-//! Loads targets.json and provides fast O(1) lookup using HashSet.
+//! Loads targets.json and provides fast O(1) lookup using HashSet with FxHash.
 //! Supports all address types: P2PKH, P2SH, P2WPKH, P2WSH
 //!
+//! **Performance**: Uses FxHash instead of SipHash for ~3x faster hash lookups.
 //! **Cache Support**: Parses JSON once, saves binary cache for fast reload.
 //! Cache is invalidated when source file changes (size or mtime).
 
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::hash::BuildHasherDefault;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use fxhash::FxHasher;
 use serde::{Serialize, Deserialize};
+
+/// Fast HashSet using FxHash - 3x faster than default SipHash for fixed-size keys
+type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// Cache file format version (increment when format changes)
 const CACHE_VERSION: u32 = 1;
@@ -45,14 +51,16 @@ struct CachedTargets {
     stats: TargetStats,
 }
 
-/// Fast target lookup using HashSet
+/// Fast target lookup using FxHashSet (~3x faster than default)
 pub struct TargetSet {
     /// All addresses as strings for direct lookup
     addresses: HashSet<String>,
     /// Hash160 lookups for P2PKH/P2WPKH (decoded from address)
-    hash160_set: HashSet<[u8; 20]>,
+    /// Uses FxHash for faster lookup on fixed-size keys
+    hash160_set: FxHashSet<[u8; 20]>,
     /// P2SH script hashes
-    p2sh_set: HashSet<[u8; 20]>,
+    /// Uses FxHash for faster lookup on fixed-size keys
+    p2sh_set: FxHashSet<[u8; 20]>,
     /// Stats
     pub stats: TargetStats,
 }
@@ -115,9 +123,9 @@ impl TargetSet {
             return None;
         }
         
-        // Cache is valid - rebuild HashSets from lists
-        let hash160_set: HashSet<[u8; 20]> = cached.hash160_list.into_iter().collect();
-        let p2sh_set: HashSet<[u8; 20]> = cached.p2sh_list.into_iter().collect();
+        // Cache is valid - rebuild FxHashSets from lists
+        let hash160_set: FxHashSet<[u8; 20]> = cached.hash160_list.into_iter().collect();
+        let p2sh_set: FxHashSet<[u8; 20]> = cached.p2sh_list.into_iter().collect();
         
         let load_time = start.elapsed().as_millis() as u64;
         
@@ -187,8 +195,8 @@ impl TargetSet {
         let reader = BufReader::with_capacity(64 * 1024 * 1024, file); // 64MB buffer
         
         let mut addresses = HashSet::new();
-        let mut hash160_set = HashSet::new();
-        let mut p2sh_set = HashSet::new();
+        let mut hash160_set: FxHashSet<[u8; 20]> = FxHashSet::default();
+        let mut p2sh_set: FxHashSet<[u8; 20]> = FxHashSet::default();
         let mut stats = TargetStats::default();
         
         println!("📂 Parsing targets from JSON (first run, will cache)...");

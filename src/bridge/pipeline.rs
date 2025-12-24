@@ -145,26 +145,31 @@ where
     }
     
     /// Match batch using parallel processing
+    /// 
+    /// Uses SIMD-friendly patterns and minimizes allocations
     fn match_batch_parallel(&self, batch: &KeyBatch) -> Vec<Match> {
         let chunk_size = self.config.parallel_chunk_size;
         let data = batch.as_bytes();
         
         data.par_chunks(chunk_size * RawKeyData::SIZE)
             .flat_map(|chunk| {
-                let mut matches = Vec::new();
+                // Pre-allocate with estimated capacity (matches are rare)
+                let mut matches = Vec::with_capacity(8);
+                let key_count = chunk.len() / RawKeyData::SIZE;
                 
-                for i in 0..(chunk.len() / RawKeyData::SIZE) {
+                for i in 0..key_count {
                     let offset = i * RawKeyData::SIZE;
-                    if let Some(key) = RawKeyData::from_bytes(&chunk[offset..]) {
-                        if !key.is_valid() {
-                            continue;
-                        }
-                        
-                        let match_types = self.matcher.check_key(&key.pubkey_hash, &key.p2sh_hash);
-                        
-                        for mt in match_types {
-                            matches.push(Match::new(key, mt));
-                        }
+                    // SAFETY: We know the chunk is aligned to RawKeyData::SIZE
+                    let key = unsafe { RawKeyData::from_bytes_unchecked(&chunk[offset..]) };
+                    
+                    if !key.is_valid() {
+                        continue;
+                    }
+                    
+                    let match_types = self.matcher.check_key(&key.pubkey_hash, &key.p2sh_hash);
+                    
+                    for mt in match_types {
+                        matches.push(Match::new(key, mt));
                     }
                 }
                 

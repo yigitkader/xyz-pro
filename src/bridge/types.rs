@@ -20,32 +20,48 @@ impl RawKeyData {
     /// Size of RawKeyData in bytes
     pub const SIZE: usize = 72;
     
-    /// Create from raw bytes
-    #[inline]
+    /// Create from raw bytes - zero-copy where possible
+    /// 
+    /// # Safety
+    /// Uses unaligned read since data from GPU buffer may not be aligned.
+    /// This is safe because RawKeyData is #[repr(C, packed)].
+    #[inline(always)]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < Self::SIZE {
             return None;
         }
         
-        let mut private_key = [0u8; 32];
-        let mut pubkey_hash = [0u8; 20];
-        let mut p2sh_hash = [0u8; 20];
-        
-        private_key.copy_from_slice(&data[0..32]);
-        pubkey_hash.copy_from_slice(&data[32..52]);
-        p2sh_hash.copy_from_slice(&data[52..72]);
-        
-        Some(Self {
-            private_key,
-            pubkey_hash,
-            p2sh_hash,
+        // SAFETY: RawKeyData is #[repr(C, packed)] so it can be read from any alignment.
+        // The data pointer points to at least SIZE bytes (checked above).
+        Some(unsafe {
+            std::ptr::read_unaligned(data.as_ptr() as *const Self)
         })
     }
     
+    /// Create from raw bytes with bounds check elided (caller guarantees size)
+    /// 
+    /// # Safety
+    /// Caller must ensure `data.len() >= SIZE`
+    #[inline(always)]
+    pub unsafe fn from_bytes_unchecked(data: &[u8]) -> Self {
+        debug_assert!(data.len() >= Self::SIZE);
+        std::ptr::read_unaligned(data.as_ptr() as *const Self)
+    }
+    
     /// Check if this key data is valid (non-zero private key)
-    #[inline]
+    /// Uses SIMD-friendly pattern for faster checking
+    #[inline(always)]
     pub fn is_valid(&self) -> bool {
-        self.private_key.iter().any(|&b| b != 0)
+        // Check 8 bytes at a time for faster zero-detection
+        let ptr = self.private_key.as_ptr() as *const u64;
+        unsafe {
+            // Read 4 u64s (32 bytes) and OR them together
+            let v0 = std::ptr::read_unaligned(ptr);
+            let v1 = std::ptr::read_unaligned(ptr.add(1));
+            let v2 = std::ptr::read_unaligned(ptr.add(2));
+            let v3 = std::ptr::read_unaligned(ptr.add(3));
+            (v0 | v1 | v2 | v3) != 0
+        }
     }
     
     /// Get private key as hex string
@@ -174,6 +190,7 @@ pub struct Match {
 
 impl Match {
     /// Create a new match
+    #[inline(always)]
     pub fn new(key: RawKeyData, match_type: MatchType) -> Self {
         let matched_hash = match match_type {
             MatchType::P2PKH | MatchType::P2WPKH => key.pubkey_hash,

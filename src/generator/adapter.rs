@@ -4,13 +4,14 @@
 //! KeyGenerator trait, allowing clean integration with the pipeline.
 //!
 //! Pipeline Strategy:
-//! - Use double/triple buffering to overlap GPU compute with CPU processing
+//! - Use triple buffering to overlap GPU compute with CPU processing
 //! - First call: dispatch batch 0, wait, return
 //! - Subsequent: dispatch batch N+1, wait for batch N, return batch N
 //!
 //! Memory Safety:
-//! - Double-buffered output: each generate_batch call writes to alternating buffers
-//! - This ensures the previous slice remains valid while the next batch is being written
+//! - Triple-buffered output: each generate_batch call writes to rotating buffers
+//! - This ensures the previous TWO slices remain valid while the next batch is being written
+//! - Caller has two full batch cycles to process data before buffer is reused
 //! - Mutex protects against concurrent writes to the same buffer
 
 use std::cell::UnsafeCell;
@@ -22,34 +23,40 @@ use parking_lot::Mutex;
 use crate::bridge::KeyGenerator;
 use super::GpuKeyGenerator;
 
-/// Number of output buffers for double-buffering
-/// This ensures the slice returned by generate_batch remains valid
-/// until generate_batch is called again (not just during the call)
-const NUM_OUTPUT_BUFFERS: usize = 2;
+/// Number of output buffers for triple-buffering
+/// 
+/// Triple buffering (3 buffers) provides a safety margin:
+/// - Buffer N: currently being written
+/// - Buffer N-1: returned to caller (being processed)
+/// - Buffer N-2: previous slice (may still be in use)
+/// 
+/// This allows the caller TWO generate_batch() calls before any buffer is reused,
+/// providing a much safer margin than double-buffering.
+const NUM_OUTPUT_BUFFERS: usize = 3;
 
 /// Adapter that wraps GpuKeyGenerator and implements KeyGenerator trait
 /// 
 /// # Thread Safety
 /// - Uses `parking_lot::Mutex` to serialize buffer writes
-/// - Double-buffered output prevents use-after-free
+/// - Triple-buffered output prevents use-after-free
 /// - `generate_batch` can be called from multiple threads (serialized)
 /// 
-/// # Memory Safety (Double-Buffer Guarantee)
-/// 1. Uses 2 alternating output buffers
-/// 2. Each call writes to buffer[N % 2], returns slice to that buffer
-/// 3. The PREVIOUS slice (buffer[(N-1) % 2]) remains valid and untouched
-/// 4. Only after TWO more calls is a buffer overwritten
-/// 5. This gives the caller a full batch cycle to process the data
+/// # Memory Safety (Triple-Buffer Guarantee)
+/// 1. Uses 3 rotating output buffers
+/// 2. Each call writes to buffer[N % 3], returns slice to that buffer
+/// 3. The PREVIOUS TWO slices (buffer[(N-1) % 3] and buffer[(N-2) % 3]) remain valid
+/// 4. Only after THREE more calls is a buffer overwritten
+/// 5. This gives the caller two full batch cycles to process the data
 /// 
 /// # Invariant
-/// The Mutex ensures only one thread writes at a time, and the double-buffer
+/// The Mutex ensures only one thread writes at a time, and the triple-buffer
 /// scheme ensures previous slices remain valid. This is safe because:
 /// - UnsafeCell access is protected by the Mutex
 /// - Buffers are heap-allocated with stable addresses
-/// - Double-buffering prevents concurrent read/write to same buffer
+/// - Triple-buffering provides extra safety margin
 pub struct GpuGeneratorAdapter {
     inner: Arc<GpuKeyGenerator>,
-    /// Double output buffers for safe slice returns
+    /// Triple output buffers for safe slice returns
     /// UnsafeCell allows interior mutability; Mutex ensures exclusive write access
     batch_buffers: [UnsafeCell<Box<[u8]>>; NUM_OUTPUT_BUFFERS],
     /// Mutex for synchronizing buffer writes (protects UnsafeCell access)
@@ -58,7 +65,7 @@ pub struct GpuGeneratorAdapter {
     buffer_size: usize,
     /// Current GPU buffer index for round-robin (for pipeline)
     gpu_buf_idx: AtomicUsize,
-    /// Current output buffer index (alternates 0, 1, 0, 1, ...)
+    /// Current output buffer index (rotates 0, 1, 2, 0, 1, 2, ...)
     output_buf_idx: AtomicUsize,
     /// Whether pipeline has been primed
     pipeline_primed: AtomicBool,
@@ -78,8 +85,10 @@ impl GpuGeneratorAdapter {
         let output_size = 72; // RawKeyData::SIZE
         let buffer_size = batch_size * output_size;
         
-        // Create double buffers for safe slice returns
+        // Create triple buffers for safe slice returns
+        // Each buffer is independently allocated on the heap for stable addresses
         let batch_buffers = [
+            UnsafeCell::new(vec![0u8; buffer_size].into_boxed_slice()),
             UnsafeCell::new(vec![0u8; buffer_size].into_boxed_slice()),
             UnsafeCell::new(vec![0u8; buffer_size].into_boxed_slice()),
         ];
@@ -135,8 +144,8 @@ impl KeyGenerator for GpuGeneratorAdapter {
         // Get current GPU buffer index (for pipeline round-robin)
         let gpu_idx = self.gpu_buf_idx.fetch_add(1, Ordering::SeqCst) % depth;
         
-        // Get current output buffer index (for double-buffering)
-        // This alternates: 0, 1, 0, 1, ... ensuring previous slice remains valid
+        // Get current output buffer index (for triple-buffering)
+        // This rotates: 0, 1, 2, 0, 1, 2, ... ensuring previous TWO slices remain valid
         let out_idx = self.output_buf_idx.fetch_add(1, Ordering::SeqCst) % NUM_OUTPUT_BUFFERS;
         
         // Get the GPU buffer set for reading
@@ -173,14 +182,14 @@ impl KeyGenerator for GpuGeneratorAdapter {
         
         // Lock is released here when _guard drops
         // The returned slice points to buffer[out_idx] which won't be
-        // written to again until 2 more generate_batch calls
+        // written to again until 3 more generate_batch calls (triple-buffering)
         
         // SAFETY: This is sound because:
         // 1. Box<[u8]> is heap-allocated with a stable address
         // 2. Data was fully written under write_lock protection
-        // 3. Double-buffering ensures this buffer won't be overwritten
-        //    until AFTER the next generate_batch call completes
-        // 4. Caller has until the call AFTER next to process this slice
+        // 3. Triple-buffering ensures this buffer won't be overwritten
+        //    until AFTER two more generate_batch calls complete
+        // 4. Caller has two full batch cycles to process this slice
         Ok(unsafe {
             std::slice::from_raw_parts(result_ptr, result_len)
         })
