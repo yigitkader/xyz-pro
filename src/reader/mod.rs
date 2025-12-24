@@ -16,12 +16,15 @@
 //! ## Bridge Integration
 //! 
 //! Use `TargetMatcher` to integrate with the bridge pipeline:
-//! ```ignore
+//! ```no_run
 //! use xyz_pro::reader::{TargetSet, TargetMatcher};
 //! use xyz_pro::bridge::Matcher;
 //! 
-//! let matcher = TargetMatcher::load("targets.json")?;
-//! // Now 'matcher' implements Matcher trait
+//! fn main() -> Result<(), String> {
+//!     let matcher = TargetMatcher::load("targets.json")?;
+//!     println!("Loaded {} targets", matcher.target_count());
+//!     Ok(())
+//! }
 //! ```
 
 mod targets;

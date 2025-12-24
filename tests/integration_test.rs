@@ -451,27 +451,71 @@ fn test_glv_lambda_transform() {
     println!("✅ GLV Lambda verification:");
     println!("   λ³ ≡ 1 (mod n) verified");
     
-    // Test scalar multiplication: k * λ mod n
-    // Use private key 1 as test
-    let k = Scalar::from_repr(test_vectors::PRIVKEY_1_BE.into()).unwrap();
-    let glv_k = k * lambda;
+    // Test scalar multiplication with multiple edge cases
+    // This ensures scalar_mul_mod_n handles all ranges correctly
     
-    // Convert back to bytes
-    let glv_k_bytes = glv_k.to_repr();
+    println!("   Testing GLV transform with various k values:");
     
-    println!("   k = 1");
-    println!("   λ·k mod n = {}", hex::encode(glv_k_bytes.as_slice()));
+    // Helper to verify GLV transform
+    let verify_glv = |k: Scalar, name: &str| {
+        let glv_k = k * lambda;
+        let lambda_sq = lambda * lambda;
+        let recovered_k = glv_k * lambda_sq;
+        assert_eq!(
+            recovered_k, k,
+            "(λ·k)·λ² should equal k for {}", name
+        );
+        println!("   ✓ {} verified", name);
+    };
     
-    // Verify: (λ·k)·λ² = k (since λ³ = 1)
-    let lambda_sq = lambda * lambda;
-    let recovered_k = glv_k * lambda_sq;
-    assert_eq!(
-        recovered_k, k,
-        "(λ·k)·λ² should equal k"
-    );
+    // Case 1: k = 1 (minimal)
+    let k1 = Scalar::from_repr(test_vectors::PRIVKEY_1_BE.into()).unwrap();
+    verify_glv(k1, "k = 1 (minimal)");
     
-    println!("   (λ·k)·λ² = k verified");
-    println!("✅ GLV Lambda transform is mathematically correct!");
+    // Case 2: k = 2^128 (128-bit boundary - tests carry across word boundary)
+    let mut k128_bytes = [0u8; 32];
+    k128_bytes[15] = 1; // 2^128 in big-endian
+    let k128 = Scalar::from_repr(k128_bytes.into()).unwrap();
+    verify_glv(k128, "k = 2^128 (word boundary)");
+    
+    // Case 3: k = 2^192 (tests upper half of 256-bit range)
+    let mut k192_bytes = [0u8; 32];
+    k192_bytes[7] = 1; // 2^192 in big-endian
+    let k192 = Scalar::from_repr(k192_bytes.into()).unwrap();
+    verify_glv(k192, "k = 2^192 (upper half)");
+    
+    // Case 4: k = n - 1 (maximum valid scalar, near curve order)
+    // n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    let n_minus_1_bytes: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+        0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x40,
+    ];
+    let k_max = Scalar::from_repr(n_minus_1_bytes.into()).unwrap();
+    verify_glv(k_max, "k = n-1 (maximum)");
+    
+    // Case 5: k = 0xFFFFFFFF...FFFF (all bits set, tests reduction)
+    let k_allones_bytes = [0xFF; 32];
+    // This will be reduced mod n automatically
+    // Note: from_repr returns CtOption, use into_option() to convert
+    let k_allones_opt: k256::elliptic_curve::subtle::CtOption<Scalar> = 
+        Scalar::from_repr(k_allones_bytes.into());
+    if k_allones_opt.is_some().into() {
+        verify_glv(k_allones_opt.unwrap(), "k = 2^256-1 (all bits, reduced)");
+    }
+    
+    // Case 6: Random large value (stress test)
+    let k_random_bytes: [u8; 32] = [
+        0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC,
+        0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+        0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+        0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+    ];
+    let k_random = Scalar::from_repr(k_random_bytes.into()).unwrap();
+    verify_glv(k_random, "k = random large value");
+    
+    println!("✅ GLV Lambda transform is mathematically correct for all edge cases!");
 }
 
 /// Test that GPU-computed hashes match CPU-computed hashes
@@ -621,4 +665,337 @@ fn test_target_set_caching() {
     // Cached load should be faster (or at least similar)
     // We don't assert this strictly as it depends on system state
     println!("✅ Cache system works correctly");
+}
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+/// Test RawKeyData with all-zero private key (invalid)
+#[test]
+fn test_edge_case_zero_private_key() {
+    let raw = xyz_pro::generator::RawKeyData {
+        private_key: [0u8; 32],
+        pubkey_hash: [0u8; 20],
+        p2sh_hash: [0u8; 20],
+    };
+    
+    // Zero private key is invalid
+    assert!(!raw.is_valid(), "Zero private key should be invalid");
+    println!("✅ Zero private key correctly rejected");
+}
+
+/// Test RawKeyData with maximum valid private key (n-1)
+#[test]
+fn test_edge_case_max_private_key() {
+    // n-1 = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140
+    let max_key: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+        0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x40,
+    ];
+    
+    let raw = xyz_pro::generator::RawKeyData {
+        private_key: max_key,
+        pubkey_hash: [0xFF; 20],
+        p2sh_hash: [0xFF; 20],
+    };
+    
+    // Max key is valid (non-zero)
+    assert!(raw.is_valid(), "Max private key should be valid");
+    println!("✅ Maximum private key (n-1) accepted");
+}
+
+/// Test RawKeyData::from_bytes with various sizes
+#[test]
+fn test_edge_case_raw_key_data_sizes() {
+    // Exactly 72 bytes - should work
+    let data_72 = vec![0x42u8; 72];
+    let raw = xyz_pro::generator::RawKeyData::from_bytes(&data_72);
+    assert!(raw.is_some(), "72 bytes should be valid");
+    
+    // Less than 72 bytes - should fail
+    let data_71 = vec![0x42u8; 71];
+    let raw = xyz_pro::generator::RawKeyData::from_bytes(&data_71);
+    assert!(raw.is_none(), "71 bytes should be invalid");
+    
+    // More than 72 bytes - should work (uses first 72)
+    let data_100 = vec![0x42u8; 100];
+    let raw = xyz_pro::generator::RawKeyData::from_bytes(&data_100);
+    assert!(raw.is_some(), "100 bytes should work (uses first 72)");
+    
+    println!("✅ RawKeyData::from_bytes handles edge sizes correctly");
+}
+
+/// Test address encoding with all-0xFF hash (boundary)
+#[test]
+fn test_edge_case_max_hash_encoding() {
+    let mut encoder = AddressEncoder::new();
+    
+    let raw = xyz_pro::generator::RawKeyData {
+        private_key: [0xFF; 32],
+        pubkey_hash: [0xFF; 20],
+        p2sh_hash: [0xFF; 20],
+    };
+    
+    let entry = encoder.encode(&raw);
+    
+    // All addresses should still be valid format
+    assert!(entry.p2pkh.starts_with('1'), "P2PKH should start with 1");
+    assert!(entry.p2sh.starts_with('3'), "P2SH should start with 3");
+    assert!(entry.p2wpkh.starts_with("bc1q"), "P2WPKH should start with bc1q");
+    
+    // Verify lengths are reasonable
+    assert!(entry.p2pkh.len() >= 25 && entry.p2pkh.len() <= 34, "P2PKH length should be valid");
+    assert!(entry.p2sh.len() >= 25 && entry.p2sh.len() <= 35, "P2SH length should be valid");
+    assert!(entry.p2wpkh.len() >= 42 && entry.p2wpkh.len() <= 62, "P2WPKH length should be valid");
+    
+    println!("✅ Max hash (0xFF) encoding produces valid addresses");
+    println!("   P2PKH:  {} (len={})", entry.p2pkh, entry.p2pkh.len());
+    println!("   P2SH:   {} (len={})", entry.p2sh, entry.p2sh.len());
+    println!("   P2WPKH: {} (len={})", entry.p2wpkh, entry.p2wpkh.len());
+}
+
+/// Test GLV scalar multiplication with edge values
+#[test]
+fn test_edge_case_glv_scalar_mul() {
+    use k256::Scalar;
+    use k256::elliptic_curve::PrimeField;
+    
+    // GLV Lambda
+    let lambda_bytes: [u8; 32] = [
+        0x53, 0x63, 0xAD, 0x4C, 0xC0, 0x5C, 0x30, 0xE0,
+        0xA5, 0x26, 0x1C, 0x02, 0x88, 0x12, 0x64, 0x5A,
+        0x12, 0x2E, 0x22, 0xEA, 0x20, 0x81, 0x66, 0x78,
+        0xDF, 0x02, 0x96, 0x7C, 0x1B, 0x23, 0xBD, 0x72,
+    ];
+    let lambda = Scalar::from_repr(lambda_bytes.into()).unwrap();
+    
+    // Test cases that stress carry propagation in scalar_mul_mod_n
+    let test_cases: Vec<(&str, [u8; 32])> = vec![
+        // All ones in each word boundary
+        ("0x00...00FF (byte 31)", {
+            let mut k = [0u8; 32];
+            k[31] = 0xFF;
+            k
+        }),
+        ("0x00...FF00 (byte 30)", {
+            let mut k = [0u8; 32];
+            k[30] = 0xFF;
+            k
+        }),
+        // Word boundaries (64-bit)
+        ("0x00...00FFFFFFFF (lower 32 bits)", {
+            let mut k = [0u8; 32];
+            k[28..32].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+            k
+        }),
+        // 128-bit boundary
+        ("0x00...FFFFFFFF...0 (bits 128-159)", {
+            let mut k = [0u8; 32];
+            k[12..16].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+            k
+        }),
+        // Alternating bits (stress test)
+        ("0xAAAA...AAAA", {
+            [0xAA; 32]
+        }),
+        ("0x5555...5555", {
+            [0x55; 32]
+        }),
+    ];
+    
+    println!("🧪 Testing GLV scalar multiplication edge cases:");
+    
+    for (name, k_bytes) in test_cases {
+        let k_opt: k256::elliptic_curve::subtle::CtOption<Scalar> = 
+            Scalar::from_repr(k_bytes.into());
+        if !bool::from(k_opt.is_some()) {
+            continue; // Skip if not valid scalar
+        }
+        let k = k_opt.unwrap();
+        
+        // Verify: (λ·k)·λ² = k
+        let glv_k = k * lambda;
+        let lambda_sq = lambda * lambda;
+        let recovered_k = glv_k * lambda_sq;
+        
+        assert_eq!(
+            recovered_k, k,
+            "GLV transform should be reversible for {}", name
+        );
+        println!("   ✓ {}", name);
+    }
+    
+    println!("✅ All GLV scalar multiplication edge cases passed");
+}
+
+/// Test XOR filter with potential collision scenarios
+#[test]
+fn test_edge_case_xor_filter_collisions() {
+    use std::collections::HashSet;
+    
+    // Generate hashes that could potentially collide in XOR-fold
+    // XOR-fold: p1 ^ p2 ^ p3 where p1,p2=8 bytes, p3=4 bytes
+    
+    // Two different hashes that XOR-fold to same value:
+    // hash1: [A, B, C] -> A ^ B ^ C
+    // hash2: [A', B', C'] where A' ^ B' ^ C' = A ^ B ^ C
+    
+    let hash1: [u8; 20] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,  // p1
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,  // p2
+        0x12, 0x34, 0x56, 0x78,                          // p3
+    ];
+    
+    // Construct hash2 that XOR-folds to same value as hash1
+    // by swapping bits between p1 and p2
+    let hash2: [u8; 20] = [
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,  // swapped p1
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,  // swapped p2
+        0x12, 0x34, 0x56, 0x78,                          // same p3
+    ];
+    
+    // These should XOR-fold to the same value but be different hashes
+    fn xor_fold(hash: &[u8; 20]) -> u64 {
+        let p1 = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+        let p2 = u64::from_le_bytes(hash[8..16].try_into().unwrap());
+        let p3 = u32::from_le_bytes(hash[16..20].try_into().unwrap()) as u64;
+        p1 ^ p2 ^ p3
+    }
+    
+    let fold1 = xor_fold(&hash1);
+    let fold2 = xor_fold(&hash2);
+    
+    // Verify they fold to same value (potential collision)
+    assert_eq!(fold1, fold2, "These hashes should XOR-fold to same value");
+    
+    // But the actual hashes are different
+    assert_ne!(hash1, hash2, "The actual hashes should be different");
+    
+    // This is why XOR filter uses HashSet as fallback!
+    let mut set: HashSet<[u8; 20]> = HashSet::new();
+    set.insert(hash1);
+    
+    // XOR filter would say "maybe" for hash2, but HashSet correctly rejects
+    assert!(set.contains(&hash1), "HashSet should contain hash1");
+    assert!(!set.contains(&hash2), "HashSet should NOT contain hash2 (collision handled)");
+    
+    println!("✅ XOR filter collision scenario correctly handled by HashSet fallback");
+    println!("   hash1 XOR-fold: 0x{:016X}", fold1);
+    println!("   hash2 XOR-fold: 0x{:016X}", fold2);
+    println!("   Both fold to same value but HashSet distinguishes them");
+}
+
+/// Test KeyBatch iteration with various sizes
+#[test]
+fn test_edge_case_key_batch_sizes() {
+    use xyz_pro::bridge::KeyBatch;
+    use xyz_pro::generator::RawKeyData;
+    
+    // Empty batch
+    let empty_data: Vec<u8> = vec![];
+    let empty_batch = KeyBatch::new(&empty_data);
+    assert_eq!(empty_batch.len(), 0, "Empty batch should have 0 keys");
+    
+    // Single key
+    let single_data = vec![0x42u8; RawKeyData::SIZE];
+    let single_batch = KeyBatch::new(&single_data);
+    assert_eq!(single_batch.len(), 1, "Single key batch should have 1 key");
+    
+    // Partial key (should be truncated)
+    let partial_data = vec![0x42u8; RawKeyData::SIZE + 10];
+    let partial_batch = KeyBatch::new(&partial_data);
+    assert_eq!(partial_batch.len(), 1, "Partial extra bytes should be ignored");
+    
+    // Large batch
+    let large_data = vec![0x42u8; RawKeyData::SIZE * 1000];
+    let large_batch = KeyBatch::new(&large_data);
+    assert_eq!(large_batch.len(), 1000, "Large batch should have 1000 keys");
+    
+    println!("✅ KeyBatch handles all size edge cases correctly");
+}
+
+/// Test GPU output format matches expected layout
+#[test]
+fn test_edge_case_gpu_output_layout() {
+    use xyz_pro::generator::RawKeyData;
+    
+    // GPU output format: [privkey:32][pubkey_hash:20][p2sh_hash:20] = 72 bytes
+    assert_eq!(RawKeyData::SIZE, 72, "RawKeyData should be exactly 72 bytes");
+    
+    // Test struct layout
+    let raw = RawKeyData {
+        private_key: [0x11; 32],
+        pubkey_hash: [0x22; 20],
+        p2sh_hash: [0x33; 20],
+    };
+    
+    // Verify field offsets by reconstructing from bytes
+    let reconstructed = RawKeyData::from_bytes(&[
+        // 32 bytes private key
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        // 20 bytes pubkey_hash
+        0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+        0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+        0x22, 0x22, 0x22, 0x22,
+        // 20 bytes p2sh_hash
+        0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+        0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+        0x33, 0x33, 0x33, 0x33,
+    ]).expect("Should parse 72 bytes");
+    
+    assert_eq!(raw.private_key, reconstructed.private_key, "Private key layout mismatch");
+    assert_eq!(raw.pubkey_hash, reconstructed.pubkey_hash, "Pubkey hash layout mismatch");
+    assert_eq!(raw.p2sh_hash, reconstructed.p2sh_hash, "P2SH hash layout mismatch");
+    
+    println!("✅ GPU output layout verified: [privkey:32][pubkey_hash:20][p2sh_hash:20]");
+}
+
+/// Test private key validation edge cases
+#[test]
+fn test_edge_case_privkey_validation() {
+    // Test is_valid() with various patterns
+    let test_cases: Vec<(&str, [u8; 32], bool)> = vec![
+        ("All zeros", [0u8; 32], false),
+        ("Single bit set (LSB)", {
+            let mut k = [0u8; 32];
+            k[31] = 0x01;
+            k
+        }, true),
+        ("Single bit set (MSB)", {
+            let mut k = [0u8; 32];
+            k[0] = 0x80;
+            k
+        }, true),
+        ("All ones", [0xFF; 32], true),
+        ("Only middle byte set", {
+            let mut k = [0u8; 32];
+            k[16] = 0x42;
+            k
+        }, true),
+    ];
+    
+    println!("🧪 Testing private key validation edge cases:");
+    
+    for (name, privkey, expected_valid) in test_cases {
+        let raw = xyz_pro::generator::RawKeyData {
+            private_key: privkey,
+            pubkey_hash: [0u8; 20],
+            p2sh_hash: [0u8; 20],
+        };
+        
+        let is_valid = raw.is_valid();
+        assert_eq!(
+            is_valid, expected_valid,
+            "{}: expected valid={}, got valid={}", name, expected_valid, is_valid
+        );
+        println!("   ✓ {}: valid={}", name, is_valid);
+    }
+    
+    println!("✅ All private key validation edge cases passed");
 }

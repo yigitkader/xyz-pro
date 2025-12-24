@@ -16,14 +16,17 @@
 //! ## Bridge Integration
 //! 
 //! Use `GpuGeneratorAdapter` to integrate with the bridge pipeline:
-//! ```ignore
+//! ```no_run
 //! use xyz_pro::generator::{GpuKeyGenerator, GpuGeneratorAdapter, GeneratorConfig};
 //! use xyz_pro::bridge::KeyGenerator;
 //! 
-//! let config = GeneratorConfig::default();
-//! let gpu_gen = GpuKeyGenerator::new(config)?;
-//! let adapter = GpuGeneratorAdapter::new(gpu_gen);
-//! // Now 'adapter' implements KeyGenerator trait
+//! fn main() -> Result<(), String> {
+//!     let config = GeneratorConfig::default();
+//!     let gpu_gen = GpuKeyGenerator::new(config)?;
+//!     let adapter = GpuGeneratorAdapter::new(gpu_gen);
+//!     println!("Batch size: {}", adapter.batch_size());
+//!     Ok(())
+//! }
 //! ```
 
 mod keygen;

@@ -27,9 +27,22 @@
 //! ```
 //!
 //! Usage:
-//! ```ignore
-//! let pipeline = IntegratedPipeline::new(generator, matcher, output);
-//! pipeline.run()?;
+//! ```no_run
+//! use xyz_pro::bridge::{IntegratedPipeline, ConsoleOutput};
+//! use xyz_pro::generator::{GpuKeyGenerator, GpuGeneratorAdapter, GeneratorConfig};
+//! use xyz_pro::reader::ParallelMatcher;
+//! 
+//! fn main() -> Result<(), String> {
+//!     let config = GeneratorConfig::default();
+//!     let gpu = GpuKeyGenerator::new(config)?;
+//!     let generator = GpuGeneratorAdapter::new(gpu);
+//!     let matcher = ParallelMatcher::load("targets.json")?;
+//!     let output = ConsoleOutput::new();
+//!     
+//!     let pipeline = IntegratedPipeline::new(generator, matcher, output);
+//!     pipeline.run()?;
+//!     Ok(())
+//! }
 //! ```
 
 mod types;
