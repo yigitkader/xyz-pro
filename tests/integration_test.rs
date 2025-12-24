@@ -1702,8 +1702,10 @@ fn test_gpu_thread_offset_determinism() {
 
 /// Test that GPU keys are sequential (no gaps)
 /// 
-/// NOTE: With GLV mode enabled, output is [k, λ·k, k+1, λ·(k+1), ...] pairs
-/// The base keys (k) should be sequential, GLV keys (λ·k) are derived
+/// NOTE: With GLV mode enabled:
+/// - GLV 2x: output is [k, λ·k, k+1, λ·(k+1), ...] pairs (stride = 2)
+/// - GLV 3x: output is [k, λ·k, λ²·k, k+1, λ·(k+1), λ²·(k+1), ...] triplets (stride = 3)
+/// The base keys (k) should be sequential, GLV keys are derived
 #[test]
 fn test_gpu_keys_are_sequential() {
     use xyz_pro::bridge::KeyGenerator;
@@ -1726,6 +1728,10 @@ fn test_gpu_keys_are_sequential() {
         }
     };
     
+    // Get the GLV stride from config (2 for GLV2x, 3 for GLV3x)
+    let glv_stride = gpu_gen.glv_mode().keys_per_ec_op();
+    println!("   GLV mode: {:?} (stride = {})", gpu_gen.glv_mode(), glv_stride);
+    
     let adapter = GpuGeneratorAdapter::new(gpu_gen);
     let data = match adapter.generate_batch() {
         Ok(d) => d,
@@ -1735,18 +1741,20 @@ fn test_gpu_keys_are_sequential() {
         }
     };
     
-    // With GLV, keys come in pairs: [base_key, glv_key, base_key+1, glv_key+1, ...]
-    // We check that base keys (even indices) are sequential
+    // With GLV, keys come in groups:
+    // GLV 2x: [base_key, glv_key, base_key+1, glv_key+1, ...]
+    // GLV 3x: [base_key, glv_key, glv2_key, base_key+1, ...]
+    // We check that base keys (at stride intervals) are sequential
     let key_count = data.len() / RawKeyData::SIZE;
     let check_count = key_count.min(100);
     
     println!("   Total keys in batch: {}", key_count);
-    println!("   GLV mode: each base key produces 2 output entries");
+    println!("   Each EC operation produces {} output entries", glv_stride);
     
-    // Check first 50 base keys (indices 0, 2, 4, ...) are sequential
+    // Check first N base keys (at indices 0, stride, 2*stride, ...)
     let mut sequential_count = 0;
-    for pair in 0..check_count.min(50) {
-        let base_idx = pair * 2;  // Base keys are at even indices
+    for group in 0..check_count.min(50) {
+        let base_idx = group * glv_stride;  // Base keys at stride intervals
         if base_idx >= key_count {
             break;
         }
@@ -1759,20 +1767,24 @@ fn test_gpu_keys_are_sequential() {
         offset_bytes.copy_from_slice(&privkey[24..32]);
         let actual_offset = u64::from_be_bytes(offset_bytes);
         
-        let expected_offset = start_offset + pair as u64;
+        let expected_offset = start_offset + group as u64;
         
         // Base keys should be sequential
         assert_eq!(
             actual_offset, expected_offset,
             "Base key {} (at index {}) should have offset {}, got {}",
-            pair, base_idx, expected_offset, actual_offset
+            group, base_idx, expected_offset, actual_offset
         );
         sequential_count += 1;
     }
     
     println!("✅ First {} base keys are sequential: {}..{}", 
              sequential_count, start_offset, start_offset + sequential_count as u64 - 1);
-    println!("   GLV keys at odd indices are λ·k (derived from base keys)");
+    match glv_stride {
+        2 => println!("   GLV keys at indices 1, 3, 5... are λ·k"),
+        3 => println!("   GLV keys: indices 1,4,7... are λ·k, indices 2,5,8... are λ²·k"),
+        _ => println!("   Standard mode: no GLV keys"),
+    }
 }
 
 // ============================================================================

@@ -96,7 +96,9 @@ unsafe impl Sync for GpuGeneratorAdapter {}
 impl GpuGeneratorAdapter {
     /// Create a new adapter wrapping a GpuKeyGenerator
     pub fn new(generator: GpuKeyGenerator) -> Self {
-        let batch_size = generator.batch_size() * 2; // GLV: 2x keys
+        // GLV multiplier from config: 1 (disabled), 2 (GLV2x), 3 (GLV3x)
+        let glv_multiplier = generator.glv_mode().keys_per_ec_op();
+        let batch_size = generator.batch_size() * glv_multiplier;
         let output_size = 72; // RawKeyData::SIZE
         let buffer_size = batch_size * output_size;
         
@@ -142,8 +144,9 @@ impl GpuGeneratorAdapter {
 
 impl KeyGenerator for GpuGeneratorAdapter {
     fn batch_size(&self) -> usize {
-        // GLV: 2x keys per EC operation
-        self.inner.batch_size() * 2
+        // GLV multiplier from config: 1 (disabled), 2 (GLV2x), 3 (GLV3x)
+        let glv_multiplier = self.inner.glv_mode().keys_per_ec_op();
+        self.inner.batch_size() * glv_multiplier
     }
     
     fn generate_batch(&self) -> Result<&[u8], String> {

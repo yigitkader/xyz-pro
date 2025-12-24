@@ -495,13 +495,22 @@ impl GpuKeyGenerator {
         println!("   Creating {} command queues for async pipelining", tier.pipeline_depth);
         let mut buffer_sets = Vec::with_capacity(tier.pipeline_depth);
         for i in 0..tier.pipeline_depth {
+            // Create keys_per_thread buffer and initialize it
+            let keys_per_thread_buf = device.new_buffer(4, storage);
+            unsafe {
+                // CRITICAL: Initialize keys_per_thread to BATCH_SIZE
+                // GPU shader reads this to know how many keys each thread produces
+                let ptr = keys_per_thread_buf.contents() as *mut u32;
+                *ptr = BATCH_SIZE;
+            }
+            
             buffer_sets.push(BufferSet {
                 queue: device.new_command_queue(),
                 base_privkey_buf: device.new_buffer(32, storage),
                 base_pubkey_x_buf: device.new_buffer(32, storage),
                 base_pubkey_y_buf: device.new_buffer(32, storage),
                 output_buffer: device.new_buffer(output_buffer_size as u64, storage),
-                keys_per_thread_buf: device.new_buffer(4, storage),
+                keys_per_thread_buf,
                 pending_command: std::sync::Mutex::new(None),
                 in_use: AtomicBool::new(false), // Initially available for dispatch
             });
@@ -626,7 +635,14 @@ impl GpuKeyGenerator {
     // ACCESSOR METHODS FOR BRIDGE ADAPTER
     // ========================================================================
     
-    /// Get batch size (keys per dispatch)
+    /// Get batch size (EC operations per dispatch)
+    /// 
+    /// NOTE: This returns the number of EC point multiplications, NOT the number
+    /// of output keys. With GLV enabled, each EC operation produces multiple keys:
+    /// - GLV 2x: 2 keys per EC op (k and λk)
+    /// - GLV 3x: 3 keys per EC op (k, λk, λ²k)
+    /// 
+    /// To get total output keys: `batch_size() * glv_mode().keys_per_ec_op()`
     pub fn batch_size(&self) -> usize {
         self.tier.keys_per_dispatch
     }
