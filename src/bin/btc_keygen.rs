@@ -75,9 +75,16 @@ fn run_scan_mode(args: &[String]) {
     // This ensures --batch, --threads, --format etc. are not ignored
     let mut config = parse_args(args);
     
-    // Override specific scan-mode settings
+    // Scan-mode specific arguments:
+    // --targets / -T : Path to targets JSON file (note: -T uppercase, -t is for --threads)
+    // --output / -o  : Path to matches output file (overrides config.output_dir in scan mode)
     let targets_path = parse_string_arg(args, "--targets").unwrap_or_else(|| "targets.json".to_string());
+    
+    // In scan mode, --output is the matches file, NOT output directory
+    // If user specified --output, use it; otherwise default to "matches.txt"
     let output_file = parse_string_arg(args, "--output").unwrap_or_else(|| "matches.txt".to_string());
+    // Clear output_dir since it's not used in scan mode (prevents confusion)
+    config.output_dir = String::new();
     
     // Scan-mode specific overrides from command line
     if let Some(start) = parse_u64_arg(args, "--start") {
@@ -186,9 +193,10 @@ fn run_scan_mode(args: &[String]) {
 /// - `-t` → `--targets` (in scan mode)
 fn parse_string_arg(args: &[String], name: &str) -> Option<String> {
     // Define short flag mappings
+    // NOTE: -t is reserved for --threads, so --targets uses -T (uppercase)
     let short_flag = match name {
         "--output" => Some("-o"),
-        "--targets" => Some("-t"),
+        "--targets" => Some("-T"),  // Uppercase T to avoid conflict with -t (threads)
         "--input" => Some("-i"),
         "--format" => Some("-f"),
         _ => None,

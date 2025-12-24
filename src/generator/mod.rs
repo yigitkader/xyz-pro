@@ -96,17 +96,14 @@ impl RawKeyData {
     }
     
     /// Check if private key is non-zero (valid)
+    /// 
+    /// Uses safe byte iteration instead of unaligned pointer casts.
+    /// The compiler will auto-vectorize this into SIMD operations.
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
-        // Check 8 bytes at a time for SIMD optimization
-        let ptr = self.private_key.as_ptr() as *const u64;
-        unsafe {
-            let v0 = std::ptr::read_unaligned(ptr);
-            let v1 = std::ptr::read_unaligned(ptr.add(1));
-            let v2 = std::ptr::read_unaligned(ptr.add(2));
-            let v3 = std::ptr::read_unaligned(ptr.add(3));
-            (v0 | v1 | v2 | v3) != 0
-        }
+        // Safe implementation: any non-zero byte means valid key
+        // Compiler auto-vectorizes this into efficient SIMD code
+        self.private_key.iter().any(|&b| b != 0)
     }
 }
 
