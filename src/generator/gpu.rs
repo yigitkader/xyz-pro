@@ -373,15 +373,27 @@ impl GpuKeyGenerator {
     
     /// Wait for all pending GPU command buffers to complete
     /// Called during stop() for graceful shutdown
+    /// 
+    /// # Deadlock Prevention
+    /// Each pending command is taken from the mutex before waiting,
+    /// ensuring no locks are held during Metal API calls.
     fn wait_for_all_pending(&self) {
         for (idx, bs) in self.buffer_sets.iter().enumerate() {
-            if let Ok(pending) = bs.pending_command.lock() {
-                if let Some(ref cb) = *pending {
-                    cb.wait_until_completed();
-                }
+            // Take ownership of command buffer, releasing lock immediately
+            let cb_opt = {
+                let mut pending = match bs.pending_command.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                pending.take()
+            }; // Lock released here
+            
+            // Wait without holding lock
+            if let Some(cb) = cb_opt {
+                cb.wait_until_completed();
             }
-            // Also ensure any in-flight commands on the queue are done
-            // by creating and waiting on a sync command
+            
+            // Sync command for any in-flight work
             let sync_cb = bs.queue.new_command_buffer();
             sync_cb.commit();
             sync_cb.wait_until_completed();
@@ -575,13 +587,28 @@ impl GpuKeyGenerator {
     /// 
     /// CRITICAL: This waits on the ACTUAL dispatched command buffer,
     /// not a new empty one. This is the correct Metal synchronization pattern.
+    /// Wait for pending GPU command to complete
+    /// 
+    /// # Deadlock Prevention
+    /// The Mutex lock is released BEFORE calling wait_until_completed().
+    /// This prevents potential deadlocks if Metal's wait triggers callbacks
+    /// that might try to acquire the same lock.
     pub fn wait_for_completion(&self, buf_idx: usize) {
         let bs = &self.buffer_sets[buf_idx];
-        if let Ok(mut pending) = bs.pending_command.lock() {
-            if let Some(ref cb) = *pending {
-                cb.wait_until_completed();
-            }
-            *pending = None;
+        
+        // Take ownership of command buffer while releasing lock immediately
+        // This prevents deadlock: Metal callbacks during wait can't re-acquire this lock
+        let cb_opt = {
+            let mut pending = match bs.pending_command.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(), // Recover from poisoned mutex
+            };
+            pending.take() // Take ownership, None left in place
+        }; // Lock released here, BEFORE wait
+        
+        // Now safe to wait without holding the lock
+        if let Some(cb) = cb_opt {
+            cb.wait_until_completed();
         }
     }
     
@@ -1268,13 +1295,22 @@ impl Drop for GpuKeyGenerator {
         }
         
         // Wait for all GPU command buffers to complete
+        // Using take() pattern to avoid holding lock during wait
         for bs in &self.buffer_sets {
-            // Wait for pending command
-            if let Ok(pending) = bs.pending_command.lock() {
-                if let Some(ref cb) = *pending {
-                    cb.wait_until_completed();
-                }
+            // Take ownership of command buffer, releasing lock immediately
+            let cb_opt = {
+                let mut pending = match bs.pending_command.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                pending.take()
+            }; // Lock released here
+            
+            // Wait without holding lock (deadlock prevention)
+            if let Some(cb) = cb_opt {
+                cb.wait_until_completed();
             }
+            
             // Sync the queue
             let sync_cb = bs.queue.new_command_buffer();
             sync_cb.commit();

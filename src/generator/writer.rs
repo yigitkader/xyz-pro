@@ -358,6 +358,9 @@ impl AsyncRawWriter {
     /// 
     /// This properly closes the channel by dropping the sender,
     /// ensuring the writer thread sees the disconnect and exits cleanly.
+    /// Shutdown the async writer and wait for all pending writes to complete
+    /// 
+    /// Returns the total number of keys written, or 0 if the writer thread panicked.
     pub fn shutdown(self) -> u64 {
         // Destructure self to get ownership of both fields
         let AsyncRawWriter { sender, handle } = self;
@@ -372,7 +375,23 @@ impl AsyncRawWriter {
         
         // Wait for thread to complete all pending writes
         match handle {
-            Some(h) => h.join().unwrap_or(0),
+            Some(h) => match h.join() {
+                Ok(count) => count,
+                Err(panic_payload) => {
+                    // Thread panicked - log the error
+                    // This can happen if disk is full, permissions denied, etc.
+                    eprintln!("⚠️  Writer thread panicked! Some data may not have been written.");
+                    
+                    // Try to extract panic message
+                    if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+                        eprintln!("   Panic message: {}", msg);
+                    } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
+                        eprintln!("   Panic message: {}", msg);
+                    }
+                    
+                    0
+                }
+            },
             None => 0,
         }
     }
