@@ -17,7 +17,8 @@
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
 
 use parking_lot::Mutex;
 
@@ -76,8 +77,12 @@ pub struct GpuGeneratorAdapter {
     gpu_buf_idx: AtomicUsize,
     /// Current output buffer index (rotates 0, 1, 2, 3, 0, 1, 2, 3, ...)
     output_buf_idx: AtomicUsize,
-    /// Whether pipeline has been primed
-    pipeline_primed: AtomicBool,
+    /// One-time pipeline priming (thread-safe, runs exactly once)
+    /// Using std::sync::Once is more robust than AtomicBool for this pattern:
+    /// - Guarantees exactly one execution even under race conditions
+    /// - Other threads block until initialization completes
+    /// - No risk of double-prime or use-before-prime
+    pipeline_prime_once: Once,
 }
 
 // Safety: 
@@ -111,7 +116,7 @@ impl GpuGeneratorAdapter {
             buffer_size,
             gpu_buf_idx: AtomicUsize::new(0),
             output_buf_idx: AtomicUsize::new(0),
-            pipeline_primed: AtomicBool::new(false),
+            pipeline_prime_once: Once::new(),
         }
     }
     
@@ -121,7 +126,8 @@ impl GpuGeneratorAdapter {
     }
     
     /// Prime the pipeline by dispatching initial batches
-    fn prime_pipeline(&self) -> Result<(), String> {
+    /// This is called via Once::call_once, guaranteeing single execution
+    fn prime_pipeline_internal(&self) -> Result<(), String> {
         let depth = self.inner.pipeline_depth();
         
         // Dispatch initial batches to fill the pipeline
@@ -130,7 +136,6 @@ impl GpuGeneratorAdapter {
             self.inner.dispatch_glv(i, offset)?;
         }
         
-        self.pipeline_primed.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -145,10 +150,16 @@ impl KeyGenerator for GpuGeneratorAdapter {
         // Acquire write lock (parking_lot is fast and doesn't poison)
         let _guard = self.write_lock.lock();
         
-        // Prime pipeline on first call
-        if !self.pipeline_primed.load(Ordering::SeqCst) {
-            self.prime_pipeline()?;
-        }
+        // Prime pipeline on first call (thread-safe, runs exactly once)
+        // std::sync::Once guarantees:
+        // - Only one thread executes the closure
+        // - Other threads block until completion
+        // - Subsequent calls are no-op (fast path)
+        let mut prime_result: Result<(), String> = Ok(());
+        self.pipeline_prime_once.call_once(|| {
+            prime_result = self.prime_pipeline_internal();
+        });
+        prime_result?;
         
         let depth = self.inner.pipeline_depth();
         
