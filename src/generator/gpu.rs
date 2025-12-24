@@ -195,8 +195,12 @@ struct GpuTier {
     pool_size: usize,
 }
 
+/// Minimum memory required for GPU operation (in MB)
+/// Below this threshold, GPU will refuse to start to prevent crashes
+const MIN_GPU_MEMORY_MB: u64 = 64;
+
 impl GpuTier {
-    fn detect(device: &Device) -> Self {
+    fn detect(device: &Device) -> Result<Self, String> {
         let name = device.name().to_string();
         let name_lower = name.to_lowercase();
         let gpu_mem_mb = device.recommended_max_working_set_size() / (1024 * 1024);
@@ -240,6 +244,15 @@ impl GpuTier {
         println!("[GPU] Available for GPU after reserve: {} MB (keeping {} MB free)",
                  available_for_gpu, min_free_mb);
         
+        // CRITICAL: Check if there's enough memory to run at all
+        if available_for_gpu < MIN_GPU_MEMORY_MB {
+            return Err(format!(
+                "Insufficient memory for GPU operation. Available: {} MB, Required minimum: {} MB. \
+                 Please close other applications or run tests sequentially with --test-threads=1",
+                available_for_gpu, MIN_GPU_MEMORY_MB
+            ));
+        }
+        
         // Dynamically adjust tier if memory is insufficient
         let (threads, pipeline_depth, pool_size) = if total_buffer_mb as u64 <= available_for_gpu {
             // Enough memory - use full tier
@@ -264,8 +277,8 @@ impl GpuTier {
                 adj_pool = std::cmp::max(adj_pool.saturating_sub(1), 3);
             }
             
-            // If still not enough, reduce threads
-            while adj_threads > 16_384 {
+            // If still not enough, reduce threads further
+            while adj_threads > 8_192 {
                 let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * GLV_MAX_MULTIPLIER * adj_depth) / (1024 * 1024);
                 if (adj_buffer_mb as u64) <= available_for_gpu {
                     break;
@@ -275,6 +288,17 @@ impl GpuTier {
             }
             
             let final_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * GLV_MAX_MULTIPLIER * adj_depth) / (1024 * 1024);
+            
+            // Final check: if we still can't fit, refuse to start
+            if (final_buffer_mb as u64) > available_for_gpu {
+                return Err(format!(
+                    "Cannot reduce GPU configuration enough to fit in available memory. \
+                     Minimum required: {} MB, Available: {} MB. \
+                     Please close other applications or run tests with --test-threads=1",
+                    final_buffer_mb, available_for_gpu
+                ));
+            }
+            
             println!("[GPU] Adjusted: {} threads, {} depth, {} pool ({} MB)",
                      adj_threads, adj_depth, adj_pool, final_buffer_mb);
             
@@ -283,14 +307,14 @@ impl GpuTier {
         
         let keys_per_dispatch = threads * BATCH_SIZE as usize;
         
-        Self {
+        Ok(Self {
             name,
             threads_per_dispatch: threads,
             keys_per_dispatch,
             threadgroup_size: 256,
             pipeline_depth,
             pool_size,
-        }
+        })
     }
     
     /// Get system memory information (total and free) in MB
@@ -448,8 +472,8 @@ impl GpuKeyGenerator {
         println!("🖥️  GPU: {}", device.name());
         println!("   Max threads per threadgroup: {}", device.max_threads_per_threadgroup().width);
         
-        // Detect GPU tier
-        let tier = GpuTier::detect(&device);
+        // Detect GPU tier (may fail if insufficient memory)
+        let tier = GpuTier::detect(&device)?;
         
         // Compile embedded shader (self-contained binary, no external file needed)
         let library = device
