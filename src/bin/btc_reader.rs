@@ -74,17 +74,24 @@ fn main() {
             }
         }
     } else {
-        // Single scan mode
+        // Single scan mode - with graceful shutdown support
         println!("🔍 Scanning directory: {}", config.input_dir);
         println!();
         
-        match scanner.scan_directory(&config.input_dir) {
+        // Pass running flag for graceful Ctrl+C handling
+        match scanner.scan_directory_with_flag(&config.input_dir, Some(running.clone())) {
             Ok(result) => {
+                // Save results even on partial scan (Ctrl+C)
                 print_results(&result, &config.output_path);
             }
             Err(e) => {
-                eprintln!("❌ Scan error: {}", e);
-                std::process::exit(1);
+                if !running.load(Ordering::SeqCst) {
+                    // Ctrl+C was pressed - not an error
+                    println!("👋 Scan stopped by user");
+                } else {
+                    eprintln!("❌ Scan error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }

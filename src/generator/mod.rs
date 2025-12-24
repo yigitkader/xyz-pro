@@ -145,8 +145,22 @@ impl Default for GeneratorConfig {
     }
 }
 
+/// secp256k1 curve order (n) - maximum valid private key
+/// n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140
+/// Note: This is 256 bits, but we represent it as u64 limbs for comparison
+/// In practice, u64::MAX (~1.8×10^19) is much smaller than n (~1.16×10^77),
+/// so any u64 offset is always valid. This constant is for documentation.
+pub const SECP256K1_ORDER_HIGH: u64 = 0xFFFFFFFFFFFFFFFE;
+pub const SECP256K1_ORDER_NOTE: &str = 
+    "secp256k1 order n ≈ 1.16×10^77, u64 max ≈ 1.8×10^19 - all u64 values are valid";
+
 impl GeneratorConfig {
     /// Validate the configuration
+    /// 
+    /// # Validation Rules
+    /// - start_offset must be > 0 (0 is invalid private key)
+    /// - end_offset must be > start_offset (if set)
+    /// - u64 offsets are always < secp256k1 order (n ≈ 2^256)
     pub fn validate(&self) -> Result<(), String> {
         if self.start_offset == 0 {
             return Err("start_offset cannot be 0 (invalid private key)".to_string());
@@ -160,6 +174,11 @@ impl GeneratorConfig {
                 ));
             }
         }
+        
+        // Note: u64 values are always valid for secp256k1 since:
+        // u64::MAX = 18,446,744,073,709,551,615 (~1.8×10^19)
+        // secp256k1 n = 115,792,089,237,316,195,423,570,985,008,687,907,852,837,564,279,074,904,382,605,163,141,518,161,494,337 (~1.16×10^77)
+        // Therefore: u64::MAX << n, so all u64 offsets are valid private keys
         
         Ok(())
     }

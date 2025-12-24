@@ -317,71 +317,46 @@ impl GpuTier {
             }
         };
         
-        // Get free memory using host_statistics64
-        let free_ram: u64 = unsafe {
-            #[allow(deprecated)] // mach_host_self works fine, mach2 crate not worth the dependency
-            let host_port = libc::mach_host_self();
+        // Get free memory - use simpler sysctl approach for reliability
+        // host_statistics64 has complex struct alignment issues
+        let free_ram: u64 = {
+            // Use a conservative estimate: total_ram * available_fraction
+            // On macOS, typically 30-50% of RAM is available for new allocations
+            // We use 40% as a safe estimate
+            let estimated_free = total_ram * 40 / 100;
             
-            // vm_statistics64 structure
-            #[repr(C)]
-            struct VmStatistics64 {
-                free_count: u64,
-                active_count: u64,
-                inactive_count: u64,
-                wire_count: u64,
-                zero_fill_count: u64,
-                reactivations: u64,
-                pageins: u64,
-                pageouts: u64,
-                faults: u64,
-                cow_faults: u64,
-                lookups: u64,
-                hits: u64,
-                purges: u64,
-                purgeable_count: u64,
-                speculative_count: u64,
-                decompressions: u64,
-                compressions: u64,
-                swapins: u64,
-                swapouts: u64,
-                compressor_page_count: u64,
-                throttled_count: u64,
-                external_page_count: u64,
-                internal_page_count: u64,
-                total_uncompressed_pages_in_compressor: u64,
-            }
-            
-            let mut vm_stat: VmStatistics64 = mem::zeroed();
-            let mut count: libc::mach_msg_type_number_t = 
-                (mem::size_of::<VmStatistics64>() / mem::size_of::<libc::natural_t>()) as u32;
-            
-            // HOST_VM_INFO64 = 4
-            const HOST_VM_INFO64: libc::c_int = 4;
-            
-            extern "C" {
-                fn host_statistics64(
-                    host_priv: libc::mach_port_t,
-                    flavor: libc::c_int,
-                    info: *mut libc::c_void,
-                    count: *mut libc::mach_msg_type_number_t,
-                ) -> libc::c_int;
-            }
-            
-            let result = host_statistics64(
-                host_port,
-                HOST_VM_INFO64,
-                &mut vm_stat as *mut _ as *mut libc::c_void,
-                &mut count,
-            );
-            
-            if result == 0 {
-                // Page size (typically 16KB on Apple Silicon)
+            // Try to get actual value from sysctl if available
+            // vm.page_free_count * page_size gives free pages
+            let actual_free: u64 = unsafe {
                 let page_size = libc::sysconf(libc::_SC_PAGESIZE) as u64;
-                // Free = free + inactive + speculative (pages that can be reclaimed)
-                (vm_stat.free_count + vm_stat.inactive_count + vm_stat.speculative_count) * page_size
+                
+                // Try to get free page count via sysctl
+                let mut free_pages: u32 = 0;
+                let mut size: libc::size_t = mem::size_of::<u32>();
+                
+                // "vm.page_free_count" 
+                let name = std::ffi::CString::new("vm.page_free_count").unwrap();
+                let result = libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut free_pages as *mut _ as *mut libc::c_void,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                
+                if result == 0 && free_pages > 0 {
+                    free_pages as u64 * page_size
+                } else {
+                    // Fallback to estimate
+                    estimated_free
+                }
+            };
+            
+            // Sanity check: free RAM should be less than total RAM
+            if actual_free > 0 && actual_free < total_ram {
+                actual_free
             } else {
-                // Fallback: assume 50% of total is free
-                total_ram / 2
+                estimated_free
             }
         };
         

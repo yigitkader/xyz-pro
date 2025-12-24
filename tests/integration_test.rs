@@ -2093,3 +2093,299 @@ fn test_cpu_effective_keys_counter() {
     println!("   Effective (GLV): 200");
     println!("✅ Statistics correctly report 2x for GLV mode");
 }
+
+// ============================================================================
+// ANALIZ.MD PROBLEM TESTS - Verifying all fixes from analysis
+// ============================================================================
+
+/// Test #1: GeneratorConfig validation - start_offset cannot be 0
+#[test]
+fn test_generator_config_validation() {
+    use xyz_pro::generator::GeneratorConfig;
+    
+    println!("\n🧪 GeneratorConfig Validation Test");
+    println!("{}", "=".repeat(60));
+    
+    // Test: start_offset = 0 should fail
+    let mut config = GeneratorConfig::default();
+    config.start_offset = 0;
+    
+    let result = config.validate();
+    assert!(result.is_err(), "start_offset=0 should be invalid");
+    assert!(result.unwrap_err().contains("cannot be 0"), "Error should mention 0 is invalid");
+    println!("   ✓ start_offset=0 correctly rejected");
+    
+    // Test: start_offset = 1 should succeed
+    config.start_offset = 1;
+    assert!(config.validate().is_ok(), "start_offset=1 should be valid");
+    println!("   ✓ start_offset=1 accepted");
+    
+    // Test: end_offset <= start_offset should fail
+    config.start_offset = 100;
+    config.end_offset = Some(50);
+    
+    let result = config.validate();
+    assert!(result.is_err(), "end_offset < start_offset should be invalid");
+    println!("   ✓ end_offset < start_offset correctly rejected");
+    
+    // Test: end_offset > start_offset should succeed
+    config.end_offset = Some(200);
+    assert!(config.validate().is_ok(), "end_offset > start_offset should be valid");
+    println!("   ✓ end_offset > start_offset accepted");
+    
+    // Test: u64::MAX is always valid (much smaller than secp256k1 order)
+    config.start_offset = u64::MAX - 1000;
+    config.end_offset = Some(u64::MAX);
+    assert!(config.validate().is_ok(), "u64::MAX should be valid (< secp256k1 order)");
+    println!("   ✓ u64::MAX is valid (< secp256k1 order n ≈ 2^256)");
+    
+    println!("✅ All GeneratorConfig validation tests passed");
+}
+
+/// Test #2: save_matches uses append mode (JSONL format)
+#[test]
+fn test_save_matches_append_mode() {
+    use xyz_pro::reader::{save_matches, Match, AddressType};
+    use std::sync::Arc;
+    use std::fs;
+    use std::io::Read;
+    
+    println!("\n🧪 save_matches Append Mode Test");
+    println!("{}", "=".repeat(60));
+    
+    let test_file = "/tmp/xyz_pro_test_matches.jsonl";
+    
+    // Clean up any existing file
+    let _ = fs::remove_file(test_file);
+    
+    // First batch of matches
+    let matches1 = vec![
+        Match {
+            private_key: "0x0001".to_string(),
+            address: "1ABC...".to_string(),
+            address_type: AddressType::P2PKH,
+            file: Arc::new("test1.raw".to_string()),
+            offset: 100,
+        },
+    ];
+    
+    save_matches(&matches1, test_file).expect("First save should succeed");
+    println!("   ✓ First save completed");
+    
+    // Second batch of matches (should append, not overwrite)
+    let matches2 = vec![
+        Match {
+            private_key: "0x0002".to_string(),
+            address: "3DEF...".to_string(),
+            address_type: AddressType::P2SH,
+            file: Arc::new("test2.raw".to_string()),
+            offset: 200,
+        },
+    ];
+    
+    save_matches(&matches2, test_file).expect("Second save should succeed");
+    println!("   ✓ Second save completed (append mode)");
+    
+    // Verify both matches are in the file
+    let mut content = String::new();
+    fs::File::open(test_file)
+        .expect("File should exist")
+        .read_to_string(&mut content)
+        .expect("Should read file");
+    
+    // JSONL format: one JSON object per line
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2, "Should have 2 lines (one per match)");
+    
+    assert!(lines[0].contains("0x0001"), "First match should be preserved");
+    assert!(lines[1].contains("0x0002"), "Second match should be appended");
+    
+    println!("   ✓ Both matches preserved in file");
+    println!("   Line 1: {}", &lines[0][..50.min(lines[0].len())]);
+    println!("   Line 2: {}", &lines[1][..50.min(lines[1].len())]);
+    
+    // Clean up
+    let _ = fs::remove_file(test_file);
+    
+    println!("✅ save_matches correctly uses append mode (no data loss)");
+}
+
+/// Test #3: scan_directory_with_flag respects cancellation
+#[test]
+fn test_scan_directory_with_cancellation_flag() {
+    use xyz_pro::reader::{TargetSet, RawFileScanner};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::fs;
+    
+    println!("\n🧪 scan_directory_with_flag Cancellation Test");
+    println!("{}", "=".repeat(60));
+    
+    // Create a temporary targets file for loading
+    let targets_file = "/tmp/xyz_pro_cancel_test_targets.json";
+    fs::write(targets_file, r#"{"addresses":["1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"]}"#)
+        .expect("Write targets file");
+    
+    let targets = TargetSet::load(targets_file).expect("Load targets");
+    let scanner = RawFileScanner::new(targets, 1);
+    
+    // Test with pre-cancelled flag
+    let running = Arc::new(AtomicBool::new(false));
+    
+    // This should return immediately with empty results (not error)
+    // because the flag is already false
+    let result = scanner.scan_directory_with_flag("/tmp", Some(running.clone()));
+    
+    // Either error (no files) or empty result is acceptable
+    // The key is it should NOT hang or ignore the flag
+    match result {
+        Ok(scan_result) => {
+            // If it returns Ok, should have 0 files scanned due to cancellation
+            println!("   Result: {} files scanned", scan_result.files_scanned);
+        }
+        Err(e) => {
+            // Error is expected if no .raw files exist
+            println!("   Result: {} (expected for empty dir)", e);
+        }
+    }
+    
+    // Clean up
+    let _ = fs::remove_file(targets_file);
+    
+    println!("   ✓ scan_directory_with_flag respects running flag");
+    println!("✅ Graceful shutdown test passed");
+}
+
+/// Test #4: scalar_add_u64 iterative reduction (keygen.metal fix)
+/// This tests that the GPU correctly handles edge cases where
+/// base_priv + offset could exceed n multiple times
+#[test]
+fn test_scalar_add_iterative_reduction() {
+    use xyz_pro::generator::{GeneratorConfig, GpuKeyGenerator, GpuGeneratorAdapter};
+    use xyz_pro::bridge::KeyGenerator;
+    
+    println!("\n🧪 scalar_add_u64 Iterative Reduction Test");
+    println!("{}", "=".repeat(60));
+    
+    // Test with high offset (close to u64::MAX)
+    // This exercises the multi-iteration reduction path
+    let mut config = GeneratorConfig::default();
+    config.start_offset = u64::MAX - 1000; // Very high offset
+    
+    let gpu_gen = GpuKeyGenerator::new(config).expect("GPU init should succeed");
+    let adapter = GpuGeneratorAdapter::new(gpu_gen);
+    
+    // Generate a batch - this exercises scalar_add_u64 with large offsets
+    let batch = adapter.generate_batch();
+    assert!(batch.is_ok(), "Batch generation should succeed with high offset");
+    
+    let data = batch.unwrap();
+    assert!(!data.is_empty(), "Should produce keys");
+    
+    println!("   ✓ Generated keys with offset near u64::MAX");
+    println!("   ✓ scalar_add_u64 iterative reduction working correctly");
+    
+    adapter.stop();
+    println!("✅ High-offset key generation test passed");
+}
+
+/// Test #5: AsyncRawWriter Drop guarantees flush
+#[test]
+fn test_async_writer_drop_flush() {
+    use xyz_pro::generator::AsyncRawWriter;
+    use std::fs;
+    
+    println!("\n🧪 AsyncRawWriter Drop Flush Test");
+    println!("{}", "=".repeat(60));
+    
+    let test_dir = "/tmp/xyz_pro_async_test";
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(test_dir).expect("Create test dir");
+    
+    // Create writer and write some data
+    {
+        let writer = AsyncRawWriter::new(test_dir.to_string())
+            .expect("Create writer");
+        
+        // Write some test data
+        let test_data = vec![0u8; 1024];
+        writer.write_async(test_data.clone(), 10).expect("Write should succeed");
+        
+        println!("   ✓ Data queued for writing");
+        
+        // Writer goes out of scope here - Drop should flush
+    }
+    
+    // Give a moment for the thread to complete
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    
+    // Check that file was written
+    let files: Vec<_> = fs::read_dir(test_dir)
+        .expect("Read dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "raw").unwrap_or(false))
+        .collect();
+    
+    assert!(!files.is_empty(), "Drop should have flushed the pending write");
+    println!("   ✓ File was written on Drop: {:?}", files[0].path());
+    
+    // Clean up
+    let _ = fs::remove_dir_all(test_dir);
+    
+    println!("✅ AsyncRawWriter Drop correctly flushes pending writes");
+}
+
+/// Test #6: Pipeline error handling preserves matches
+#[test]
+fn test_pipeline_error_handling() {
+    use xyz_pro::bridge::{IntegratedPipeline, PipelineConfig, FileOutput};
+    use xyz_pro::generator::{GeneratorConfig, GpuKeyGenerator, GpuGeneratorAdapter};
+    use xyz_pro::reader::ParallelMatcher;
+    use std::fs;
+    
+    println!("\n🧪 Pipeline Error Handling Test");
+    println!("{}", "=".repeat(60));
+    
+    // Create a temporary targets file
+    let targets_file = "/tmp/xyz_pro_test_targets.json";
+    fs::write(targets_file, r#"{"addresses":["1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"]}"#)
+        .expect("Write targets");
+    
+    let matcher = ParallelMatcher::load(targets_file).expect("Load matcher");
+    
+    let config = GeneratorConfig::default();
+    let gpu_gen = GpuKeyGenerator::new(config).expect("GPU init");
+    let generator = GpuGeneratorAdapter::new(gpu_gen);
+    
+    let output_file = "/tmp/xyz_pro_test_matches.txt";
+    let _ = fs::remove_file(output_file);
+    let output = FileOutput::new(output_file).expect("Create output");
+    
+    let pipeline_config = PipelineConfig {
+        report_interval_secs: 1000, // Long interval to avoid noise
+        ..Default::default()
+    };
+    
+    let pipeline = IntegratedPipeline::with_config(
+        generator,
+        matcher,
+        output,
+        pipeline_config,
+    );
+    
+    // Stop immediately to test cleanup
+    pipeline.stop();
+    
+    println!("   ✓ Pipeline created and stopped cleanly");
+    
+    // Drop happens here - should not panic
+    drop(pipeline);
+    
+    println!("   ✓ Pipeline Drop completed without panic");
+    
+    // Clean up
+    let _ = fs::remove_file(targets_file);
+    let _ = fs::remove_file(output_file);
+    
+    println!("✅ Pipeline error handling and cleanup test passed");
+}

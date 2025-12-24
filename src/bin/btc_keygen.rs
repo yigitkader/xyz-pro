@@ -180,9 +180,22 @@ fn run_scan_mode(args: &[String]) {
     }
 }
 
+/// Parse string argument with support for short flags
+/// Maps common short flags to their long equivalents:
+/// - `-o` → `--output`
+/// - `-t` → `--targets` (in scan mode)
 fn parse_string_arg(args: &[String], name: &str) -> Option<String> {
+    // Define short flag mappings
+    let short_flag = match name {
+        "--output" => Some("-o"),
+        "--targets" => Some("-t"),
+        "--input" => Some("-i"),
+        "--format" => Some("-f"),
+        _ => None,
+    };
+    
     for i in 0..args.len().saturating_sub(1) {
-        if args[i] == name {
+        if args[i] == name || short_flag.map(|s| args[i] == s).unwrap_or(false) {
             return Some(args[i + 1].clone());
         }
     }

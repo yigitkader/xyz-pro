@@ -33,7 +33,7 @@ mod encoder;
 mod adapter;
 
 pub use targets::{TargetSet, TargetStats};
-pub use scanner::{RawFileScanner, ScanResult, Match, save_matches};
+pub use scanner::{RawFileScanner, ScanResult, Match, AddressType, save_matches};
 pub use encoder::AddressEncoder;
 // Singleton encoder functions (preferred API - zero allocation)
 pub use encoder::{encode_p2pkh, encode_p2sh, encode_p2wpkh};

@@ -7,7 +7,7 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use std::collections::HashSet;
@@ -134,6 +134,20 @@ impl RawFileScanner {
     
     /// Scan all .raw files in directory
     pub fn scan_directory<P: AsRef<Path>>(&self, dir: P) -> Result<ScanResult, String> {
+        // Use default running flag (always true) for backward compatibility
+        self.scan_directory_with_flag(dir, None)
+    }
+    
+    /// Scan all .raw files in directory with optional cancellation flag
+    /// 
+    /// # Graceful Shutdown
+    /// If `running` flag is provided and becomes false during scanning,
+    /// the scan will stop early and return partial results.
+    pub fn scan_directory_with_flag<P: AsRef<Path>>(
+        &self, 
+        dir: P,
+        running: Option<Arc<AtomicBool>>
+    ) -> Result<ScanResult, String> {
         let start = Instant::now();
         
         // Find all .raw files
@@ -151,12 +165,24 @@ impl RawFileScanner {
         println!("📁 Found {} .raw files to scan", files.len());
         
         let total_keys = AtomicU64::new(0);
+        let files_scanned = AtomicU64::new(0);
+        let was_cancelled = AtomicBool::new(false);
+        
         let all_matches: Vec<Match> = files
             .par_iter()
             .flat_map(|file| {
+                // Check cancellation flag before processing each file
+                if let Some(ref flag) = running {
+                    if !flag.load(Ordering::SeqCst) {
+                        was_cancelled.store(true, Ordering::SeqCst);
+                        return vec![];
+                    }
+                }
+                
                 match self.scan_file(file) {
                     Ok((count, matches)) => {
                         total_keys.fetch_add(count, Ordering::Relaxed);
+                        files_scanned.fetch_add(1, Ordering::Relaxed);
                         matches
                     }
                     Err(e) => {
@@ -169,8 +195,12 @@ impl RawFileScanner {
         
         let elapsed = start.elapsed().as_secs_f64();
         
+        if was_cancelled.load(Ordering::SeqCst) {
+            println!("⚠️  Scan interrupted - returning partial results");
+        }
+        
         Ok(ScanResult {
-            files_scanned: files.len(),
+            files_scanned: files_scanned.load(Ordering::Relaxed) as usize,
             keys_scanned: total_keys.load(Ordering::Relaxed),
             matches: all_matches,
             elapsed_secs: elapsed,
@@ -563,8 +593,64 @@ impl RawFileScanner {
     }
 }
 
-/// Save matches to JSON file
+/// Save matches to file (append mode to prevent data loss)
+/// 
+/// # Data Safety
+/// - Uses append mode to preserve existing matches
+/// - Each match is written as a single line (JSONL format)
+/// - sync_all() ensures data is physically written to disk
+/// - Prevents data loss even on repeated saves
+/// 
+/// # Format
+/// Each line is a complete JSON object for easy parsing and appending.
 pub fn save_matches<P: AsRef<Path>>(matches: &[Match], path: P) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::fs::OpenOptions;
+    
+    if matches.is_empty() {
+        return Ok(());
+    }
+    
+    // CRITICAL: Use append mode to prevent overwriting previous matches
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    
+    let mut writer = std::io::BufWriter::new(file);
+    
+    // Write header comment with timestamp (only if file is new/empty)
+    // Note: We use JSONL format - one JSON object per line
+    // This allows safe appending without corrupting JSON structure
+    
+    for m in matches {
+        // Each match is a complete JSON object on one line (JSONL format)
+        writeln!(
+            writer,
+            r#"{{"private_key":"{}","address":"{}","type":"{}","file":"{}","offset":{}}}"#,
+            m.private_key,
+            m.address,
+            m.address_type.as_str(),
+            m.file.as_str(),
+            m.offset
+        )?;
+    }
+    
+    // Ensure all buffered data is written to the file
+    writer.flush()?;
+    
+    // Sync to disk to prevent data loss on power failure/crash
+    let file = writer.into_inner()?;
+    file.sync_all()?;
+    
+    Ok(())
+}
+
+/// Save matches to JSON file (full JSON format, overwrites existing)
+/// 
+/// Use this when you need a complete JSON file, not append mode.
+#[allow(dead_code)]
+pub fn save_matches_json<P: AsRef<Path>>(matches: &[Match], path: P) -> std::io::Result<()> {
     use std::io::Write;
     
     let file = File::create(path)?;
@@ -579,13 +665,17 @@ pub fn save_matches<P: AsRef<Path>>(matches: &[Match], path: P) -> std::io::Resu
         writeln!(writer, "      \"private_key\": \"{}\",", m.private_key)?;
         writeln!(writer, "      \"address\": \"{}\",", m.address)?;
         writeln!(writer, "      \"type\": \"{}\",", m.address_type.as_str())?;
-        writeln!(writer, "      \"file\": \"{}\",", m.file.as_str())?; // Deref Arc<String>
+        writeln!(writer, "      \"file\": \"{}\",", m.file.as_str())?;
         writeln!(writer, "      \"offset\": {}", m.offset)?;
         writeln!(writer, "    }}{}", comma)?;
     }
     
     writeln!(writer, "  ]")?;
     writeln!(writer, "}}")?;
+    
+    writer.flush()?;
+    let file = writer.into_inner()?;
+    file.sync_all()?;
     
     Ok(())
 }
