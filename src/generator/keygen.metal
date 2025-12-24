@@ -119,17 +119,26 @@ inline uint rotl32(uint x, uint n) { return (x << n) | (x >> (32 - n)); }
 inline void scalar_add_u64(thread ulong4& s, ulong val) {
     ulong old = s.x;
     s.x += val;
+    bool overflow = false;
+    
     if (s.x < old) {
         old = s.y; s.y += 1;
         if (s.y < old) {
             old = s.z; s.z += 1;
             if (s.z < old) {
-                s.w += 1;
+                old = s.w; s.w += 1;
+                // CRITICAL FIX: Detect overflow beyond 256 bits
+                // If s.w wraps to 0, we've exceeded 2^256
+                if (s.w < old) {
+                    overflow = true;
+                }
             }
         }
     }
     
-    if (s.w > SECP256K1_N.w || 
+    // Reduce mod n if: overflow OR s >= n
+    if (overflow ||
+        s.w > SECP256K1_N.w || 
         (s.w == SECP256K1_N.w && s.z > SECP256K1_N.z) ||
         (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y > SECP256K1_N.y) ||
         (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x >= SECP256K1_N.x)) {

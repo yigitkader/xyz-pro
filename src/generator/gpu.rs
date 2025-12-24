@@ -800,13 +800,21 @@ impl GpuKeyGenerator {
                 }
             }
             
-            // Wait for GPU completion and get raw data
+            // PIPELINE FIX: Dispatch NEXT batch BEFORE waiting for current
+            // This enables true GPU-CPU parallelism
             let process_idx = current_buf % depth;
-            let bs = &self.buffer_sets[process_idx];
+            let next_idx = (current_buf + 1) % depth;
             
-            // FIXED: Wait for the ACTUAL dispatched command buffer
-            // Previously this created an empty buffer which was an anti-pattern
+            // 1. DISPATCH NEXT: Start GPU work immediately (async)
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            self.dispatch_batch(next_idx, next_offset)?;
+            
+            // 2. WAIT FOR CURRENT: Now wait for the batch we're about to process
             self.wait_for_completion(process_idx);
+            
+            let bs = &self.buffer_sets[process_idx];
             
             // Direct copy from GPU buffer (zero-copy on unified memory)
             let output_ptr = bs.output_buffer.contents() as *const u8;
@@ -819,14 +827,7 @@ impl GpuKeyGenerator {
             pending_keys += self.tier.keys_per_dispatch;
             self.total_generated.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
             
-            // LOOK-AHEAD: Pre-compute next pubkey
-            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            let next_privkey = Self::offset_to_privkey(next_offset);
-            self.precompute_pubkey(&next_privkey);
-            
-            // Dispatch next batch
-            self.dispatch_batch(process_idx, next_offset)?;
-            
+            // Next batch already dispatched - true pipelining!
             current_buf += 1;
             
             // Async write when buffer is full
@@ -942,12 +943,25 @@ impl GpuKeyGenerator {
         let mut current_buf = 0;
         
         while !self.should_stop.load(Ordering::SeqCst) {
-            let process_idx = current_buf % depth;
-            let bs = &self.buffer_sets[process_idx];
+            // PIPELINE FIX: Dispatch NEXT batch BEFORE waiting for current
+            // This enables true GPU-CPU parallelism:
+            // - GPU works on next batch
+            // - CPU processes current batch
+            // - No idle time on either side!
             
-            // FIXED: Wait for the ACTUAL dispatched command buffer
-            // Previously this created an empty buffer which was an anti-pattern
+            let process_idx = current_buf % depth;
+            let next_idx = (current_buf + 1) % depth;
+            
+            // 1. DISPATCH NEXT: Start GPU work immediately (async)
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            self.dispatch_batch_glv(next_idx, next_offset)?;
+            
+            // 2. WAIT FOR CURRENT: Now wait for the batch we're about to process
             self.wait_for_completion(process_idx);
+            
+            let bs = &self.buffer_sets[process_idx];
             
             // ZERO-COPY: Direct access to GPU buffer via Unified Memory
             // GLV outputs 2x keys per dispatch
@@ -1019,12 +1033,7 @@ impl GpuKeyGenerator {
             // GLV: 2 keys per EC operation
             self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
             
-            // LOOK-AHEAD: Dispatch next batch while CPU is matching
-            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            let next_privkey = Self::offset_to_privkey(next_offset);
-            self.precompute_pubkey(&next_privkey);
-            self.dispatch_batch_glv(process_idx, next_offset)?;
-            
+            // Next batch already dispatched at loop start - true pipelining!
             current_buf += 1;
             
             // Progress report

@@ -199,26 +199,67 @@ impl RawFileScanner {
             return Err("Invalid magic bytes".to_string());
         }
         
-        // Check version (offset 4, 1 byte)
-        let version = mmap[4];
-        if version == 0 {
-            // Legacy format (v0): magic(4) + count(8) = 12 bytes
-            // For backward compatibility with old files
+        // ROBUST FORMAT DETECTION: Use filesize validation, not just version byte
+        // This prevents ambiguity when legacy count's first byte equals a valid version
+        //
+        // Legacy (v0): magic(4) + count(8) = 12 bytes header
+        // V1:          magic(4) + version(1) + reserved(3) + count(8) = 16 bytes header
+        
+        let file_size = mmap.len();
+        
+        // Try v1 format first (more strict validation)
+        let v1_valid = if file_size >= HEADER_SIZE {
+            let version = mmap[4];
+            let reserved_ok = mmap[5] == 0 && mmap[6] == 0 && mmap[7] == 0;
+            let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
+            let expected = HEADER_SIZE + (count as usize * ENTRY_SIZE);
+            
+            version == FORMAT_VERSION && reserved_ok && file_size == expected
+        } else {
+            false
+        };
+        
+        // Try legacy format
+        let legacy_valid = if file_size >= 12 {
             let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
-            let expected_size = 12 + (count as usize * ENTRY_SIZE);
-            if mmap.len() >= expected_size {
-                // This looks like a legacy file, process it
-                return self.scan_file_legacy(path, &mmap, count);
-            }
+            let expected = 12 + (count as usize * ENTRY_SIZE);
+            
+            file_size == expected
+        } else {
+            false
+        };
+        
+        // Choose format based on exact match
+        if v1_valid && legacy_valid {
+            // Ambiguous - prefer v1 (newer)
+            // This should be rare; log a warning
+            eprintln!("⚠️ File '{}' matches both v0 and v1 format, using v1", path.display());
         }
         
-        if version > FORMAT_VERSION {
+        if legacy_valid && !v1_valid {
+            // Legacy format
+            let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
+            return self.scan_file_legacy(path, &mmap, count);
+        }
+        
+        if !v1_valid && !legacy_valid {
+            // Try relaxed v1 (count within reasonable bounds but not exact match)
+            if file_size >= HEADER_SIZE {
+                let version = mmap[4];
+                if version > FORMAT_VERSION {
+                    return Err(format!(
+                        "Unsupported file version {} (max supported: {}). Please update the software.",
+                        version, FORMAT_VERSION
+                    ));
+                }
+            }
             return Err(format!(
-                "Unsupported file version {} (max supported: {}). Please update the software.",
-                version, FORMAT_VERSION
+                "Invalid file format: size {} doesn't match expected header+data layout",
+                file_size
             ));
         }
         
+        // V1 format - already validated above
         // Check reserved bytes are zero (offset 5-7)
         if mmap[5] != 0 || mmap[6] != 0 || mmap[7] != 0 {
             return Err("Invalid header: reserved bytes must be zero".to_string());
@@ -228,6 +269,7 @@ impl RawFileScanner {
         let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
         let expected_size = HEADER_SIZE + (count as usize * ENTRY_SIZE);
         
+        // This should always pass since we validated above, but keep for safety
         if mmap.len() < expected_size {
             return Err(format!("File truncated: expected {}, got {}", expected_size, mmap.len()));
         }
