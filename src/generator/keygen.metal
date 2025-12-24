@@ -295,16 +295,18 @@ ulong4 mod_mul(ulong4 a, ulong4 b) {
             r[i + j] = add_with_carry(r[i + j], lo, 0, &c1);
             
             // Three-way add: r[i+j+1] += hi + c1 + c
+            // CARRY SAFETY: c2 and c3 are each 0 or 1
+            // Combined carry c = c2 + c3 can be 0, 1, or 2 - this is safe
             ulong c2, c3;
             r[i + j + 1] = add_with_carry(r[i + j + 1], hi, c1, &c2);
             r[i + j + 1] = add_with_carry(r[i + j + 1], c, 0, &c3);
-            c = c2 + c3;  // Combined carry (0, 1, or 2)
+            c = c2 + c3;
         }
-        // Propagate remaining carry
+        // Propagate remaining carry (c can be 0, 1, or 2 entering this loop)
         for (int k = i + 4; k < 8 && c; k++) {
             ulong ck;
             r[k] = add_with_carry(r[k], c, 0, &ck);
-            c = ck;
+            c = ck;  // After add_with_carry, ck is always 0 or 1
         }
     }
     return secp256k1_reduce(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
@@ -731,16 +733,22 @@ ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
             r[i + j] = add_with_carry(r[i + j], lo, 0, &c1);
             
             // r[i+j+1] += hi + c1 + c (three-way add, safely decomposed)
+            // CARRY SAFETY: c2 and c3 are each 0 or 1
+            // Combined carry c = c2 + c3 can be 0, 1, or 2
+            // add_with_carry handles any ulong value correctly, so this is safe
             ulong c2, c3;
             r[i + j + 1] = add_with_carry(r[i + j + 1], hi, c1, &c2);
             r[i + j + 1] = add_with_carry(r[i + j + 1], c, 0, &c3);
-            c = c2 + c3;  // Combined carry (can be 0, 1, or 2)
+            // c can now be 0, 1, or 2 - this is mathematically correct
+            // and add_with_carry in the propagation loop handles it properly
+            c = c2 + c3;
         }
         // Propagate remaining carry through higher words
+        // Note: c can be 0, 1, or 2 entering this loop - all values are handled correctly
         for (int k = i + 4; k < 8 && c; k++) {
             ulong ck;
             r[k] = add_with_carry(r[k], c, 0, &ck);
-            c = ck;
+            c = ck;  // After add_with_carry, ck is always 0 or 1
         }
     }
     

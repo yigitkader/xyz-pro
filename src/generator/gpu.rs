@@ -317,26 +317,21 @@ impl GpuTier {
             }
         };
         
-        // Get free memory - use simpler sysctl approach for reliability
-        // host_statistics64 has complex struct alignment issues
+        // Get available memory including inactive pages that can be reclaimed
+        // macOS marks disk cache as "inactive" - it's immediately reclaimable
         let free_ram: u64 = {
-            // Use a conservative estimate: total_ram * available_fraction
-            // On macOS, typically 30-50% of RAM is available for new allocations
-            // We use 40% as a safe estimate
-            let estimated_free = total_ram * 40 / 100;
+            let page_size: u64 = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
             
-            // Try to get actual value from sysctl if available
-            // vm.page_free_count * page_size gives free pages
-            let actual_free: u64 = unsafe {
-                let page_size = libc::sysconf(libc::_SC_PAGESIZE) as u64;
-                
-                // Try to get free page count via sysctl
-                let mut free_pages: u32 = 0;
-                let mut size: libc::size_t = mem::size_of::<u32>();
-                
-                // "vm.page_free_count" 
+            // Try to get free + inactive page counts via sysctl
+            let mut free_pages: u32 = 0;
+            let mut inactive_pages: u32 = 0;
+            let mut speculative_pages: u32 = 0;
+            let mut size: libc::size_t = mem::size_of::<u32>();
+            
+            unsafe {
+                // Free pages - immediately available
                 let name = std::ffi::CString::new("vm.page_free_count").unwrap();
-                let result = libc::sysctlbyname(
+                let _ = libc::sysctlbyname(
                     name.as_ptr(),
                     &mut free_pages as *mut _ as *mut libc::c_void,
                     &mut size,
@@ -344,19 +339,39 @@ impl GpuTier {
                     0,
                 );
                 
-                if result == 0 && free_pages > 0 {
-                    free_pages as u64 * page_size
-                } else {
-                    // Fallback to estimate
-                    estimated_free
-                }
-            };
+                // Inactive pages - reclaimable disk cache
+                size = mem::size_of::<u32>();
+                let name = std::ffi::CString::new("vm.page_inactive_count").unwrap();
+                let _ = libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut inactive_pages as *mut _ as *mut libc::c_void,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                
+                // Speculative pages - prefetched, immediately reclaimable
+                size = mem::size_of::<u32>();
+                let name = std::ffi::CString::new("vm.page_speculative_count").unwrap();
+                let _ = libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut speculative_pages as *mut _ as *mut libc::c_void,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                );
+            }
             
-            // Sanity check: free RAM should be less than total RAM
-            if actual_free > 0 && actual_free < total_ram {
-                actual_free
+            // Available = free + inactive + speculative (all are reclaimable)
+            let available_pages = free_pages as u64 + inactive_pages as u64 + speculative_pages as u64;
+            let available_bytes = available_pages * page_size;
+            
+            // Sanity check: available RAM should be less than total RAM
+            if available_bytes > 0 && available_bytes < total_ram {
+                available_bytes
             } else {
-                estimated_free
+                // Fallback: assume 50% of total is available
+                total_ram / 2
             }
         };
         
@@ -1150,13 +1165,18 @@ impl GpuKeyGenerator {
         let mut async_writer = AsyncRawWriter::new(self.config.output_dir.clone())
             .map_err(|e| format!("Failed to create async writer: {}", e))?;
         
-        println!("🚀 NASA-GRADE RAW OUTPUT MODE");
+        // GLV mode: 2 keys per EC operation (consistent with run_scan)
+        let keys_per_dispatch = self.tier.keys_per_dispatch * 2;
+        let output_size_per_dispatch = keys_per_dispatch * OUTPUT_SIZE;
+        
+        println!("🚀 NASA-GRADE RAW OUTPUT MODE + GLV ENDOMORPHISM");
         println!("   ✓ Zero CPU processing");
         println!("   ✓ Async I/O thread (GPU never waits)");
         println!("   ✓ Memory-mapped files (mmap)");
         println!("   ✓ Direct GPU buffer dump");
+        println!("   ✓ GLV Endomorphism: 2x throughput (2 keys per EC op)");
         println!("   Pipeline depth: {}", self.tier.pipeline_depth);
-        println!("   Keys per dispatch: {}", self.tier.keys_per_dispatch);
+        println!("   Keys per dispatch: {} [GLV: 2x]", keys_per_dispatch);
         println!("   Output: 72 bytes/key (privkey:32 + hash160:20 + p2sh:20)");
         println!();
         
@@ -1164,9 +1184,8 @@ impl GpuKeyGenerator {
         let report_interval = Duration::from_secs(2);
         
         let depth = self.tier.pipeline_depth;
-        let output_size_per_dispatch = self.tier.keys_per_dispatch * OUTPUT_SIZE;
         
-        // Prime the pipeline
+        // Prime the pipeline with GLV kernel (consistent with run_scan)
         for i in 0..depth {
             if let Some(target) = target_keys {
                 if self.total_generated.load(Ordering::Relaxed) >= target {
@@ -1175,7 +1194,7 @@ impl GpuKeyGenerator {
             }
             
             let offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            self.dispatch_batch(i, offset)?;
+            self.dispatch_batch_glv(i, offset)?;
         }
         
         let mut current_buf = 0;
@@ -1201,31 +1220,29 @@ impl GpuKeyGenerator {
                 }
             }
             
-            // PIPELINE FIX: Dispatch NEXT batch BEFORE waiting for current
-            // This enables true GPU-CPU parallelism
+            // CORRECT PIPELINE: wait → read → dispatch (same buffer)
+            // 
+            // Buffer lifecycle: GPU_WORKING → WAIT → CPU_READ → GPU_WORKING (new data)
+            // 
+            // With depth=4, at any time:
+            // - 3 buffers are GPU_WORKING (primed in advance)
+            // - 1 buffer is being processed by CPU
+            //
+            // CRITICAL FIX: Previously dispatched to next_idx which was still GPU_WORKING!
+            // Now we dispatch to process_idx AFTER reading, which is guaranteed to be free.
             let process_idx = current_buf % depth;
-            let next_idx = (current_buf + 1) % depth;
             
-            // 1. DISPATCH NEXT: Start GPU work immediately (async)
-            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            let next_privkey = Self::offset_to_privkey(next_offset);
-            self.precompute_pubkey(&next_privkey);
-            self.dispatch_batch(next_idx, next_offset)?;
-            
-            // 2. WAIT FOR CURRENT: Now wait for the batch we're about to process
-            // Check for GPU errors (OutOfMemory, PageFault, etc.)
+            // 1. WAIT: Ensure GPU has finished with this buffer
             if let Err(e) = self.wait_for_completion(process_idx) {
                 return Err(format!("GPU batch processing failed: {}", e));
             }
             
             let bs = &self.buffer_sets[process_idx];
             
-            // RACE CONDITION PREVENTION: Mark buffer as in-use while reading
-            // This prevents GPU from dispatching to this buffer via in_use spin-wait
+            // 2. READ: Mark buffer as in-use while CPU reads
             bs.in_use.store(true, Ordering::Release);
             
             // Direct copy from GPU buffer (zero-copy on unified memory)
-            // Memory fence is implicit in wait_until_completed + Ordering::Release
             let output_ptr = bs.output_buffer.contents() as *const u8;
             let output_slice = unsafe {
                 std::slice::from_raw_parts(output_ptr, output_size_per_dispatch)
@@ -1234,13 +1251,23 @@ impl GpuKeyGenerator {
             // Accumulate raw data
             raw_buffer.extend_from_slice(output_slice);
             
-            // Mark buffer as available for next dispatch
+            // GLV produces 2x keys per dispatch
+            pending_keys += keys_per_dispatch;
+            self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
+            
+            // 3. DISPATCH: Now buffer is free, dispatch new work to SAME buffer
+            // This maintains pipeline depth while avoiding race condition
+            // Note: Offset increments by base keys (not 2x) because GLV uses λ*k space
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            
+            // Mark buffer as available BEFORE dispatch (CPU read complete)
             bs.in_use.store(false, Ordering::Release);
             
-            pending_keys += self.tier.keys_per_dispatch;
-            self.total_generated.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            // Dispatch to the SAME buffer we just read from (GLV mode)
+            self.dispatch_batch_glv(process_idx, next_offset)?;
             
-            // Next batch already dispatched - true pipelining!
             current_buf += 1;
             
             // Async write when buffer is full (either memory limit or file limit)
@@ -1360,28 +1387,23 @@ impl GpuKeyGenerator {
         let mut current_buf = 0;
         
         while !self.should_stop.load(Ordering::SeqCst) {
-            // PIPELINE FIX: Dispatch NEXT batch BEFORE waiting for current
-            // This enables true GPU-CPU parallelism:
-            // - GPU works on next batch
-            // - CPU processes current batch
-            // - No idle time on either side!
-            
+            // CORRECT PIPELINE: wait → read/process → dispatch (same buffer)
+            // 
+            // Buffer lifecycle: GPU_WORKING → WAIT → CPU_PROCESS → GPU_WORKING (new data)
+            // 
+            // CRITICAL FIX: Previously dispatched to next_idx which was still GPU_WORKING!
+            // Now we dispatch to process_idx AFTER processing, which is guaranteed to be free.
             let process_idx = current_buf % depth;
-            let next_idx = (current_buf + 1) % depth;
             
-            // 1. DISPATCH NEXT: Start GPU work immediately (async)
-            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            let next_privkey = Self::offset_to_privkey(next_offset);
-            self.precompute_pubkey(&next_privkey);
-            self.dispatch_batch_glv(next_idx, next_offset)?;
-            
-            // 2. WAIT FOR CURRENT: Now wait for the batch we're about to process
-            // Check for GPU errors (OutOfMemory, PageFault, etc.)
+            // 1. WAIT: Ensure GPU has finished with this buffer
             if let Err(e) = self.wait_for_completion(process_idx) {
                 return Err(format!("GPU batch processing failed: {}", e));
             }
             
             let bs = &self.buffer_sets[process_idx];
+            
+            // 2. PROCESS: Mark buffer as in-use while CPU processes
+            bs.in_use.store(true, Ordering::Release);
             
             // ZERO-COPY: Direct access to GPU buffer via Unified Memory
             // GLV outputs 2x keys per dispatch
@@ -1453,7 +1475,17 @@ impl GpuKeyGenerator {
             // GLV: 2 keys per EC operation
             self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
             
-            // Next batch already dispatched at loop start - true pipelining!
+            // 3. DISPATCH: Now buffer is free, dispatch new work to SAME buffer
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            
+            // Mark buffer as available BEFORE dispatch (CPU processing complete)
+            bs.in_use.store(false, Ordering::Release);
+            
+            // Dispatch to the SAME buffer we just processed
+            self.dispatch_batch_glv(process_idx, next_offset)?;
+            
             current_buf += 1;
             
             // Progress report
