@@ -57,11 +57,15 @@ struct CachedTargets {
 
 /// Fast target lookup using FxHashSet (~3x faster than default)
 /// When xor-filter feature is enabled, uses Xor8 for 10x faster negative lookups
+/// 
+/// **Optimized for 50M+ targets:**
+/// - No string storage (saves ~2GB for 50M addresses)
+/// - Pre-allocated HashSets
+/// - XOR filters for fast negative lookups
 pub struct TargetSet {
-    /// All addresses as strings for direct lookup
-    addresses: HashSet<String>,
     /// Hash160 lookups for P2PKH/P2WPKH (decoded from address)
     /// Uses FxHash for faster lookup on fixed-size keys
+    /// Memory: 50M × 20 bytes = 1GB + HashSet overhead (~50%) = 1.5GB
     hash160_set: FxHashSet<[u8; 20]>,
     /// P2SH script hashes
     /// Uses FxHash for faster lookup on fixed-size keys
@@ -69,6 +73,7 @@ pub struct TargetSet {
     
     /// XOR Filter for hash160 - ultra-fast negative lookup
     /// False positive rate ~0.4%, but HashSet confirms positives
+    /// Memory: 50M × 1.23 bytes = 61MB (very efficient!)
     #[cfg(feature = "xor-filter")]
     hash160_xor: Option<Xor8>,
     
@@ -182,11 +187,7 @@ impl TargetSet {
         #[cfg(feature = "xor-filter")]
         println!("   ✓ XOR Filter enabled (10x faster negative lookups)");
         
-        // Create empty addresses set (not needed for matching, saves memory)
-        let addresses = HashSet::new();
-        
         Some(Self {
-            addresses,
             hash160_set,
             p2sh_set,
             #[cfg(feature = "xor-filter")]
@@ -254,19 +255,40 @@ impl TargetSet {
     }
     
     /// Load targets directly from JSON (no cache)
+    /// 
+    /// **Optimized for 50M+ targets:**
+    /// - Pre-allocated HashSets (avoids rehashing during growth)
+    /// - No string storage (saves ~2GB memory)
+    /// - Progress reporting every 500K addresses
+    /// - Memory estimate: 50M targets ≈ 1.5GB RAM
     fn load_from_json(path: &Path) -> Result<Self, String> {
         let start = Instant::now();
         let file = File::open(path)
             .map_err(|e| format!("Failed to open targets file: {}", e))?;
         
-        let reader = BufReader::with_capacity(64 * 1024 * 1024, file); // 64MB buffer
-        
-        let mut addresses = HashSet::new();
-        let mut hash160_set: FxHashSet<[u8; 20]> = FxHashSet::default();
-        let mut p2sh_set: FxHashSet<[u8; 20]> = FxHashSet::default();
-        let mut stats = TargetStats::default();
+        // Estimate target count from file size (~45 bytes per address on average)
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let estimated_count = (file_size / 45) as usize;
+        let initial_capacity = estimated_count.max(1_000_000); // At least 1M
         
         println!("📂 Parsing targets from JSON (first run, will cache)...");
+        println!("   File size: {:.1} MB, estimated targets: ~{}",
+                 file_size as f64 / (1024.0 * 1024.0),
+                 format_count(estimated_count));
+        println!("   Pre-allocating {} capacity for HashSets...", format_count(initial_capacity));
+        
+        let reader = BufReader::with_capacity(128 * 1024 * 1024, file); // 128MB buffer for large files
+        
+        // Pre-allocate HashSets to avoid rehashing during growth
+        // This is CRITICAL for 50M+ targets - rehashing is O(n) each time
+        let mut hash160_set: FxHashSet<[u8; 20]> = FxHashSet::default();
+        hash160_set.reserve(initial_capacity);
+        
+        let mut p2sh_set: FxHashSet<[u8; 20]> = FxHashSet::default();
+        p2sh_set.reserve(initial_capacity / 10); // P2SH typically fewer
+        
+        let mut stats = TargetStats::default();
+        let mut last_progress = Instant::now();
         
         // Parse JSON - handles both compact and multi-line formats
         for line in reader.lines() {
@@ -282,55 +304,58 @@ impl TargetSet {
                 }
             
                 // Classify and store - only count if decode succeeds
+                // NOTE: We don't store the address string - saves ~2GB for 50M targets!
                 if addr.starts_with('1') {
                     if let Some(hash) = decode_p2pkh(&addr) {
                         hash160_set.insert(hash);
                         stats.p2pkh += 1;
-                    } else {
-                        eprintln!("   ⚠️ Failed to decode P2PKH address (skipped): {}", addr);
-                        continue;
+                        stats.total += 1;
                     }
+                    // Silently skip invalid addresses for performance
                 } else if addr.starts_with('3') {
                     if let Some(hash) = decode_p2sh(&addr) {
                         p2sh_set.insert(hash);
                         stats.p2sh += 1;
-                    } else {
-                        eprintln!("   ⚠️ Failed to decode P2SH address (skipped): {}", addr);
-                        continue;
+                        stats.total += 1;
                     }
                 } else if addr.starts_with("bc1q") {
                     if addr.len() <= 44 {
-                        // Only count as P2WPKH if decode succeeds
-                        match decode_bech32(&addr) {
-                            Some(hash) => { 
-                                hash160_set.insert(hash);
-                                stats.p2wpkh += 1;
-                            }
-                            None => {
-                                // Log decode failures - important for debugging invalid target addresses
-                                // Don't increment stats for failed decodes
-                                eprintln!("   ⚠️ Failed to decode bech32 address (skipped): {}", addr);
-                                continue; // Skip this invalid address entirely
-                            }
+                        if let Some(hash) = decode_bech32(&addr) {
+                            hash160_set.insert(hash);
+                            stats.p2wpkh += 1;
+                            stats.total += 1;
                         }
                     } else {
                         stats.p2wsh += 1;
+                        stats.total += 1;
                     }
                 }
-            
-                addresses.insert(addr.to_string());
-                stats.total += 1;
                 
-                // Progress
-                if stats.total % 1_000_000 == 0 {
-                    println!("   Loaded {} addresses...", stats.total);
+                // Progress every 500K or every 2 seconds
+                if stats.total % 500_000 == 0 || last_progress.elapsed().as_secs() >= 2 {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let rate = stats.total as f64 / elapsed;
+                    let remaining = if rate > 0.0 {
+                        (estimated_count.saturating_sub(stats.total)) as f64 / rate
+                    } else {
+                        0.0
+                    };
+                    println!("   {} loaded ({:.1} addr/sec, ETA: {:.0}s)", 
+                             format_count(stats.total), rate, remaining);
+                    last_progress = Instant::now();
                 }
             }
         }
         
+        // Shrink to fit after loading (release unused capacity)
+        hash160_set.shrink_to_fit();
+        p2sh_set.shrink_to_fit();
+        
         // Build XOR filters if feature enabled
         #[cfg(feature = "xor-filter")]
         let (hash160_xor, p2sh_xor) = {
+            println!("   Building XOR filters for {} + {} hashes...", 
+                     format_count(hash160_set.len()), format_count(p2sh_set.len()));
             let xor_start = Instant::now();
             
             // Convert [u8; 20] to u64 keys for XOR filter
@@ -359,17 +384,27 @@ impl TargetSet {
         
         stats.load_time_ms = start.elapsed().as_millis() as u64;
         
-        println!("✅ Parsed {} targets in {}ms", stats.total, stats.load_time_ms);
+        // Memory usage estimate
+        let hash160_mem = hash160_set.len() * 20 * 3 / 2; // ~1.5x for HashSet overhead
+        let p2sh_mem = p2sh_set.len() * 20 * 3 / 2;
+        let total_mem_mb = (hash160_mem + p2sh_mem) as f64 / (1024.0 * 1024.0);
+        
+        println!("✅ Parsed {} targets in {:.1}s", format_count(stats.total), stats.load_time_ms as f64 / 1000.0);
         println!("   P2PKH: {}, P2SH: {}, P2WPKH: {}, P2WSH: {}", 
-                 stats.p2pkh, stats.p2sh, stats.p2wpkh, stats.p2wsh);
-        println!("   Hash160 set: {} entries", hash160_set.len());
-        println!("   P2SH set: {} entries", p2sh_set.len());
+                 format_count(stats.p2pkh), format_count(stats.p2sh), 
+                 format_count(stats.p2wpkh), format_count(stats.p2wsh));
+        println!("   Hash160 set: {} entries", format_count(hash160_set.len()));
+        println!("   P2SH set: {} entries", format_count(p2sh_set.len()));
+        println!("   Estimated memory: {:.1} MB", total_mem_mb);
         
         #[cfg(feature = "xor-filter")]
-        println!("   ✓ XOR Filter enabled (10x faster negative lookups)");
+        {
+            let xor_mem = (hash160_set.len() + p2sh_set.len()) as f64 * 1.23 / (1024.0 * 1024.0);
+            println!("   XOR filter memory: {:.1} MB", xor_mem);
+            println!("   ✓ XOR Filter enabled (10x faster negative lookups)");
+        }
         
         Ok(Self {
-            addresses,
             hash160_set,
             p2sh_set,
             #[cfg(feature = "xor-filter")]
@@ -380,10 +415,18 @@ impl TargetSet {
         })
     }
     
-    /// Check if address string exists in targets
-    #[inline]
-    pub fn contains_address(&self, addr: &str) -> bool {
-        self.addresses.contains(addr)
+    /// Get memory usage estimate in bytes
+    pub fn memory_usage(&self) -> usize {
+        let hash160_mem = self.hash160_set.len() * 20 * 3 / 2;
+        let p2sh_mem = self.p2sh_set.len() * 20 * 3 / 2;
+        
+        #[cfg(feature = "xor-filter")]
+        let xor_mem = (self.hash160_set.len() + self.p2sh_set.len()) * 123 / 100;
+        
+        #[cfg(not(feature = "xor-filter"))]
+        let xor_mem = 0;
+        
+        hash160_mem + p2sh_mem + xor_mem
     }
     
     /// Check if hash160 exists (for P2PKH and P2WPKH)
@@ -659,6 +702,19 @@ fn extract_addresses_from_line(line: &str) -> Vec<String> {
     }
     
     addresses
+}
+
+/// Format large numbers with K/M/B suffixes for readability
+fn format_count(n: usize) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 #[cfg(test)]
