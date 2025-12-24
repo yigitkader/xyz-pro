@@ -199,20 +199,84 @@ impl GpuTier {
     fn detect(device: &Device) -> Self {
         let name = device.name().to_string();
         let name_lower = name.to_lowercase();
-        let mem_mb = device.recommended_max_working_set_size() / (1024 * 1024);
+        let gpu_mem_mb = device.recommended_max_working_set_size() / (1024 * 1024);
         
-        let (threads, pipeline_depth, pool_size) = if name_lower.contains("ultra") || mem_mb >= 96000 {
-            println!("[GPU] ULTRA tier: maximum throughput");
-            (262_144, 4, 8)
-        } else if name_lower.contains("max") || mem_mb >= 48000 {
-            println!("[GPU] MAX tier: high throughput");
+        // Get available system RAM to prevent swap/memory pressure
+        let (total_ram_mb, free_ram_mb) = Self::get_system_memory();
+        
+        println!("[GPU] System RAM: {} MB total, {} MB free", total_ram_mb, free_ram_mb);
+        println!("[GPU] GPU recommended working set: {} MB", gpu_mem_mb);
+        
+        // Determine base tier from GPU capabilities
+        let (base_threads, base_depth, base_pool) = if name_lower.contains("ultra") || gpu_mem_mb >= 96000 {
+            println!("[GPU] ULTRA tier detected");
+            (262_144usize, 4usize, 8usize)
+        } else if name_lower.contains("max") || gpu_mem_mb >= 48000 {
+            println!("[GPU] MAX tier detected");
             (131_072, 4, 6)
-        } else if name_lower.contains("pro") || mem_mb >= 16000 {
-            println!("[GPU] PRO tier: balanced");
+        } else if name_lower.contains("pro") || gpu_mem_mb >= 16000 {
+            println!("[GPU] PRO tier detected");
             (65_536, 3, 5)
         } else {
-            println!("[GPU] BASE tier: conservative");
+            println!("[GPU] BASE tier detected");
             (32_768, 2, 4)
+        };
+        
+        // Calculate memory requirements per buffer set
+        // Output buffer: threads * BATCH_SIZE * OUTPUT_SIZE * 2 (GLV)
+        let keys_per_dispatch = base_threads * BATCH_SIZE as usize;
+        let output_buffer_mb = (keys_per_dispatch * OUTPUT_SIZE * 2) / (1024 * 1024);
+        let total_buffer_mb = output_buffer_mb * base_depth;
+        
+        // Reserve memory for other processes: AsyncRawWriter, Rayon, OS overhead
+        // Rule: Keep at least 2GB free OR 25% of total RAM, whichever is larger
+        let min_free_mb = std::cmp::max(2048, total_ram_mb / 4);
+        let available_for_gpu = free_ram_mb.saturating_sub(min_free_mb);
+        
+        println!("[GPU] Buffer requirements: {} MB per set × {} sets = {} MB total",
+                 output_buffer_mb, base_depth, total_buffer_mb);
+        println!("[GPU] Available for GPU after reserve: {} MB (keeping {} MB free)",
+                 available_for_gpu, min_free_mb);
+        
+        // Dynamically adjust tier if memory is insufficient
+        let (threads, pipeline_depth, pool_size) = if total_buffer_mb as u64 <= available_for_gpu {
+            // Enough memory - use full tier
+            println!("[GPU] ✅ Memory sufficient, using full tier configuration");
+            (base_threads, base_depth, base_pool)
+        } else {
+            // Memory constrained - reduce configuration
+            println!("[GPU] ⚠️  Memory constrained, adjusting configuration...");
+            
+            // Strategy: First reduce pipeline_depth, then reduce threads
+            let mut adj_depth = base_depth;
+            let mut adj_threads = base_threads;
+            let mut adj_pool = base_pool;
+            
+            // Try reducing pipeline depth first (cheaper than reducing threads)
+            while adj_depth > 2 {
+                let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * 2 * adj_depth) / (1024 * 1024);
+                if (adj_buffer_mb as u64) <= available_for_gpu {
+                    break;
+                }
+                adj_depth -= 1;
+                adj_pool = std::cmp::max(adj_pool.saturating_sub(1), 3);
+            }
+            
+            // If still not enough, reduce threads
+            while adj_threads > 16_384 {
+                let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * 2 * adj_depth) / (1024 * 1024);
+                if (adj_buffer_mb as u64) <= available_for_gpu {
+                    break;
+                }
+                adj_threads /= 2;
+                adj_pool = std::cmp::max(adj_pool.saturating_sub(1), 3);
+            }
+            
+            let final_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * 2 * adj_depth) / (1024 * 1024);
+            println!("[GPU] Adjusted: {} threads, {} depth, {} pool ({} MB)",
+                     adj_threads, adj_depth, adj_pool, final_buffer_mb);
+            
+            (adj_threads, adj_depth, adj_pool)
         };
         
         let keys_per_dispatch = threads * BATCH_SIZE as usize;
@@ -225,6 +289,110 @@ impl GpuTier {
             pipeline_depth,
             pool_size,
         }
+    }
+    
+    /// Get system memory information (total and free) in MB
+    /// Uses macOS sysctl/mach APIs via libc
+    #[cfg(target_os = "macos")]
+    fn get_system_memory() -> (u64, u64) {
+        use std::mem;
+        
+        // Get total physical memory
+        let total_ram: u64 = unsafe {
+            let mut size: libc::size_t = mem::size_of::<u64>();
+            let mut total: u64 = 0;
+            let mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+            if libc::sysctl(
+                mib.as_ptr() as *mut _,
+                2,
+                &mut total as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0 {
+                total
+            } else {
+                // Fallback: assume 8GB
+                8 * 1024 * 1024 * 1024
+            }
+        };
+        
+        // Get free memory using host_statistics64
+        let free_ram: u64 = unsafe {
+            #[allow(deprecated)] // mach_host_self works fine, mach2 crate not worth the dependency
+            let host_port = libc::mach_host_self();
+            
+            // vm_statistics64 structure
+            #[repr(C)]
+            struct VmStatistics64 {
+                free_count: u64,
+                active_count: u64,
+                inactive_count: u64,
+                wire_count: u64,
+                zero_fill_count: u64,
+                reactivations: u64,
+                pageins: u64,
+                pageouts: u64,
+                faults: u64,
+                cow_faults: u64,
+                lookups: u64,
+                hits: u64,
+                purges: u64,
+                purgeable_count: u64,
+                speculative_count: u64,
+                decompressions: u64,
+                compressions: u64,
+                swapins: u64,
+                swapouts: u64,
+                compressor_page_count: u64,
+                throttled_count: u64,
+                external_page_count: u64,
+                internal_page_count: u64,
+                total_uncompressed_pages_in_compressor: u64,
+            }
+            
+            let mut vm_stat: VmStatistics64 = mem::zeroed();
+            let mut count: libc::mach_msg_type_number_t = 
+                (mem::size_of::<VmStatistics64>() / mem::size_of::<libc::natural_t>()) as u32;
+            
+            // HOST_VM_INFO64 = 4
+            const HOST_VM_INFO64: libc::c_int = 4;
+            
+            extern "C" {
+                fn host_statistics64(
+                    host_priv: libc::mach_port_t,
+                    flavor: libc::c_int,
+                    info: *mut libc::c_void,
+                    count: *mut libc::mach_msg_type_number_t,
+                ) -> libc::c_int;
+            }
+            
+            let result = host_statistics64(
+                host_port,
+                HOST_VM_INFO64,
+                &mut vm_stat as *mut _ as *mut libc::c_void,
+                &mut count,
+            );
+            
+            if result == 0 {
+                // Page size (typically 16KB on Apple Silicon)
+                let page_size = libc::sysconf(libc::_SC_PAGESIZE) as u64;
+                // Free = free + inactive + speculative (pages that can be reclaimed)
+                (vm_stat.free_count + vm_stat.inactive_count + vm_stat.speculative_count) * page_size
+            } else {
+                // Fallback: assume 50% of total is free
+                total_ram / 2
+            }
+        };
+        
+        (total_ram / (1024 * 1024), free_ram / (1024 * 1024))
+    }
+    
+    /// Fallback for non-macOS systems
+    #[cfg(not(target_os = "macos"))]
+    fn get_system_memory() -> (u64, u64) {
+        // Conservative defaults for non-macOS
+        (8 * 1024, 4 * 1024) // 8GB total, 4GB free
     }
 }
 
@@ -1004,7 +1172,7 @@ impl GpuKeyGenerator {
     fn run_raw(&self, target_keys: Option<u64>) -> Result<GeneratorStats, String> {
         let start_time = Instant::now();
         
-        let async_writer = AsyncRawWriter::new(self.config.output_dir.clone())
+        let mut async_writer = AsyncRawWriter::new(self.config.output_dir.clone())
             .map_err(|e| format!("Failed to create async writer: {}", e))?;
         
         println!("🚀 NASA-GRADE RAW OUTPUT MODE");

@@ -116,6 +116,16 @@ inline uint rotl32(uint x, uint n) { return (x << n) | (x >> (32 - n)); }
 // 256-BIT SCALAR ARITHMETIC
 // ============================================================================
 
+/// Add a 64-bit value to a 256-bit scalar and reduce mod n
+/// 
+/// FAIL-SAFE: Uses iterative reduction to handle edge cases where
+/// base_priv + thread_offset could exceed 2*n (though rare in practice).
+/// 
+/// Mathematical guarantee:
+/// - base_priv is always < n (valid private key)
+/// - thread_offset is at most ~2^40 in extreme cases (262K threads × 32 batch)
+/// - Sum is at most n + 2^40 < 2n, so 2 subtractions suffice
+/// - We do 3 iterations for extra safety margin
 inline void scalar_add_u64(thread ulong4& s, ulong val) {
     ulong old = s.x;
     s.x += val;
@@ -136,19 +146,30 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
         }
     }
     
-    // Reduce mod n if: overflow OR s >= n
-    if (overflow ||
-        s.w > SECP256K1_N.w || 
-        (s.w == SECP256K1_N.w && s.z > SECP256K1_N.z) ||
-        (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y > SECP256K1_N.y) ||
-        (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x >= SECP256K1_N.x)) {
+    // FAIL-SAFE: Iterative reduction to guarantee result is in [0, n-1]
+    // Even if sum exceeds 2*n, this loop will correctly reduce it.
+    // In practice: 1 iteration usually suffices, 2 for edge cases, 3 for safety.
+    #pragma unroll 3
+    for (int iter = 0; iter < 3; iter++) {
+        bool needs_reduction = overflow ||
+            s.w > SECP256K1_N.w || 
+            (s.w == SECP256K1_N.w && s.z > SECP256K1_N.z) ||
+            (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y > SECP256K1_N.y) ||
+            (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x >= SECP256K1_N.x);
+        
+        if (!needs_reduction) {
+            break; // Already in valid range [0, n-1]
+        }
+        
+        // Subtract n with borrow chain
         ulong bw = 0;
         ulong4 r;
         r.x = s.x - SECP256K1_N.x; bw = (s.x < SECP256K1_N.x) ? 1 : 0;
-        r.y = s.y - SECP256K1_N.y - bw; bw = (s.y < SECP256K1_N.y) || (bw && s.y == SECP256K1_N.y) ? 1 : 0;
-        r.z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z) || (bw && s.z == SECP256K1_N.z) ? 1 : 0;
+        r.y = s.y - SECP256K1_N.y - bw; bw = (s.y < SECP256K1_N.y + bw) ? 1 : 0;
+        r.z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z + bw) ? 1 : 0;
         r.w = s.w - SECP256K1_N.w - bw;
         s = r;
+        overflow = false; // Clear overflow flag after first reduction
     }
 }
 

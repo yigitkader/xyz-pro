@@ -358,25 +358,24 @@ impl AsyncRawWriter {
     /// 
     /// This properly closes the channel by dropping the sender,
     /// ensuring the writer thread sees the disconnect and exits cleanly.
-    /// Shutdown the async writer and wait for all pending writes to complete
     /// 
     /// Returns the total number of keys written, or 0 if the writer thread panicked.
-    pub fn shutdown(self) -> u64 {
-        // Destructure self to get ownership of both fields
-        let AsyncRawWriter { sender, handle } = self;
-        
+    /// 
+    /// # Note
+    /// This method takes `&mut self` to allow the Drop implementation to
+    /// handle cleanup if shutdown() is not called explicitly.
+    pub fn shutdown(&mut self) -> u64 {
         // Send shutdown message for clean exit
-        let _ = sender.send(WriterMessage::Shutdown);
+        let _ = self.sender.send(WriterMessage::Shutdown);
         
-        // Drop sender to close channel - this ensures recv() returns Err
-        // if the thread is blocked waiting. Belt-and-suspenders approach:
-        // either the Shutdown message or the channel close will trigger exit.
-        drop(sender);
-        
-        // Wait for thread to complete all pending writes
-        match handle {
+        // Take ownership of handle to join it
+        // After this, handle is None and Drop won't try to join again
+        match self.handle.take() {
             Some(h) => match h.join() {
-                Ok(count) => count,
+                Ok(count) => {
+                    println!("✅ AsyncRawWriter shutdown: {} files written", count);
+                    count
+                }
                 Err(panic_payload) => {
                     // Thread panicked - log the error
                     // This can happen if disk is full, permissions denied, etc.
@@ -392,7 +391,7 @@ impl AsyncRawWriter {
                     0
                 }
             },
-            None => 0,
+            None => 0, // Already shut down (e.g., called twice or after Drop)
         }
     }
     
@@ -444,6 +443,33 @@ impl AsyncRawWriter {
         mmap.flush()?;
         
         Ok(())
+    }
+}
+
+/// Drop implementation ensures IO thread completes all pending writes
+/// 
+/// CRITICAL: Without this, if AsyncRawWriter is dropped without calling shutdown(),
+/// the IO thread becomes orphaned and pending writes may be lost. This is especially
+/// important during Ctrl+C handling where the main thread may exit abruptly.
+/// 
+/// # Safety Guarantee
+/// - If shutdown() was called: handle is None, Drop does nothing
+/// - If shutdown() was NOT called: handle is Some, Drop joins the thread
+/// This ensures exactly one join() call regardless of how the struct is cleaned up.
+impl Drop for AsyncRawWriter {
+    fn drop(&mut self) {
+        // Only act if handle exists (shutdown() wasn't called)
+        if self.handle.is_some() {
+            // This is an implicit shutdown during Drop (e.g., Ctrl+C or panic)
+            // Log differently to indicate it wasn't an explicit shutdown
+            eprintln!("⚠️  AsyncRawWriter dropped without explicit shutdown - flushing pending writes...");
+            
+            // Reuse shutdown logic - it handles all the join and logging
+            let count = self.shutdown();
+            if count > 0 {
+                eprintln!("   {} files were written before exit", count);
+            }
+        }
     }
 }
 
