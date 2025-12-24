@@ -153,6 +153,9 @@ unsafe impl Sync for PooledBuffer {}
 // ============================================================================
 
 /// Triple buffer set for async pipelining
+/// 
+/// Each buffer set has its own command queue and tracks the last dispatched
+/// command buffer for proper GPU synchronization.
 pub struct BufferSet {
     pub queue: CommandQueue,
     pub base_privkey_buf: Buffer,
@@ -160,6 +163,9 @@ pub struct BufferSet {
     pub base_pubkey_y_buf: Buffer,
     pub output_buffer: Buffer,
     pub keys_per_thread_buf: Buffer,
+    /// Last dispatched command buffer - used for proper GPU sync
+    /// CRITICAL: Always wait on THIS buffer, not a new empty one
+    pending_command: std::sync::Mutex<Option<metal::CommandBuffer>>,
 }
 
 /// GPU configuration based on hardware tier
@@ -298,6 +304,7 @@ impl GpuKeyGenerator {
                 base_pubkey_y_buf: device.new_buffer(32, storage),
                 output_buffer: device.new_buffer(output_buffer_size as u64, storage),
                 keys_per_thread_buf: device.new_buffer(4, storage),
+                pending_command: std::sync::Mutex::new(None),
             });
             println!("   Queue {}: {} MB output buffer", i, output_buffer_size / (1024 * 1024));
         }
@@ -524,7 +531,28 @@ impl GpuKeyGenerator {
         
         command_buffer.commit();
         
+        // CRITICAL FIX: Store the ACTUAL command buffer for proper sync
+        // Previously we were creating an empty buffer and waiting on THAT,
+        // which is an anti-pattern and can cause race conditions
+        if let Ok(mut pending) = bs.pending_command.lock() {
+            *pending = Some(command_buffer.to_owned());
+        }
+        
         Ok(())
+    }
+    
+    /// Wait for pending GPU work on this buffer set to complete
+    /// 
+    /// CRITICAL: This waits on the ACTUAL dispatched command buffer,
+    /// not a new empty one. This is the correct Metal synchronization pattern.
+    pub fn wait_for_completion(&self, buf_idx: usize) {
+        let bs = &self.buffer_sets[buf_idx];
+        if let Ok(mut pending) = bs.pending_command.lock() {
+            if let Some(ref cb) = *pending {
+                cb.wait_until_completed();
+            }
+            *pending = None;
+        }
     }
     
     /// Wait for batch and process with zero-copy - NO STRING ALLOCATIONS
@@ -532,10 +560,9 @@ impl GpuKeyGenerator {
     fn process_batch_raw(&self, buf_idx: usize) -> PooledBuffer {
         let bs = &self.buffer_sets[buf_idx];
         
-        // Sync
-        let cb = bs.queue.new_command_buffer();
-        cb.commit();
-        cb.wait_until_completed();
+        // FIXED: Wait for the ACTUAL dispatched command buffer
+        // Previously this created an empty buffer which was an anti-pattern
+        self.wait_for_completion(buf_idx);
         
         // Zero-copy from unified memory
         let output_ptr = bs.output_buffer.contents() as *const u8;
@@ -777,10 +804,9 @@ impl GpuKeyGenerator {
             let process_idx = current_buf % depth;
             let bs = &self.buffer_sets[process_idx];
             
-            // Sync
-            let cb = bs.queue.new_command_buffer();
-            cb.commit();
-            cb.wait_until_completed();
+            // FIXED: Wait for the ACTUAL dispatched command buffer
+            // Previously this created an empty buffer which was an anti-pattern
+            self.wait_for_completion(process_idx);
             
             // Direct copy from GPU buffer (zero-copy on unified memory)
             let output_ptr = bs.output_buffer.contents() as *const u8;
@@ -919,10 +945,9 @@ impl GpuKeyGenerator {
             let process_idx = current_buf % depth;
             let bs = &self.buffer_sets[process_idx];
             
-            // Wait for GPU completion
-            let cb = bs.queue.new_command_buffer();
-            cb.commit();
-            cb.wait_until_completed();
+            // FIXED: Wait for the ACTUAL dispatched command buffer
+            // Previously this created an empty buffer which was an anti-pattern
+            self.wait_for_completion(process_idx);
             
             // ZERO-COPY: Direct access to GPU buffer via Unified Memory
             // GLV outputs 2x keys per dispatch

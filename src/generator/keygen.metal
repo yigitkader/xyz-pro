@@ -247,14 +247,23 @@ ulong4 mod_mul(ulong4 a, ulong4 b) {
             ulong bj = (j == 0) ? b.x : ((j == 1) ? b.y : ((j == 2) ? b.z : b.w));
             ulong hi, lo;
             mul64(ai, bj, hi, lo);
-            ulong old = r[i + j]; r[i + j] += lo;
-            ulong c1 = (r[i + j] < old) ? 1 : 0;
-            old = r[i + j + 1]; r[i + j + 1] += hi + c1 + c;
-            c = (r[i + j + 1] < old) ? 1 : 0;
-            if (hi + c1 < hi) c++;
+            
+            // FIX: Use add_with_carry for all additions to prevent overflow bugs
+            // Previous bug: "hi + c1 + c" could overflow without proper tracking
+            ulong c1;
+            r[i + j] = add_with_carry(r[i + j], lo, 0, &c1);
+            
+            // Three-way add: r[i+j+1] += hi + c1 + c
+            ulong c2, c3;
+            r[i + j + 1] = add_with_carry(r[i + j + 1], hi, c1, &c2);
+            r[i + j + 1] = add_with_carry(r[i + j + 1], c, 0, &c3);
+            c = c2 + c3;  // Combined carry (0, 1, or 2)
         }
+        // Propagate remaining carry
         for (int k = i + 4; k < 8 && c; k++) {
-            ulong old = r[k]; r[k] += c; c = (r[k] < old) ? 1 : 0;
+            ulong ck;
+            r[k] = add_with_carry(r[k], c, 0, &ck);
+            c = ck;
         }
     }
     return secp256k1_reduce(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);

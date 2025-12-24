@@ -162,10 +162,9 @@ impl KeyGenerator for GpuGeneratorAdapter {
         // Get the GPU buffer set for reading
         let bs = self.inner.buffer_set(gpu_idx);
         
-        // Wait for GPU batch to complete
-        let cb = bs.queue.new_command_buffer();
-        cb.commit();
-        cb.wait_until_completed();
+        // FIXED: Wait for the ACTUAL dispatched command buffer
+        // Previously this created an empty buffer which was an anti-pattern
+        self.inner.wait_for_completion(gpu_idx);
         
         // Get GPU output pointer (Unified Memory - zero-copy)
         let gpu_ptr = bs.output_buffer.contents() as *const u8;
