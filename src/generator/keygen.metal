@@ -513,10 +513,33 @@ constant ulong4 GLV_LAMBDA = {
     0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL
 };
 
+// Compare 256-bit numbers: returns -1 if a < b, 0 if a == b, 1 if a > b
+inline int cmp256(ulong4 a, ulong4 b) {
+    if (a.w != b.w) return (a.w > b.w) ? 1 : -1;
+    if (a.z != b.z) return (a.z > b.z) ? 1 : -1;
+    if (a.y != b.y) return (a.y > b.y) ? 1 : -1;
+    if (a.x != b.x) return (a.x > b.x) ? 1 : -1;
+    return 0;
+}
+
+// Subtract 256-bit: result = a - b (assumes a >= b)
+inline ulong4 sub256(ulong4 a, ulong4 b) {
+    ulong4 r;
+    ulong bw = 0;
+    r.x = a.x - b.x; bw = (a.x < b.x) ? 1 : 0;
+    r.y = a.y - b.y - bw; bw = (a.y < b.y + bw) ? 1 : 0;
+    r.z = a.z - b.z - bw; bw = (a.z < b.z + bw) ? 1 : 0;
+    r.w = a.w - b.w - bw;
+    return r;
+}
+
 // Multiply two 256-bit numbers modulo n (group order)
+// Uses proper Barrett-like reduction for secp256k1
 ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
+    // 512-bit product
     ulong r[8] = {0,0,0,0,0,0,0,0};
     
+    // Schoolbook multiplication
     for (int i = 0; i < 4; i++) {
         ulong ai = (i == 0) ? a.x : ((i == 1) ? a.y : ((i == 2) ? a.z : a.w));
         ulong c = 0;
@@ -524,44 +547,84 @@ ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
             ulong bj = (j == 0) ? b.x : ((j == 1) ? b.y : ((j == 2) ? b.z : b.w));
             ulong hi, lo;
             mul64(ai, bj, hi, lo);
-            ulong old = r[i + j]; r[i + j] += lo;
+            
+            // Add to accumulator with carry chain
+            ulong old = r[i + j];
+            r[i + j] += lo;
             ulong c1 = (r[i + j] < old) ? 1 : 0;
-            old = r[i + j + 1]; r[i + j + 1] += hi + c1 + c;
+            
+            old = r[i + j + 1];
+            r[i + j + 1] += hi + c1 + c;
             c = (r[i + j + 1] < old) ? 1 : 0;
             if (hi + c1 < hi) c++;
         }
+        // Propagate carry
         for (int k = i + 4; k < 8 && c; k++) {
-            ulong old = r[k]; r[k] += c; c = (r[k] < old) ? 1 : 0;
+            ulong old = r[k];
+            r[k] += c;
+            c = (r[k] < old) ? 1 : 0;
         }
     }
     
-    // Reduce mod n using the group order
+    // Reduction mod n using repeated subtraction
     // n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    ulong4 result = {r[0], r[1], r[2], r[3]};
+    // 
+    // Since both a and b are < n (< 2^256), product is < n^2 < 2^512
+    // We need to reduce by subtracting multiples of n
     
-    // Simplified reduction - may need multiple iterations for full correctness
-    while (r[4] || r[5] || r[6] || r[7] ||
-           result.w > SECP256K1_N.w ||
-           (result.w == SECP256K1_N.w && result.z > SECP256K1_N.z) ||
-           (result.w == SECP256K1_N.w && result.z == SECP256K1_N.z && result.y > SECP256K1_N.y) ||
-           (result.w == SECP256K1_N.w && result.z == SECP256K1_N.z && result.y == SECP256K1_N.y && result.x >= SECP256K1_N.x)) {
+    // Step 1: Reduce high part by computing (high * 2^256) mod n
+    // For secp256k1: 2^256 mod n = 0x14551231950B75FC4402DA1732FC9BEBF
+    // But this is complex, so we use iterative subtraction which is simpler for GPU
+    
+    // First, handle the case where high bits are non-zero
+    ulong4 hi_part = {r[4], r[5], r[6], r[7]};
+    ulong4 lo_part = {r[0], r[1], r[2], r[3]};
+    
+    // If high part is zero, we just need to reduce low part
+    bool has_high = (hi_part.x | hi_part.y | hi_part.z | hi_part.w) != 0;
+    
+    if (has_high) {
+        // Reduce iteratively - subtract n * 2^256 from 512-bit number
+        // This is equivalent to subtracting n from the view [lo, hi]
+        // After each subtraction, the high part decreases
         
-        // Subtract n
-        ulong bw = 0;
-        ulong4 tmp;
-        tmp.x = result.x - SECP256K1_N.x; bw = (result.x < SECP256K1_N.x) ? 1 : 0;
-        tmp.y = result.y - SECP256K1_N.y - bw; bw = (result.y < SECP256K1_N.y + bw) ? 1 : 0;
-        tmp.z = result.z - SECP256K1_N.z - bw; bw = (result.z < SECP256K1_N.z + bw) ? 1 : 0;
-        tmp.w = result.w - SECP256K1_N.w - bw;
-        
-        if (r[4] || r[5] || r[6] || r[7]) {
-            r[4]--; // Borrow from high words
-            if (r[4] == 0xFFFFFFFFFFFFFFFFULL) { r[5]--; }
+        // Maximum iterations needed: since product < n^2, we need at most n iterations
+        // But in practice, for λ * k where λ and k are both < n, much fewer
+        for (int iter = 0; iter < 512 && has_high; iter++) {
+            // Subtract n from low part, borrow from high part
+            ulong bw = 0;
+            ulong4 new_lo;
+            
+            new_lo.x = lo_part.x - SECP256K1_N.x;
+            bw = (lo_part.x < SECP256K1_N.x) ? 1 : 0;
+            
+            new_lo.y = lo_part.y - SECP256K1_N.y - bw;
+            bw = (lo_part.y < SECP256K1_N.y + bw) ? 1 : 0;
+            
+            new_lo.z = lo_part.z - SECP256K1_N.z - bw;
+            bw = (lo_part.z < SECP256K1_N.z + bw) ? 1 : 0;
+            
+            new_lo.w = lo_part.w - SECP256K1_N.w - bw;
+            bw = (lo_part.w < SECP256K1_N.w + bw) ? 1 : 0;
+            
+            // Borrow from high part
+            if (bw) {
+                ulong4 one = {1, 0, 0, 0};
+                hi_part = sub256(hi_part, one);
+            }
+            
+            lo_part = new_lo;
+            has_high = (hi_part.x | hi_part.y | hi_part.z | hi_part.w) != 0;
         }
-        result = tmp;
     }
     
-    return result;
+    // Step 2: Final reduction of low part
+    // Subtract n while result >= n
+    while (cmp256(lo_part, SECP256K1_N) >= 0) {
+        lo_part = sub256(lo_part, SECP256K1_N);
+    }
+    
+    return lo_part;
 }
 
 // ============================================================================

@@ -94,8 +94,8 @@ impl KeyGenerator {
             return None;
         }
         
-        // Compute public key and hash
-        let pubkey_hash = match compute_pubkey_hash(&private_key) {
+        // Compute public key hash and p2sh hash
+        let (pubkey_hash, p2sh_hash) = match compute_pubkey_hash(&private_key) {
             Some(h) => h,
             None => return None,
         };
@@ -103,6 +103,7 @@ impl KeyGenerator {
         Some(RawKeyData {
             private_key,
             pubkey_hash,
+            p2sh_hash,
         })
     }
     
@@ -170,9 +171,9 @@ fn is_valid_private_key(key: &[u8; 32]) -> bool {
     false
 }
 
-/// Compute HASH160 of compressed public key
+/// Compute HASH160 of compressed public key and P2SH-P2WPKH script hash
 #[inline]
-fn compute_pubkey_hash(private_key: &[u8; 32]) -> Option<[u8; 20]> {
+fn compute_pubkey_hash(private_key: &[u8; 32]) -> Option<([u8; 20], [u8; 20])> {
     let secret_key = SecretKey::from_bytes(private_key.into()).ok()?;
     let public_key = secret_key.public_key();
     let encoded = public_key.to_encoded_point(true); // compressed
@@ -182,9 +183,23 @@ fn compute_pubkey_hash(private_key: &[u8; 32]) -> Option<[u8; 20]> {
     let sha = Sha256::digest(pubkey_bytes);
     let ripemd = Ripemd160::digest(sha);
     
-    let mut result = [0u8; 20];
-    result.copy_from_slice(&ripemd);
-    Some(result)
+    let mut pubkey_hash = [0u8; 20];
+    pubkey_hash.copy_from_slice(&ripemd);
+    
+    // P2SH-P2WPKH: HASH160(0x0014 || pubkey_hash)
+    // Witness program: OP_0 (0x00) + OP_PUSHBYTES_20 (0x14) + pubkey_hash
+    let mut witness_program = [0u8; 22];
+    witness_program[0] = 0x00;
+    witness_program[1] = 0x14;
+    witness_program[2..22].copy_from_slice(&pubkey_hash);
+    
+    let sha = Sha256::digest(&witness_program);
+    let ripemd = Ripemd160::digest(sha);
+    
+    let mut p2sh_hash = [0u8; 20];
+    p2sh_hash.copy_from_slice(&ripemd);
+    
+    Some((pubkey_hash, p2sh_hash))
 }
 
 #[cfg(test)]
@@ -214,9 +229,13 @@ mod tests {
     #[test]
     fn test_pubkey_hash() {
         let key = [0x01u8; 32];
-        let hash = compute_pubkey_hash(&key);
-        assert!(hash.is_some());
-        assert_eq!(hash.unwrap().len(), 20);
+        let hashes = compute_pubkey_hash(&key);
+        assert!(hashes.is_some());
+        let (pubkey_hash, p2sh_hash) = hashes.unwrap();
+        assert_eq!(pubkey_hash.len(), 20);
+        assert_eq!(p2sh_hash.len(), 20);
+        // Verify hashes are different
+        assert_ne!(pubkey_hash, p2sh_hash);
     }
 }
 

@@ -12,7 +12,6 @@
 //!
 //! Target: Maximum throughput on Apple Silicon.
 
-use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -223,8 +222,8 @@ pub struct GpuKeyGenerator {
     // Buffer pool for zero-copy
     buffer_pool: Arc<BufferPool>,
     
-    // Look-ahead pubkey computation
-    lookahead_pubkey: UnsafeCell<Option<([u8; 32], [u8; 32])>>,
+    // Look-ahead pubkey computation (thread-safe)
+    lookahead_pubkey: std::sync::Mutex<Option<([u8; 32], [u8; 32])>>,
     
     // State
     current_offset: AtomicU64,
@@ -234,7 +233,8 @@ pub struct GpuKeyGenerator {
     total_generated: AtomicU64,
 }
 
-// Make UnsafeCell safe across threads (we handle synchronization manually)
+// Metal types are thread-safe on Apple Silicon
+// Mutex protects lookahead_pubkey, atomics protect counters
 unsafe impl Send for GpuKeyGenerator {}
 unsafe impl Sync for GpuKeyGenerator {}
 
@@ -340,7 +340,7 @@ impl GpuKeyGenerator {
             current_buffer: AtomicUsize::new(0),
             wnaf_table_buffer,
             buffer_pool,
-            lookahead_pubkey: UnsafeCell::new(None),
+            lookahead_pubkey: std::sync::Mutex::new(None),
             current_offset: AtomicU64::new(start_offset),
             should_stop: Arc::new(AtomicBool::new(false)),
             total_generated: AtomicU64::new(0),
@@ -423,8 +423,8 @@ impl GpuKeyGenerator {
     /// Pre-compute pubkey for next batch (called while GPU is busy)
     fn precompute_pubkey(&self, next_key: &[u8; 32]) {
         if let Ok(pubkey) = Self::compute_base_pubkey(next_key) {
-            unsafe {
-                *self.lookahead_pubkey.get() = Some(pubkey);
+            if let Ok(mut cached) = self.lookahead_pubkey.lock() {
+                *cached = Some(pubkey);
             }
         }
     }
@@ -463,10 +463,12 @@ impl GpuKeyGenerator {
         
         let base_privkey = Self::offset_to_privkey(base_offset);
         
-        // LOOK-AHEAD: Try to use pre-computed pubkey
-        let (pubkey_x, pubkey_y) = unsafe {
-            let cached = &mut *self.lookahead_pubkey.get();
-            if let Some((x, y)) = cached.take() {
+        // LOOK-AHEAD: Try to use pre-computed pubkey (thread-safe)
+        let (pubkey_x, pubkey_y) = {
+            let cached = self.lookahead_pubkey.lock()
+                .map_err(|_| "Mutex poisoned")?
+                .take();
+            if let Some((x, y)) = cached {
                 (x, y)
             } else {
                 Self::compute_base_pubkey(&base_privkey)?

@@ -49,61 +49,52 @@ impl TargetSet {
         
         println!("📂 Loading targets...");
         
-        // Simple line-by-line parsing (faster than serde for large files)
+        // Parse JSON - handles both compact and multi-line formats
         for line in reader.lines() {
             let line = line.map_err(|e| format!("Read error: {}", e))?;
-            let trimmed = line.trim();
             
-            // Skip JSON syntax
-            if trimmed.is_empty() 
-                || trimmed == "{" 
-                || trimmed == "}" 
-                || trimmed == "]" 
-                || trimmed.starts_with("\"addresses\"") 
-                || trimmed == "[" 
-            {
-                continue;
-            }
+            // For each line, extract all quoted strings that look like addresses
+            // This handles both compact JSON and multi-line JSON
+            let addresses_in_line = extract_addresses_from_line(&line);
             
-            // Extract address from JSON string
-            // Order: trim comma first, then quotes
-            let addr = trimmed
-                .trim_end_matches(',')
-                .trim_start_matches('"')
-                .trim_end_matches('"');
-            
-            if addr.is_empty() {
-                continue;
-            }
-            
-            // Classify and store
-            if addr.starts_with('1') {
-                stats.p2pkh += 1;
-                if let Some(hash) = decode_p2pkh(addr) {
-                    hash160_set.insert(hash);
+            for addr in addresses_in_line {
+                if addr.is_empty() {
+                    continue;
                 }
-            } else if addr.starts_with('3') {
-                stats.p2sh += 1;
-                if let Some(hash) = decode_p2sh(addr) {
-                    p2sh_set.insert(hash);
-                }
-            } else if addr.starts_with("bc1q") {
-                if addr.len() <= 44 {
-                    stats.p2wpkh += 1;
-                    if let Some(hash) = decode_bech32(addr) {
+            
+                // Classify and store
+                if addr.starts_with('1') {
+                    stats.p2pkh += 1;
+                    if let Some(hash) = decode_p2pkh(&addr) {
                         hash160_set.insert(hash);
                     }
-                } else {
-                    stats.p2wsh += 1;
+                } else if addr.starts_with('3') {
+                    stats.p2sh += 1;
+                    if let Some(hash) = decode_p2sh(&addr) {
+                        p2sh_set.insert(hash);
+                    }
+                } else if addr.starts_with("bc1q") {
+                    if addr.len() <= 44 {
+                        stats.p2wpkh += 1;
+                        match decode_bech32(&addr) {
+                            Some(hash) => { hash160_set.insert(hash); }
+                            None => { 
+                                #[cfg(debug_assertions)]
+                                eprintln!("   ⚠️ Failed to decode bech32: {}", addr); 
+                            }
+                        }
+                    } else {
+                        stats.p2wsh += 1;
+                    }
                 }
-            }
             
-            addresses.insert(addr.to_string());
-            stats.total += 1;
-            
-            // Progress
-            if stats.total % 1_000_000 == 0 {
-                println!("   Loaded {} addresses...", stats.total);
+                addresses.insert(addr.to_string());
+                stats.total += 1;
+                
+                // Progress
+                if stats.total % 1_000_000 == 0 {
+                    println!("   Loaded {} addresses...", stats.total);
+                }
             }
         }
         
@@ -214,6 +205,35 @@ fn decode_bech32(addr: &str) -> Option<[u8; 20]> {
     }
 }
 
+/// Extract addresses from a line (handles both compact and multi-line JSON)
+fn extract_addresses_from_line(line: &str) -> Vec<String> {
+    let mut addresses = Vec::new();
+    let mut in_quote = false;
+    let mut current_addr = String::new();
+    
+    for ch in line.chars() {
+        if ch == '"' {
+            if in_quote {
+                // End of quoted string
+                // Check if it looks like a Bitcoin address
+                if !current_addr.is_empty() 
+                   && (current_addr.starts_with('1') 
+                       || current_addr.starts_with('3')
+                       || current_addr.starts_with("bc1"))
+                {
+                    addresses.push(current_addr.clone());
+                }
+                current_addr.clear();
+            }
+            in_quote = !in_quote;
+        } else if in_quote {
+            current_addr.push(ch);
+        }
+    }
+    
+    addresses
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +249,45 @@ mod tests {
     fn test_decode_bech32() {
         let hash = decode_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
         assert!(hash.is_some());
+    }
+    
+    #[test]
+    fn test_extract_addresses_compact() {
+        let line = r#"{"addresses":["1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH","3CWFddi6m4ndiGyKqzYvsFYagqDLPVMTzC","bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"]}"#;
+        let addrs = extract_addresses_from_line(line);
+        assert_eq!(addrs.len(), 3);
+        assert_eq!(addrs[0], "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH");
+        assert_eq!(addrs[1], "3CWFddi6m4ndiGyKqzYvsFYagqDLPVMTzC");
+        assert_eq!(addrs[2], "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    }
+    
+    #[test]
+    fn test_same_pubkey_different_formats() {
+        // These addresses are for the SAME public key, just different formats
+        // P2PKH: 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH
+        // P2WPKH: bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+        // They share the same hash160!
+        
+        let p2pkh = decode_p2pkh("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH");
+        let p2wpkh = decode_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        
+        assert!(p2pkh.is_some(), "P2PKH decode should succeed");
+        assert!(p2wpkh.is_some(), "P2WPKH decode should succeed");
+        
+        // Same pubkey = same hash160 (this is correct!)
+        assert_eq!(p2pkh.unwrap(), p2wpkh.unwrap(), 
+            "Same pubkey should produce same hash160 across address formats");
+    }
+    
+    #[test]
+    fn test_different_pubkeys() {
+        // Different addresses = different hashes
+        let addr1 = decode_p2pkh("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"); // Satoshi's genesis
+        let addr2 = decode_p2pkh("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"); // Different
+        
+        assert!(addr1.is_some());
+        assert!(addr2.is_some());
+        assert_ne!(addr1.unwrap(), addr2.unwrap(), "Different addresses should have different hashes");
     }
 }
 

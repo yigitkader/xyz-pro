@@ -255,6 +255,7 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::types::MatchType;
     
     // Mock generator for testing
     struct MockGenerator {

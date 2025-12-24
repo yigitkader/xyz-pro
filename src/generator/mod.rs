@@ -61,10 +61,17 @@ pub struct KeyOutput {
 }
 
 /// Raw key data for internal processing (minimal allocations)
+/// Layout must match GPU output: [privkey:32][pubkey_hash:20][p2sh_hash:20] = 72 bytes
 #[derive(Clone, Copy)]
+#[repr(C, packed)]
 pub struct RawKeyData {
     pub private_key: [u8; 32],
     pub pubkey_hash: [u8; 20],
+    pub p2sh_hash: [u8; 20],
+}
+
+impl RawKeyData {
+    pub const SIZE: usize = 72;
 }
 
 /// Generator configuration
