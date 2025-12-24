@@ -153,12 +153,19 @@ impl TargetSet {
             let xor_start = Instant::now();
             
             // Convert [u8; 20] to u64 keys for XOR filter
-            let hash160_keys: Vec<u64> = cached.hash160_list.iter()
+            // IMPORTANT: Must deduplicate! XOR filter panics on duplicate keys
+            // Collisions in hash160_to_u64 are rare but possible (XOR-fold of 20 bytes to 8)
+            let mut hash160_keys: Vec<u64> = cached.hash160_list.iter()
                 .map(|h| hash160_to_u64(h))
                 .collect();
-            let p2sh_keys: Vec<u64> = cached.p2sh_list.iter()
+            hash160_keys.sort_unstable();
+            hash160_keys.dedup();
+            
+            let mut p2sh_keys: Vec<u64> = cached.p2sh_list.iter()
                 .map(|h| hash160_to_u64(h))
                 .collect();
+            p2sh_keys.sort_unstable();
+            p2sh_keys.dedup();
             
             let h_xor = if !hash160_keys.is_empty() {
                 Xor8::try_from(&hash160_keys).ok()
@@ -359,12 +366,27 @@ impl TargetSet {
             let xor_start = Instant::now();
             
             // Convert [u8; 20] to u64 keys for XOR filter
-            let hash160_keys: Vec<u64> = hash160_set.iter()
+            // IMPORTANT: Must deduplicate! XOR filter panics on duplicate keys
+            // Collisions in hash160_to_u64 are possible (XOR-fold of 20 bytes to 8)
+            let mut hash160_keys: Vec<u64> = hash160_set.iter()
                 .map(|h| hash160_to_u64(h))
                 .collect();
-            let p2sh_keys: Vec<u64> = p2sh_set.iter()
+            hash160_keys.sort_unstable();
+            hash160_keys.dedup();
+            
+            let mut p2sh_keys: Vec<u64> = p2sh_set.iter()
                 .map(|h| hash160_to_u64(h))
                 .collect();
+            p2sh_keys.sort_unstable();
+            p2sh_keys.dedup();
+            
+            // Log collision stats
+            let h_collisions = hash160_set.len() - hash160_keys.len();
+            let p_collisions = p2sh_set.len() - p2sh_keys.len();
+            if h_collisions > 0 || p_collisions > 0 {
+                println!("   ⚠️  XOR key collisions: {} hash160, {} p2sh (expected ~0.00001%)", 
+                         h_collisions, p_collisions);
+            }
             
             let h_xor = if !hash160_keys.is_empty() {
                 Xor8::try_from(&hash160_keys).ok()
