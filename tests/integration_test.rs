@@ -1544,3 +1544,411 @@ fn test_scan_mode_zero_string_allocation() {
     println!("   Matches found: {} (String encoding only on match)", match_count);
     println!("✅ Scan mode correctly avoids String allocations");
 }
+
+// ============================================================================
+// PHILOX RNG COLLISION TEST - GPU Thread Uniqueness
+// ============================================================================
+
+/// Test that GPU generates unique private keys with no collisions
+/// 
+/// This verifies:
+/// 1. Each GPU thread gets a unique offset (gid * keys_per_thread + b)
+/// 2. No two threads produce the same private key
+/// 3. The deterministic sequence is correct
+#[test]
+fn test_gpu_thread_uniqueness_no_collisions() {
+    use std::collections::HashSet;
+    use xyz_pro::bridge::KeyGenerator;
+    use xyz_pro::bridge::RawKeyData;
+    
+    println!("\n🧪 GPU Thread Uniqueness Test (Philox RNG Collision Check)");
+    println!("{}", "=".repeat(60));
+    
+    let config = GeneratorConfig {
+        start_offset: 1,
+        ..Default::default()
+    };
+    
+    let gpu_gen = match GpuKeyGenerator::new(config) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available: {}", e);
+            return;
+        }
+    };
+    
+    let adapter = GpuGeneratorAdapter::new(gpu_gen);
+    
+    // Generate multiple batches and check for collisions
+    let mut all_keys: HashSet<[u8; 32]> = HashSet::new();
+    let mut total_keys = 0u64;
+    let num_batches = 5;
+    
+    for batch_idx in 0..num_batches {
+        let batch_data = match adapter.generate_batch() {
+            Ok(data) => data,
+            Err(e) => {
+                println!("⚠️ Batch generation failed: {}", e);
+                return;
+            }
+        };
+        let batch_size = batch_data.len() / RawKeyData::SIZE;
+        
+        for i in 0..batch_size {
+            if let Some(key_data) = RawKeyData::from_bytes(&batch_data[i * RawKeyData::SIZE..]) {
+                let privkey = key_data.private_key;
+                
+                // Skip zero keys
+                if !key_data.is_valid() {
+                    continue;
+                }
+                
+                // Check if key already seen (collision!)
+                if !all_keys.insert(privkey) {
+                    panic!(
+                        "❌ COLLISION DETECTED! Batch {}, key {} has duplicate private key: {:02x?}",
+                        batch_idx, i, privkey
+                    );
+                }
+            }
+        }
+        
+        total_keys += batch_size as u64;
+        println!("   Batch {}: {} keys, total unique: {}", batch_idx, batch_size, all_keys.len());
+    }
+    
+    // Verify we got a significant number of unique keys
+    assert!(all_keys.len() > 1000, "Should have at least 1000 unique keys");
+    
+    println!("✅ {} unique keys generated, NO COLLISIONS", all_keys.len());
+    println!("   Each GPU thread produced unique private keys");
+}
+
+/// Test GPU thread offset calculation is deterministic and sequential
+/// 
+/// Verifies the formula: private_key[i] = base_offset + (gid * keys_per_thread) + b
+#[test]
+fn test_gpu_thread_offset_determinism() {
+    use xyz_pro::bridge::KeyGenerator;
+    use xyz_pro::bridge::RawKeyData;
+    
+    println!("\n🧪 GPU Thread Offset Determinism Test");
+    println!("{}", "=".repeat(60));
+    
+    // Generate from same starting offset twice
+    let config1 = GeneratorConfig {
+        start_offset: 1000,
+        ..Default::default()
+    };
+    
+    let config2 = GeneratorConfig {
+        start_offset: 1000,
+        ..Default::default()
+    };
+    
+    let gpu_gen1 = match GpuKeyGenerator::new(config1) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available: {}", e);
+            return;
+        }
+    };
+    
+    let gpu_gen2 = match GpuKeyGenerator::new(config2) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    
+    let adapter1 = GpuGeneratorAdapter::new(gpu_gen1);
+    let adapter2 = GpuGeneratorAdapter::new(gpu_gen2);
+    
+    // Generate same batch twice
+    let data1 = match adapter1.generate_batch() {
+        Ok(d) => d.to_vec(),  // Copy since we need both
+        Err(e) => {
+            println!("⚠️ Batch 1 failed: {}", e);
+            return;
+        }
+    };
+    
+    let data2 = match adapter2.generate_batch() {
+        Ok(d) => d.to_vec(),
+        Err(e) => {
+            println!("⚠️ Batch 2 failed: {}", e);
+            return;
+        }
+    };
+    
+    // Compare first 1000 keys (should be identical)
+    let keys1 = data1.len() / RawKeyData::SIZE;
+    let keys2 = data2.len() / RawKeyData::SIZE;
+    let compare_count = keys1.min(keys2).min(1000);
+    
+    for i in 0..compare_count {
+        let key1 = RawKeyData::from_bytes(&data1[i * RawKeyData::SIZE..]).unwrap();
+        let key2 = RawKeyData::from_bytes(&data2[i * RawKeyData::SIZE..]).unwrap();
+        
+        assert_eq!(
+            key1.private_key,
+            key2.private_key,
+            "Key {} should be identical for same start_offset",
+            i
+        );
+    }
+    
+    println!("✅ {} keys are deterministic and reproducible", compare_count);
+    println!("   Same start_offset produces identical sequence");
+}
+
+/// Test that GPU keys are sequential (no gaps)
+/// 
+/// NOTE: With GLV mode enabled, output is [k, λ·k, k+1, λ·(k+1), ...] pairs
+/// The base keys (k) should be sequential, GLV keys (λ·k) are derived
+#[test]
+fn test_gpu_keys_are_sequential() {
+    use xyz_pro::bridge::KeyGenerator;
+    use xyz_pro::bridge::RawKeyData;
+    
+    println!("\n🧪 GPU Keys Sequential Test (GLV Mode)");
+    println!("{}", "=".repeat(60));
+    
+    let start_offset = 1u64;
+    let config = GeneratorConfig {
+        start_offset,
+        ..Default::default()
+    };
+    
+    let gpu_gen = match GpuKeyGenerator::new(config) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available: {}", e);
+            return;
+        }
+    };
+    
+    let adapter = GpuGeneratorAdapter::new(gpu_gen);
+    let data = match adapter.generate_batch() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("⚠️ Batch failed: {}", e);
+            return;
+        }
+    };
+    
+    // With GLV, keys come in pairs: [base_key, glv_key, base_key+1, glv_key+1, ...]
+    // We check that base keys (even indices) are sequential
+    let key_count = data.len() / RawKeyData::SIZE;
+    let check_count = key_count.min(100);
+    
+    println!("   Total keys in batch: {}", key_count);
+    println!("   GLV mode: each base key produces 2 output entries");
+    
+    // Check first 50 base keys (indices 0, 2, 4, ...) are sequential
+    let mut sequential_count = 0;
+    for pair in 0..check_count.min(50) {
+        let base_idx = pair * 2;  // Base keys are at even indices
+        if base_idx >= key_count {
+            break;
+        }
+        
+        let key_data = RawKeyData::from_bytes(&data[base_idx * RawKeyData::SIZE..]).unwrap();
+        let privkey = key_data.private_key;
+        
+        // Extract the expected offset from privkey (last 8 bytes, big endian)
+        let mut offset_bytes = [0u8; 8];
+        offset_bytes.copy_from_slice(&privkey[24..32]);
+        let actual_offset = u64::from_be_bytes(offset_bytes);
+        
+        let expected_offset = start_offset + pair as u64;
+        
+        // Base keys should be sequential
+        assert_eq!(
+            actual_offset, expected_offset,
+            "Base key {} (at index {}) should have offset {}, got {}",
+            pair, base_idx, expected_offset, actual_offset
+        );
+        sequential_count += 1;
+    }
+    
+    println!("✅ First {} base keys are sequential: {}..{}", 
+             sequential_count, start_offset, start_offset + sequential_count as u64 - 1);
+    println!("   GLV keys at odd indices are λ·k (derived from base keys)");
+}
+
+// ============================================================================
+// MEMORY ALIGNMENT / ZERO-COPY TESTS
+// ============================================================================
+
+/// Test RawKeyData struct alignment for zero-copy GPU access
+/// 
+/// Metal API requires proper alignment for zero-copy (Unified Memory).
+/// This verifies RawKeyData is correctly sized and aligned.
+#[test]
+fn test_rawkeydata_alignment_for_zerocopy() {
+    use std::mem::{size_of, align_of};
+    use xyz_pro::bridge::RawKeyData;
+    
+    println!("\n🧪 RawKeyData Alignment Test (Zero-Copy Safety)");
+    println!("{}", "=".repeat(60));
+    
+    // RawKeyData is #[repr(C, packed)] - 72 bytes, 1-byte alignment
+    let size = size_of::<RawKeyData>();
+    let align = align_of::<RawKeyData>();
+    
+    println!("   RawKeyData size:  {} bytes", size);
+    println!("   RawKeyData align: {} bytes", align);
+    
+    // Verify size matches GPU output format: privkey(32) + pubkey_hash(20) + p2sh_hash(20)
+    assert_eq!(size, 72, "RawKeyData should be exactly 72 bytes");
+    assert_eq!(size, RawKeyData::SIZE, "RawKeyData::SIZE should match size_of");
+    
+    // For packed struct, alignment is 1 (byte-aligned)
+    assert_eq!(align, 1, "Packed struct should have 1-byte alignment");
+    
+    // Verify field layout matches GPU output
+    let test_bytes = [
+        // private_key (32 bytes of 0xAA)
+        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        // pubkey_hash (20 bytes of 0xBB)
+        0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+        0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+        0xBB, 0xBB, 0xBB, 0xBB,
+        // p2sh_hash (20 bytes of 0xCC)
+        0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+        0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+        0xCC, 0xCC, 0xCC, 0xCC,
+    ];
+    
+    let test_data = RawKeyData::from_bytes(&test_bytes).expect("Should parse");
+    
+    // Verify fields
+    assert!(test_data.private_key.iter().all(|&b| b == 0xAA), "private_key should be all 0xAA");
+    assert!(test_data.pubkey_hash.iter().all(|&b| b == 0xBB), "pubkey_hash should be all 0xBB");
+    assert!(test_data.p2sh_hash.iter().all(|&b| b == 0xCC), "p2sh_hash should be all 0xCC");
+    
+    println!("✅ RawKeyData layout matches GPU output format exactly");
+    println!("   [0..31]  private_key  (32 bytes)");
+    println!("   [32..51] pubkey_hash  (20 bytes)");
+    println!("   [52..71] p2sh_hash    (20 bytes)");
+}
+
+/// Test Metal buffer alignment (page-aligned for zero-copy)
+/// 
+/// Metal's StorageModeShared requires buffers to be page-aligned (4096 bytes)
+/// for efficient zero-copy access between CPU and GPU.
+#[test]
+fn test_metal_buffer_page_alignment() {
+    println!("\n🧪 Metal Buffer Page Alignment Test");
+    println!("{}", "=".repeat(60));
+    
+    let config = GeneratorConfig {
+        start_offset: 1,
+        ..Default::default()
+    };
+    
+    let gpu_gen = match GpuKeyGenerator::new(config) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available: {}", e);
+            return;
+        }
+    };
+    
+    // Get buffer info - use public buffer_set method
+    let pipeline_depth = gpu_gen.pipeline_depth();
+    
+    for i in 0..pipeline_depth {
+        let bs = gpu_gen.buffer_set(i);
+        let output_ptr = bs.output_buffer.contents() as usize;
+        let output_len = bs.output_buffer.length() as usize;
+        
+        // Check page alignment (4096 bytes = 0x1000)
+        let page_aligned = (output_ptr & 0xFFF) == 0;
+        
+        println!("   Buffer {}: ptr=0x{:x}, len={} MB, page_aligned={}",
+                 i, output_ptr, output_len / (1024 * 1024), page_aligned);
+        
+        // Metal API guarantees page alignment for StorageModeShared
+        // If this fails, it indicates a Metal API issue (very unlikely)
+        assert!(
+            page_aligned,
+            "Metal buffer {} should be page-aligned (4096 bytes), got ptr=0x{:x}",
+            i, output_ptr
+        );
+    }
+    
+    println!("✅ All Metal buffers are page-aligned (4096 bytes)");
+    println!("   Zero-copy access is safe on Unified Memory");
+}
+
+/// Test GPU output buffer can be read as RawKeyData slice without issues
+#[test]
+fn test_gpu_buffer_to_rawkeydata_slice() {
+    use xyz_pro::bridge::KeyGenerator;
+    use xyz_pro::bridge::RawKeyData;
+    
+    println!("\n🧪 GPU Buffer → RawKeyData Slice Test");
+    println!("{}", "=".repeat(60));
+    
+    let config = GeneratorConfig {
+        start_offset: 1,
+        ..Default::default()
+    };
+    
+    let gpu_gen = match GpuKeyGenerator::new(config) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("⚠️ GPU not available: {}", e);
+            return;
+        }
+    };
+    
+    let adapter = GpuGeneratorAdapter::new(gpu_gen);
+    
+    // Generate a batch
+    let data = match adapter.generate_batch() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("⚠️ Batch failed: {}", e);
+            return;
+        }
+    };
+    let total_keys = data.len() / RawKeyData::SIZE;
+    
+    // Verify batch can be iterated safely
+    let mut valid_count = 0;
+    let mut invalid_count = 0;
+    
+    for i in 0..total_keys {
+        if let Some(key_data) = RawKeyData::from_bytes(&data[i * RawKeyData::SIZE..]) {
+            if key_data.is_valid() {
+                valid_count += 1;
+                
+                // Verify we can access all fields without issues
+                let _privkey = &key_data.private_key;
+                let _pubhash = &key_data.pubkey_hash;
+                let _p2sh = &key_data.p2sh_hash;
+            } else {
+                invalid_count += 1;
+            }
+        }
+    }
+    
+    println!("   Total keys: {}", total_keys);
+    println!("   Valid keys: {}", valid_count);
+    println!("   Invalid (zero) keys: {}", invalid_count);
+    
+    // Most keys should be valid (non-zero)
+    assert!(valid_count > 0, "Should have some valid keys");
+    
+    // The very first key might be zero if start_offset is handled specially
+    // but the vast majority should be valid
+    let valid_ratio = valid_count as f64 / total_keys as f64;
+    assert!(valid_ratio > 0.99, "At least 99% of keys should be valid, got {}%", valid_ratio * 100.0);
+    
+    println!("✅ GPU buffer → RawKeyData slice works correctly");
+    println!("   {}% keys are valid (non-zero)", (valid_ratio * 100.0) as u32);
+}

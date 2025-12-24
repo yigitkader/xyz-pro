@@ -45,13 +45,16 @@ fn main() {
     let scanner = RawFileScanner::new(targets, config.threads);
     
     // Setup Ctrl+C handler
+    // IMPORTANT: Do NOT call exit(0) directly - this can cause data loss if
+    // matches are being saved to disk. Instead, set the running flag to false
+    // and let the main loop exit gracefully.
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     
     ctrlc::set_handler(move || {
-        println!("\n\n⚠️  Received Ctrl+C, stopping...");
+        println!("\n\n⚠️  Received Ctrl+C, stopping gracefully...");
         running_clone.store(false, Ordering::SeqCst);
-        std::process::exit(0);
+        // DO NOT call exit(0) here - let the main loop finish any pending I/O
     }).expect("Error setting Ctrl+C handler");
     
     if watch_mode {
@@ -60,9 +63,15 @@ fn main() {
         println!("   Input directory: {}", config.input_dir);
         println!();
         
-        if let Err(e) = scanner.watch_and_scan(&config.input_dir, interval) {
-            eprintln!("❌ Watch error: {}", e);
-            std::process::exit(1);
+        // Pass running flag to watch loop for graceful shutdown
+        if let Err(e) = scanner.watch_and_scan_with_flag(&config.input_dir, interval, running.clone()) {
+            if !running.load(Ordering::SeqCst) {
+                // Ctrl+C was pressed - not an error
+                println!("👋 Watch mode stopped by user");
+            } else {
+                eprintln!("❌ Watch error: {}", e);
+                std::process::exit(1);
+            }
         }
     } else {
         // Single scan mode
@@ -79,6 +88,8 @@ fn main() {
             }
         }
     }
+    
+    println!("✅ Reader exited cleanly");
 }
 
 fn print_results(result: &xyz_pro::reader::ScanResult, output_path: &str) {
@@ -121,30 +132,46 @@ fn parse_args(args: &[String]) -> ReaderConfig {
                 if i + 1 < args.len() {
                     config.targets_path = args[i + 1].clone();
                     i += 1;
+                } else {
+                    eprintln!("❌ --targets requires a file path");
+                    std::process::exit(1);
                 }
             }
             "--input" | "-i" => {
                 if i + 1 < args.len() {
                     config.input_dir = args[i + 1].clone();
                     i += 1;
+                } else {
+                    eprintln!("❌ --input requires a directory path");
+                    std::process::exit(1);
                 }
             }
             "--output" | "-o" => {
                 if i + 1 < args.len() {
                     config.output_path = args[i + 1].clone();
                     i += 1;
+                } else {
+                    eprintln!("❌ --output requires a file path");
+                    std::process::exit(1);
                 }
             }
             "--threads" | "-n" => {
                 if i + 1 < args.len() {
                     match args[i + 1].parse::<usize>() {
-                        Ok(n) => config.threads = n,
+                        Ok(n) if n > 0 => config.threads = n,
+                        Ok(_) => {
+                            eprintln!("❌ --threads must be greater than 0");
+                            std::process::exit(1);
+                        }
                         Err(e) => {
                             eprintln!("❌ Invalid thread count '{}': {}", args[i + 1], e);
                             std::process::exit(1);
                         }
                     }
                     i += 1;
+                } else {
+                    eprintln!("❌ --threads requires a number");
+                    std::process::exit(1);
                 }
             }
             "--help" | "-h" => {

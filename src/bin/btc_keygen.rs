@@ -71,10 +71,30 @@ fn run_generator_mode(args: &[String]) {
 /// - Output: Handles matches (file + console)
 /// - Pipeline: Orchestrates everything
 fn run_scan_mode(args: &[String]) {
-    // Parse arguments
-    let targets_path = parse_string_arg(args, "--targets").unwrap_or("targets.json".to_string());
-    let start_offset = parse_u64_arg(args, "--start").unwrap_or(1);
-    let output_file = parse_string_arg(args, "--output").unwrap_or("matches.txt".to_string());
+    // Parse ALL arguments using centralized parser
+    // This ensures --batch, --threads, --format etc. are not ignored
+    let mut config = parse_args(args);
+    
+    // Override specific scan-mode settings
+    let targets_path = parse_string_arg(args, "--targets").unwrap_or_else(|| "targets.json".to_string());
+    let output_file = parse_string_arg(args, "--output").unwrap_or_else(|| "matches.txt".to_string());
+    
+    // Scan-mode specific overrides from command line
+    if let Some(start) = parse_u64_arg(args, "--start") {
+        config.start_offset = start;
+    }
+    if let Some(end) = parse_u64_arg(args, "--end") {
+        config.end_offset = Some(end);
+    }
+    
+    // Scan mode always uses Raw format (no disk I/O until match)
+    config.output_format = OutputFormat::Raw;
+    
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        eprintln!("❌ Invalid configuration: {}", e);
+        std::process::exit(1);
+    }
     
     // ========================================================================
     // 1. READER MODULE: Load targets
@@ -87,15 +107,6 @@ fn run_scan_mode(args: &[String]) {
             eprintln!("❌ Failed to load targets: {}", e);
             std::process::exit(1);
         }
-    };
-    
-    // ========================================================================
-    // 2. GENERATOR MODULE: Initialize GPU
-    // ========================================================================
-    let config = GeneratorConfig {
-        start_offset,
-        output_format: OutputFormat::Raw,
-        ..Default::default()
     };
     
     let gpu_gen = match GpuKeyGenerator::new(config) {
@@ -288,50 +299,108 @@ fn parse_args(args: &[String]) -> GeneratorConfig {
                 if i + 1 < args.len() {
                     config.output_dir = args[i + 1].clone();
                     i += 1;
+                } else {
+                    eprintln!("❌ --output requires a directory path");
+                    std::process::exit(1);
                 }
             }
             "--format" | "-f" => {
                 if i + 1 < args.len() {
-                    config.output_format = match args[i + 1].to_lowercase().as_str() {
+                    let format_str = args[i + 1].to_lowercase();
+                    config.output_format = match format_str.as_str() {
                         "binary" | "bin" => OutputFormat::Binary,
                         "both" => OutputFormat::Both,
                         "compact" | "cbin" => OutputFormat::Compact,
                         "raw" => OutputFormat::Raw,
-                        _ => OutputFormat::Json,
+                        "json" => OutputFormat::Json,
+                        _ => {
+                            eprintln!("❌ Invalid format '{}'. Valid options: json, binary, compact, raw, both", format_str);
+                            std::process::exit(1);
+                        }
                     };
                     i += 1;
+                } else {
+                    eprintln!("❌ --format requires a value (json, binary, compact, raw, both)");
+                    std::process::exit(1);
                 }
             }
             "--batch" | "-b" => {
                 if i + 1 < args.len() {
-                    if let Ok(n) = args[i + 1].parse() {
-                        config.batch_size = n;
+                    match args[i + 1].parse::<usize>() {
+                        Ok(n) if n > 0 => config.batch_size = n,
+                        Ok(_) => {
+                            eprintln!("❌ --batch must be greater than 0");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid batch size '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
                     }
                     i += 1;
+                } else {
+                    eprintln!("❌ --batch requires a number");
+                    std::process::exit(1);
                 }
             }
             "--keys-per-file" | "-k" => {
                 if i + 1 < args.len() {
-                    if let Ok(n) = args[i + 1].parse() {
-                        config.keys_per_file = n;
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) if n > 0 => config.keys_per_file = n,
+                        Ok(_) => {
+                            eprintln!("❌ --keys-per-file must be greater than 0");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid keys-per-file value '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
                     }
                     i += 1;
+                } else {
+                    eprintln!("❌ --keys-per-file requires a number");
+                    std::process::exit(1);
                 }
             }
             "--threads" | "-t" => {
                 if i + 1 < args.len() {
-                    if let Ok(n) = args[i + 1].parse() {
-                        config.threads = n;
+                    match args[i + 1].parse::<usize>() {
+                        Ok(n) => config.threads = n,
+                        Err(e) => {
+                            eprintln!("❌ Invalid thread count '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
                     }
                     i += 1;
+                } else {
+                    eprintln!("❌ --threads requires a number");
+                    std::process::exit(1);
                 }
             }
             "--start-offset" => {
                 if i + 1 < args.len() {
-                    if let Ok(n) = args[i + 1].parse() {
-                        config.start_offset = n;
+                    let val = &args[i + 1];
+                    let result = if val.starts_with("0x") || val.starts_with("0X") {
+                        u64::from_str_radix(&val[2..], 16)
+                    } else {
+                        val.parse()
+                    };
+                    match result {
+                        Ok(n) if n > 0 => config.start_offset = n,
+                        Ok(_) => {
+                            eprintln!("❌ --start-offset must be greater than 0 (0 is invalid private key)");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid start-offset '{}': {}", val, e);
+                            eprintln!("   Expected: decimal (123456) or hex (0x1E240)");
+                            std::process::exit(1);
+                        }
                     }
                     i += 1;
+                } else {
+                    eprintln!("❌ --start-offset requires a number");
+                    std::process::exit(1);
                 }
             }
             "--help" | "-h" => {
@@ -347,7 +416,8 @@ fn parse_args(args: &[String]) -> GeneratorConfig {
 }
 
 fn parse_target(args: &[String]) -> Option<u64> {
-    for i in 0..args.len() - 1 {
+    // Use saturating_sub to prevent panic when args is empty or has 1 element
+    for i in 0..args.len().saturating_sub(1) {
         if args[i] == "--target" || args[i] == "-n" {
             return args[i + 1].parse().ok();
         }
@@ -356,7 +426,8 @@ fn parse_target(args: &[String]) -> Option<u64> {
 }
 
 fn parse_seed(args: &[String]) -> Option<u64> {
-    for i in 0..args.len() - 1 {
+    // Use saturating_sub to prevent panic when args is empty or has 1 element
+    for i in 0..args.len().saturating_sub(1) {
         if args[i] == "--seed" || args[i] == "-s" {
             return args[i + 1].parse().ok();
         }

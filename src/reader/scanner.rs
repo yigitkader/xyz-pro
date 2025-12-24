@@ -484,8 +484,30 @@ impl RawFileScanner {
     
     /// Watch directory for new files and scan them
     pub fn watch_and_scan<P: AsRef<Path>>(&self, dir: P, interval_secs: u64) -> Result<(), String> {
+        // Default: no external stop flag, runs until Ctrl+C kills the process
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.watch_and_scan_with_flag(dir, interval_secs, running)
+    }
+    
+    /// Watch directory for new files and scan them with external stop flag
+    /// 
+    /// This version accepts an external `running` flag that can be set to false
+    /// to gracefully stop the watch loop. This prevents data loss that would occur
+    /// if the process was terminated with exit(0) during a file write.
+    /// 
+    /// # Arguments
+    /// * `dir` - Directory to watch for new .raw files
+    /// * `interval_secs` - How often to check for new files
+    /// * `running` - Atomic flag that when set to false, stops the loop gracefully
+    pub fn watch_and_scan_with_flag<P: AsRef<Path>>(
+        &self, 
+        dir: P, 
+        interval_secs: u64,
+        running: Arc<std::sync::atomic::AtomicBool>
+    ) -> Result<(), String> {
         use std::thread;
         use std::time::Duration;
+        use std::sync::atomic::Ordering;
         
         let dir = dir.as_ref().to_path_buf();
         let mut scanned_files: HashSet<PathBuf> = HashSet::new();
@@ -493,7 +515,7 @@ impl RawFileScanner {
         println!("👀 Watching {} for new .raw files...", dir.display());
         println!("   Press Ctrl+C to stop");
         
-        loop {
+        while running.load(Ordering::SeqCst) {
             // Find new files
             let current_files: Vec<PathBuf> = fs::read_dir(&dir)
                 .map_err(|e| format!("Failed to read directory: {}", e))?
@@ -504,6 +526,11 @@ impl RawFileScanner {
                 .collect();
             
             for file in current_files {
+                // Check running flag before each file to allow quick shutdown
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                
                 println!("📄 New file: {:?}", file);
                 
                 match self.scan_file(&file) {
@@ -523,8 +550,16 @@ impl RawFileScanner {
                 }
             }
             
-            thread::sleep(Duration::from_secs(interval_secs));
+            // Check running flag during sleep to allow quick shutdown
+            for _ in 0..(interval_secs * 10) {
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         }
+        
+        Ok(())
     }
 }
 
