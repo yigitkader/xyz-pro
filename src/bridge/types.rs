@@ -239,6 +239,156 @@ impl<'a> Iterator for KeyBatchIter<'a> {
 
 impl<'a> ExactSizeIterator for KeyBatchIter<'a> {}
 
+/// GPU Error types based on Metal MTLCommandBufferError codes
+/// These provide more reliable error classification than string matching
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum GpuErrorCode {
+    /// No error
+    None = 0,
+    /// Internal error (MTLCommandBufferErrorInternal = 1)
+    Internal = 1,
+    /// Timeout (MTLCommandBufferErrorTimeout = 2)
+    Timeout = 2,
+    /// Page fault - GPU memory access error (MTLCommandBufferErrorPageFault = 3)
+    PageFault = 3,
+    /// Access revoked / blacklisted (MTLCommandBufferErrorAccessRevoked = 4)
+    AccessRevoked = 4,
+    /// Not permitted (MTLCommandBufferErrorNotPermitted = 7)
+    NotPermitted = 7,
+    /// Out of memory (MTLCommandBufferErrorOutOfMemory = 8)
+    OutOfMemory = 8,
+    /// Invalid resource (MTLCommandBufferErrorInvalidResource = 9)
+    InvalidResource = 9,
+    /// Memoryless texture error (MTLCommandBufferErrorMemoryless = 10)
+    Memoryless = 10,
+    /// Device reset (MTLCommandBufferErrorDeviceReset = 11)
+    DeviceReset = 11,
+    /// Stack overflow (MTLCommandBufferErrorStackOverflow = 12)
+    StackOverflow = 12,
+    /// Unknown error code
+    Unknown = 999,
+}
+
+impl GpuErrorCode {
+    /// Convert from Metal error code integer
+    pub fn from_code(code: u64) -> Self {
+        match code {
+            0 => Self::None,
+            1 => Self::Internal,
+            2 => Self::Timeout,
+            3 => Self::PageFault,
+            4 => Self::AccessRevoked,
+            7 => Self::NotPermitted,
+            8 => Self::OutOfMemory,
+            9 => Self::InvalidResource,
+            10 => Self::Memoryless,
+            11 => Self::DeviceReset,
+            12 => Self::StackOverflow,
+            _ => Self::Unknown,
+        }
+    }
+    
+    /// Check if this error is fatal (non-recoverable)
+    /// Fatal errors indicate hardware/driver issues that won't resolve with retries
+    #[inline]
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            // These are always fatal - hardware/driver level failures
+            Self::Internal => true,
+            Self::PageFault => true,
+            Self::AccessRevoked => true,
+            Self::NotPermitted => true,
+            Self::OutOfMemory => true,
+            Self::InvalidResource => true,
+            Self::Memoryless => true,
+            Self::DeviceReset => true,
+            Self::StackOverflow => true,
+            // These might be recoverable
+            Self::None => false,
+            Self::Timeout => false, // Could be transient load
+            Self::Unknown => false, // Be conservative with unknown
+        }
+    }
+    
+    /// Check if this error might be recoverable with retry
+    #[inline]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Timeout => true, // Might succeed on retry
+            Self::Unknown => true, // Give it a chance
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for GpuErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::Internal => write!(f, "Internal GPU Error"),
+            Self::Timeout => write!(f, "GPU Timeout"),
+            Self::PageFault => write!(f, "GPU Page Fault"),
+            Self::AccessRevoked => write!(f, "GPU Access Revoked"),
+            Self::NotPermitted => write!(f, "GPU Operation Not Permitted"),
+            Self::OutOfMemory => write!(f, "GPU Out of Memory"),
+            Self::InvalidResource => write!(f, "Invalid GPU Resource"),
+            Self::Memoryless => write!(f, "Memoryless Texture Error"),
+            Self::DeviceReset => write!(f, "GPU Device Reset"),
+            Self::StackOverflow => write!(f, "GPU Stack Overflow"),
+            Self::Unknown => write!(f, "Unknown GPU Error"),
+        }
+    }
+}
+
+/// GPU Error with both code and message
+#[derive(Debug, Clone)]
+pub struct GpuError {
+    /// Error code from Metal API
+    pub code: GpuErrorCode,
+    /// Human-readable error message
+    pub message: String,
+}
+
+impl GpuError {
+    pub fn new(code: GpuErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+    
+    /// Create from error code only
+    pub fn from_code(code: u64) -> Self {
+        let gpu_code = GpuErrorCode::from_code(code);
+        Self {
+            code: gpu_code,
+            message: gpu_code.to_string(),
+        }
+    }
+    
+    /// Check if this error is fatal
+    #[inline]
+    pub fn is_fatal(&self) -> bool {
+        self.code.is_fatal()
+    }
+    
+    /// Check if this error is retriable
+    #[inline]
+    pub fn is_retriable(&self) -> bool {
+        self.code.is_retriable()
+    }
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for GpuError {}
+
 /// Type of address match
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchType {

@@ -175,7 +175,14 @@ impl KeyGenerator for GpuGeneratorAdapter {
         
         // FIXED: Wait for the ACTUAL dispatched command buffer
         // Previously this created an empty buffer which was an anti-pattern
-        self.inner.wait_for_completion(gpu_idx);
+        // Now properly checks for GPU errors (OutOfMemory, PageFault, etc.)
+        if let Err(e) = self.inner.wait_for_completion(gpu_idx) {
+            return Err(format!("GPU command buffer error: {}", e));
+        }
+        
+        // RACE CONDITION PREVENTION: Mark buffer as in-use before reading
+        // This prevents GPU from dispatching to this buffer while we're copying
+        bs.in_use.store(true, std::sync::atomic::Ordering::Release);
         
         // Get GPU output pointer (Unified Memory - zero-copy)
         let gpu_ptr = bs.output_buffer.contents() as *const u8;
@@ -190,7 +197,11 @@ impl KeyGenerator for GpuGeneratorAdapter {
             std::ptr::copy_nonoverlapping(gpu_ptr, buffer.as_mut_ptr(), self.buffer_size);
         }
         
-        // Dispatch next GPU batch (after copy is complete)
+        // RACE CONDITION PREVENTION: Mark buffer as available BEFORE dispatching
+        // The copy is complete, so GPU can now write to this buffer
+        bs.in_use.store(false, std::sync::atomic::Ordering::Release);
+        
+        // Dispatch next GPU batch (after copy is complete and in_use is released)
         let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
         self.inner.dispatch_glv(gpu_idx, next_offset)?;
         
@@ -231,6 +242,18 @@ impl KeyGenerator for GpuGeneratorAdapter {
     
     fn total_generated(&self) -> u64 {
         self.inner.total_generated()
+    }
+    
+    fn is_range_complete(&self) -> bool {
+        self.inner.is_range_complete()
+    }
+    
+    fn end_offset(&self) -> Option<u64> {
+        self.inner.end_offset()
+    }
+    
+    fn progress_percent(&self) -> Option<f64> {
+        self.inner.progress_percent()
     }
 }
 

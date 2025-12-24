@@ -156,6 +156,17 @@ unsafe impl Sync for PooledBuffer {}
 /// 
 /// Each buffer set has its own command queue and tracks the last dispatched
 /// command buffer for proper GPU synchronization.
+/// 
+/// ## Race Condition Prevention
+/// The `in_use` flag prevents GPU from writing to a buffer that CPU is still reading.
+/// Without this, if CPU matching is slower than GPU generation, the GPU could
+/// overwrite data that the CPU is still processing, causing data corruption.
+/// 
+/// Flow:
+/// 1. GPU dispatch: Check `in_use == false`, then dispatch (buffer owned by GPU)
+/// 2. GPU complete: `wait_for_completion()` finishes
+/// 3. CPU read start: Set `in_use = true` (buffer owned by CPU)
+/// 4. CPU read end: Set `in_use = false` (buffer available for next dispatch)
 pub struct BufferSet {
     pub queue: CommandQueue,
     pub base_privkey_buf: Buffer,
@@ -166,6 +177,10 @@ pub struct BufferSet {
     /// Last dispatched command buffer - used for proper GPU sync
     /// CRITICAL: Always wait on THIS buffer, not a new empty one
     pending_command: std::sync::Mutex<Option<metal::CommandBuffer>>,
+    /// Buffer in-use flag - prevents race condition between GPU write and CPU read
+    /// true = CPU is reading this buffer, GPU must not dispatch to it
+    /// false = buffer is available for GPU dispatch
+    pub in_use: AtomicBool,
 }
 
 /// GPU configuration based on hardware tier
@@ -256,6 +271,16 @@ unsafe impl Sync for GpuKeyGenerator {}
 impl GpuKeyGenerator {
     /// Create a new GPU key generator with all optimizations
     pub fn new(config: GeneratorConfig) -> Result<Self, String> {
+        // Validate configuration
+        config.validate()?;
+        
+        // Warn about range limits
+        if let Some(end) = config.end_offset {
+            let range_size = end.saturating_sub(config.start_offset);
+            println!("📊 Range scan mode: {} to {} ({} keys)", 
+                     config.start_offset, end, range_size);
+        }
+        
         let device = Device::system_default()
             .ok_or("No Metal device found")?;
         
@@ -305,6 +330,7 @@ impl GpuKeyGenerator {
                 output_buffer: device.new_buffer(output_buffer_size as u64, storage),
                 keys_per_thread_buf: device.new_buffer(4, storage),
                 pending_command: std::sync::Mutex::new(None),
+                in_use: AtomicBool::new(false), // Initially available for dispatch
             });
             println!("   Queue {}: {} MB output buffer", i, output_buffer_size / (1024 * 1024));
         }
@@ -451,9 +477,45 @@ impl GpuKeyGenerator {
         self.current_offset.load(Ordering::Relaxed)
     }
     
+    /// Get end offset (if configured)
+    pub fn end_offset(&self) -> Option<u64> {
+        self.config.end_offset
+    }
+    
+    /// Get start offset
+    pub fn start_offset(&self) -> u64 {
+        self.config.start_offset
+    }
+    
+    /// Check if the configured range has been completely scanned
+    /// Returns true if end_offset is set AND current_offset >= end_offset
+    pub fn is_range_complete(&self) -> bool {
+        if let Some(end) = self.config.end_offset {
+            self.current_offset.load(Ordering::Relaxed) >= end
+        } else {
+            false
+        }
+    }
+    
+    /// Get progress percentage (0.0 to 100.0) if end_offset is configured
+    pub fn progress_percent(&self) -> Option<f64> {
+        self.config.end_offset.map(|end| {
+            let start = self.config.start_offset;
+            let current = self.current_offset.load(Ordering::Relaxed);
+            let total = end.saturating_sub(start);
+            let done = current.saturating_sub(start);
+            if total == 0 {
+                100.0
+            } else {
+                (done as f64 / total as f64 * 100.0).min(100.0)
+            }
+        })
+    }
+    
     /// Check if should stop
     pub fn should_stop_flag(&self) -> bool {
-        self.should_stop.load(Ordering::SeqCst)
+        // Stop if explicitly requested OR if range is complete
+        self.should_stop.load(Ordering::SeqCst) || self.is_range_complete()
     }
     
     /// Get total generated
@@ -544,6 +606,37 @@ impl GpuKeyGenerator {
     fn dispatch_batch_internal(&self, buf_idx: usize, base_offset: u64, use_glv: bool) -> Result<(), String> {
         let bs = &self.buffer_sets[buf_idx];
         
+        // RACE CONDITION PREVENTION: Wait for CPU to finish reading this buffer
+        // If CPU is still reading (in_use = true), we cannot dispatch to this buffer
+        // as it would corrupt data being processed.
+        // 
+        // Spin-wait with exponential backoff to avoid busy-waiting
+        let mut spin_count = 0;
+        const MAX_SPINS: u32 = 1000;
+        const YIELD_THRESHOLD: u32 = 10;
+        
+        while bs.in_use.load(Ordering::Acquire) {
+            spin_count += 1;
+            
+            if spin_count > MAX_SPINS {
+                // Buffer still in use after many attempts - this indicates
+                // CPU is severely lagging behind GPU. Log warning and wait.
+                if spin_count == MAX_SPINS + 1 {
+                    eprintln!("⚠️ Buffer {} still in use - CPU lagging behind GPU", buf_idx);
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            } else if spin_count > YIELD_THRESHOLD {
+                // Yield to other threads after initial spins
+                std::thread::yield_now();
+            }
+            // else: spin-wait (fast path for short waits)
+            
+            // Check for shutdown request
+            if self.should_stop.load(Ordering::SeqCst) {
+                return Err("Generator stopped while waiting for buffer".to_string());
+            }
+        }
+        
         let base_privkey = Self::offset_to_privkey(base_offset);
         
         // LOOK-AHEAD: Try to use pre-computed pubkey (thread-safe)
@@ -616,7 +709,11 @@ impl GpuKeyGenerator {
     /// If the mutex is poisoned (a previous holder panicked), we signal
     /// shutdown rather than attempting to use potentially corrupted state.
     /// This follows fail-fast principles for GPU operations.
-    pub fn wait_for_completion(&self, buf_idx: usize) {
+    /// 
+    /// # Return Value
+    /// Returns Ok(()) on success, or Err with GpuError on failure.
+    /// Fatal errors (OutOfMemory, PageFault, etc.) trigger automatic shutdown.
+    pub fn wait_for_completion(&self, buf_idx: usize) -> Result<(), String> {
         let bs = &self.buffer_sets[buf_idx];
         
         // Take ownership of command buffer while releasing lock immediately
@@ -639,17 +736,75 @@ impl GpuKeyGenerator {
         // Now safe to wait without holding the lock
         if let Some(cb) = cb_opt {
             cb.wait_until_completed();
+            
+            // Check command buffer status for errors
+            // MTLCommandBufferStatus: 0=NotEnqueued, 1=Enqueued, 2=Committed, 
+            //                         3=Scheduled, 4=Completed, 5=Error
+            let status = cb.status();
+            
+            if status == metal::MTLCommandBufferStatus::Error {
+                // Extract error code from Metal
+                // MTLCommandBufferError codes are defined in Metal framework
+                let error_msg = format!(
+                    "GPU command buffer failed with status Error. \
+                     This may indicate OutOfMemory, PageFault, or other GPU errors. \
+                     Status code: {:?}",
+                    status
+                );
+                
+                // Signal shutdown for fatal errors
+                eprintln!("❌ GPU ERROR: {}", error_msg);
+                self.should_stop.store(true, Ordering::SeqCst);
+                
+                return Err(error_msg);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Wait for completion without checking status (for backward compatibility)
+    /// Used internally where error handling is done at a higher level
+    #[allow(dead_code)]
+    fn wait_for_completion_unchecked(&self, buf_idx: usize) {
+        let bs = &self.buffer_sets[buf_idx];
+        
+        let cb_opt = {
+            let mut pending = match bs.pending_command.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending.take()
+        };
+        
+        if let Some(cb) = cb_opt {
+            cb.wait_until_completed();
         }
     }
     
     /// Wait for batch and process with zero-copy - NO STRING ALLOCATIONS
     /// Returns raw key data directly from GPU buffer without any String conversions
+    /// 
+    /// If GPU error occurs, returns empty batch and signals shutdown via should_stop.
+    /// 
+    /// ## Race Condition Prevention
+    /// Sets `in_use = true` while reading buffer contents, preventing GPU from
+    /// dispatching new work to this buffer until CPU finishes reading.
     fn process_batch_raw(&self, buf_idx: usize) -> PooledBuffer {
         let bs = &self.buffer_sets[buf_idx];
         
         // FIXED: Wait for the ACTUAL dispatched command buffer
         // Previously this created an empty buffer which was an anti-pattern
-        self.wait_for_completion(buf_idx);
+        if let Err(e) = self.wait_for_completion(buf_idx) {
+            // GPU error occurred - should_stop is already set in wait_for_completion
+            // Return empty batch; upper level will see should_stop() = true
+            eprintln!("⚠️ GPU batch processing failed: {}", e);
+            return self.buffer_pool.wrap(self.buffer_pool.acquire());
+        }
+        
+        // RACE CONDITION PREVENTION: Mark buffer as in-use before reading
+        // This prevents GPU from dispatching to this buffer while we're reading
+        bs.in_use.store(true, Ordering::Release);
         
         // Zero-copy from unified memory
         let output_ptr = bs.output_buffer.contents() as *const u8;
@@ -673,6 +828,10 @@ impl GpuKeyGenerator {
                 }
             }
         }
+        
+        // RACE CONDITION PREVENTION: Mark buffer as available for next dispatch
+        // Must be done AFTER all reads are complete
+        bs.in_use.store(false, Ordering::Release);
         
         pooled
     }
@@ -899,7 +1058,10 @@ impl GpuKeyGenerator {
             self.dispatch_batch(next_idx, next_offset)?;
             
             // 2. WAIT FOR CURRENT: Now wait for the batch we're about to process
-            self.wait_for_completion(process_idx);
+            // Check for GPU errors (OutOfMemory, PageFault, etc.)
+            if let Err(e) = self.wait_for_completion(process_idx) {
+                return Err(format!("GPU batch processing failed: {}", e));
+            }
             
             let bs = &self.buffer_sets[process_idx];
             
@@ -1046,7 +1208,10 @@ impl GpuKeyGenerator {
             self.dispatch_batch_glv(next_idx, next_offset)?;
             
             // 2. WAIT FOR CURRENT: Now wait for the batch we're about to process
-            self.wait_for_completion(process_idx);
+            // Check for GPU errors (OutOfMemory, PageFault, etc.)
+            if let Err(e) = self.wait_for_completion(process_idx) {
+                return Err(format!("GPU batch processing failed: {}", e));
+            }
             
             let bs = &self.buffer_sets[process_idx];
             

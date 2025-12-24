@@ -728,53 +728,82 @@ ulong4 scalar_mul_mod_n(ulong4 a, ulong4 b) {
         return lo_part;
     }
     
-    // Compute hi * C (max 385 bits)
-    ulong t[7];
-    mul_by_reduction_constant(hi_part, t);
+    // =========================================================================
+    // ITERATIVE REDUCTION LOOP
+    // =========================================================================
+    // Mathematical analysis:
+    // - C = 2^256 mod n ≈ 2^129 (128.9 bits)
+    // - Each round: hi_part (X bits) * C → (X + 129) bits total
+    // - Upper portion (overflow) = (X + 129 - 256) = (X - 127) bits
+    //
+    // Convergence per round:
+    // - Round 1: 256-bit hi → 129-bit overflow
+    // - Round 2: 129-bit    → 2-bit overflow  
+    // - Round 3: 2-bit      → 0-bit (typically)
+    // - Round 4+: cleanup for edge cases
+    //
+    // We use a loop with maximum 6 iterations (mathematically sufficient)
+    // to guarantee complete reduction. In practice, 2-3 iterations suffice.
+    // =========================================================================
     
-    // Add to lo_part
-    ulong carry = 0;
-    lo_part.x = add_with_carry(lo_part.x, t[0], 0, &carry);
-    lo_part.y = add_with_carry(lo_part.y, t[1], carry, &carry);
-    lo_part.z = add_with_carry(lo_part.z, t[2], carry, &carry);
-    lo_part.w = add_with_carry(lo_part.w, t[3], carry, &carry);
+    ulong4 current_hi = hi_part;
     
-    // Handle overflow (t[4..6] + carry)
-    ulong4 overflow = {t[4] + carry, t[5], t[6], 0};
-    
-    if ((overflow.x | overflow.y | overflow.z) != 0) {
-        // Second reduction round
-        ulong t2[7];
-        mul_by_reduction_constant(overflow, t2);
-        
-        carry = 0;
-        lo_part.x = add_with_carry(lo_part.x, t2[0], 0, &carry);
-        lo_part.y = add_with_carry(lo_part.y, t2[1], carry, &carry);
-        lo_part.z = add_with_carry(lo_part.z, t2[2], carry, &carry);
-        lo_part.w = add_with_carry(lo_part.w, t2[3], carry, &carry);
-        
-        // Third round (extremely rare)
-        if (carry || t2[4] || t2[5] || t2[6]) {
-            ulong4 ov2 = {t2[4] + carry, t2[5], t2[6], 0};
-            ulong t3[7];
-            mul_by_reduction_constant(ov2, t3);
-            
-            carry = 0;
-            lo_part.x = add_with_carry(lo_part.x, t3[0], 0, &carry);
-            lo_part.y = add_with_carry(lo_part.y, t3[1], carry, &carry);
-            lo_part.z = add_with_carry(lo_part.z, t3[2], carry, &carry);
-            lo_part.w = add_with_carry(lo_part.w, t3[3], carry, &carry);
+    // Reduction loop: reduce while high part is non-zero
+    // Maximum 6 rounds mathematically guarantees convergence
+    #pragma unroll 1
+    for (int round = 0; round < 6; round++) {
+        // Check if reduction is complete
+        if ((current_hi.x | current_hi.y | current_hi.z | current_hi.w) == 0) {
+            break;
         }
+        
+        // Compute current_hi * C (produces up to 385 bits)
+        ulong t[7];
+        mul_by_reduction_constant(current_hi, t);
+        
+        // Add t[0..3] to lo_part with carry tracking
+        ulong carry = 0;
+        lo_part.x = add_with_carry(lo_part.x, t[0], 0, &carry);
+        lo_part.y = add_with_carry(lo_part.y, t[1], carry, &carry);
+        lo_part.z = add_with_carry(lo_part.z, t[2], carry, &carry);
+        lo_part.w = add_with_carry(lo_part.w, t[3], carry, &carry);
+        
+        // Build new high part from t[4..6] + carry
+        // CRITICAL: Must use add_with_carry chain to handle overflow
+        ulong ov_carry = 0;
+        current_hi.x = add_with_carry(t[4], carry, 0, &ov_carry);
+        current_hi.y = add_with_carry(t[5], ov_carry, 0, &ov_carry);
+        current_hi.z = add_with_carry(t[6], ov_carry, 0, &ov_carry);
+        current_hi.w = ov_carry;
     }
     
-    // Step 3: Final reduction - subtract n while result >= n
-    // Use a loop to handle all edge cases robustly
-    // In practice, at most 3-4 iterations are ever needed due to the reduction algorithm,
-    // but we loop up to 8 times to guarantee correctness for any edge case.
-    // Most common case: 0-2 iterations (handled by branch prediction).
-    #pragma unroll 2
-    for (int i = 0; i < 8 && cmp256(lo_part, SECP256K1_N) >= 0; i++) {
-        lo_part = sub256(lo_part, SECP256K1_N);
+    // =========================================================================
+    // FINAL MODULAR REDUCTION
+    // =========================================================================
+    // After the reduction loop, lo_part < 2^256 but may still be >= n.
+    // 
+    // Mathematical bound on lo_part after reduction:
+    // The accumulated sum from all reduction rounds is bounded.
+    // Since each round adds at most C * max_hi_value, and this decreases
+    // geometrically, the total is bounded by:
+    //   lo_part < original_lo + C * (2^256 + 2^129 + 2^2 + ...) < 2 * 2^256
+    //
+    // However, since we're working mod 2^256 (overflow goes to hi_part),
+    // the actual lo_part < 2^256.
+    //
+    // The key insight: after reduction, lo_part can be at most a few
+    // multiples of n above [0, n-1]. Empirically and theoretically:
+    // - Typical case: lo_part < 2n (1 subtraction)
+    // - Worst case: lo_part < 4n (3 subtractions)
+    //
+    // We use 4 iterations for safety margin.
+    // =========================================================================
+    
+    #pragma unroll 4
+    for (int i = 0; i < 4; i++) {
+        if (cmp256(lo_part, SECP256K1_N) >= 0) {
+            lo_part = sub256(lo_part, SECP256K1_N);
+        }
     }
     
     return lo_part;

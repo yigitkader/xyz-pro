@@ -125,6 +125,10 @@ pub struct GeneratorConfig {
     pub keys_per_file: u64,
     /// Starting offset for private keys (optional)
     pub start_offset: u64,
+    /// Ending offset for private keys (optional, None = unlimited/wrap around)
+    /// When set, generator stops when current_offset reaches this value.
+    /// This is useful for scanning specific ranges (e.g., Bitcoin Puzzle challenges).
+    pub end_offset: Option<u64>,
 }
 
 impl Default for GeneratorConfig {
@@ -136,7 +140,33 @@ impl Default for GeneratorConfig {
             output_dir: "./output".to_string(),
             keys_per_file: 1_000_000_000,
             start_offset: 1, // Start from 1 (0 is invalid private key)
+            end_offset: None, // No limit by default
         }
+    }
+}
+
+impl GeneratorConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if self.start_offset == 0 {
+            return Err("start_offset cannot be 0 (invalid private key)".to_string());
+        }
+        
+        if let Some(end) = self.end_offset {
+            if end <= self.start_offset {
+                return Err(format!(
+                    "end_offset ({}) must be greater than start_offset ({})",
+                    end, self.start_offset
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the total range size (if end_offset is set)
+    pub fn range_size(&self) -> Option<u64> {
+        self.end_offset.map(|end| end.saturating_sub(self.start_offset))
     }
 }
 

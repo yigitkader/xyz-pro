@@ -29,6 +29,23 @@ pub trait KeyGenerator: Send + Sync {
     
     /// Get total keys generated so far
     fn total_generated(&self) -> u64;
+    
+    /// Check if the configured range has been completely scanned
+    /// Returns true if end_offset is set AND current_offset >= end_offset
+    /// This prevents wrap-around when scanning specific ranges (e.g., Bitcoin Puzzles)
+    fn is_range_complete(&self) -> bool {
+        false // Default: no range limit
+    }
+    
+    /// Get the end offset if configured
+    fn end_offset(&self) -> Option<u64> {
+        None // Default: no limit
+    }
+    
+    /// Get progress percentage (0.0 to 100.0) if end_offset is configured
+    fn progress_percent(&self) -> Option<f64> {
+        None // Default: unknown progress
+    }
 }
 
 /// Matcher Trait

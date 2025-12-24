@@ -139,6 +139,13 @@ where
         self.print_banner();
         
         while !self.generator.should_stop() {
+            // Check if range is complete BEFORE generating next batch
+            // This prevents wrap-around when scanning specific ranges
+            if self.generator.is_range_complete() {
+                println!("🏁 Range scan complete - reached end offset");
+                break;
+            }
+            
             // 1. Generate batch (zero-copy from GPU) with retry logic
             let batch_data = self.generate_with_retry()?;
             let batch = KeyBatch::new(batch_data);
@@ -167,6 +174,14 @@ where
         self.output.flush()?;
         
         let elapsed = start_time.elapsed().as_secs_f64();
+        
+        // Print completion summary
+        if self.generator.is_range_complete() {
+            println!("✅ Range scan completed successfully!");
+            if let Some(progress) = self.generator.progress_percent() {
+                println!("   Progress: {:.2}%", progress);
+            }
+        }
         
         Ok(PipelineStats {
             keys_scanned: self.generator.total_generated(),
@@ -220,16 +235,65 @@ where
     /// - Compilation failed: Shader is broken
     /// - Invalid buffer: Memory corruption detected
     /// - Command encoder: Metal command buffer creation failed
+    /// 
+    /// # Error Detection Strategy
+    /// 1. First, check for Metal API error codes (most reliable)
+    /// 2. Fall back to string pattern matching for driver-specific messages
+    /// 
+    /// Note: Metal API returns MTLCommandBufferError codes which are more reliable
+    /// than string matching, but some drivers may format errors differently.
     #[inline]
     fn is_fatal_error(error: &str) -> bool {
+        use super::GpuErrorCode;
+        
+        // Strategy 1: Check for known Metal error code patterns
+        // Metal errors often include status codes like "Error" or code numbers
+        let error_lower = error.to_lowercase();
+        
+        // MTLCommandBufferStatus::Error indicates GPU failure
+        if error_lower.contains("status error") || 
+           error_lower.contains("status: error") ||
+           error_lower.contains("commandbufferstatus::error") {
+            return true;
+        }
+        
+        // Check for specific MTLCommandBufferError code mentions
+        // These are the fatal error codes from Metal API
+        const FATAL_ERROR_CODES: &[(&str, GpuErrorCode)] = &[
+            ("outofmemory", GpuErrorCode::OutOfMemory),
+            ("out of memory", GpuErrorCode::OutOfMemory),
+            ("pagefault", GpuErrorCode::PageFault),
+            ("page fault", GpuErrorCode::PageFault),
+            ("internal gpu error", GpuErrorCode::Internal),
+            ("internal error", GpuErrorCode::Internal),
+            ("accessrevoked", GpuErrorCode::AccessRevoked),
+            ("access revoked", GpuErrorCode::AccessRevoked),
+            ("notpermitted", GpuErrorCode::NotPermitted),
+            ("not permitted", GpuErrorCode::NotPermitted),
+            ("invalidresource", GpuErrorCode::InvalidResource),
+            ("invalid resource", GpuErrorCode::InvalidResource),
+            ("devicereset", GpuErrorCode::DeviceReset),
+            ("device reset", GpuErrorCode::DeviceReset),
+            ("stackoverflow", GpuErrorCode::StackOverflow),
+            ("stack overflow", GpuErrorCode::StackOverflow),
+        ];
+        
+        for (pattern, code) in FATAL_ERROR_CODES {
+            if error_lower.contains(pattern) && code.is_fatal() {
+                return true;
+            }
+        }
+        
+        // Strategy 2: Fall back to string pattern matching
+        // For driver-specific error messages not covered by Metal API
         const FATAL_PATTERNS: &[&str] = &[
             // Metal device errors
             "device lost",
             "device removed", 
             "gpu hang",
             "gpu reset",
+            "gpu error",
             // Memory errors
-            "out of memory",
             "memory allocation failed",
             "buffer too large",
             "storage allocation failed",
@@ -245,15 +309,15 @@ where
             "null pointer",
             // Command buffer errors
             "command encoder",
-            "command buffer",
             "execution aborted",
             // Generic fatal indicators
             "fatal",
             "unrecoverable",
             "panic",
+            // Metal-specific
+            "mtlcommandbuffererror",
         ];
         
-        let error_lower = error.to_lowercase();
         FATAL_PATTERNS.iter().any(|pattern| error_lower.contains(pattern))
     }
     
@@ -312,6 +376,18 @@ where
         println!("║           {:>10} P2SH (SegWit)                          ║", matcher_stats.p2sh);
         println!("║           {:>10} P2WPKH (Bech32)                        ║", matcher_stats.p2wpkh);
         println!("║  Batch:   {:>10} keys                                   ║", self.generator.batch_size());
+        
+        // Show range info if configured
+        if let Some(end) = self.generator.end_offset() {
+            let start = self.generator.current_offset();
+            let range_size = end.saturating_sub(start);
+            println!("╠════════════════════════════════════════════════════════════╣");
+            println!("║  📊 RANGE SCAN MODE                                        ║");
+            println!("║  Start:   0x{:016x}                          ║", start);
+            println!("║  End:     0x{:016x}                          ║", end);
+            println!("║  Range:   {} keys                          ║", format_number(range_size));
+        }
+        
         println!("╚════════════════════════════════════════════════════════════╝");
         println!();
     }
@@ -324,13 +400,19 @@ where
         let elapsed_secs = elapsed.as_secs_f64();
         let rate = total as f64 / elapsed_secs;
         
+        // Include progress percentage if range is configured
+        let progress_str = self.generator.progress_percent()
+            .map(|p| format!(" | {:.2}%", p))
+            .unwrap_or_default();
+        
         println!(
-            "⚡ {} keys | {:.2}M/sec | {:.1}M/min | Hits: {} | Offset: 0x{:012x}",
+            "⚡ {} keys | {:.2}M/sec | {:.1}M/min | Hits: {} | Offset: 0x{:012x}{}",
             format_number(total),
             rate / 1_000_000.0,
             rate * 60.0 / 1_000_000.0,
             matches,
-            offset
+            offset,
+            progress_str
         );
     }
     

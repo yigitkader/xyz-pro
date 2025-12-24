@@ -49,7 +49,7 @@ mod types;
 mod traits;
 mod pipeline;
 
-pub use types::{RawKeyData, KeyBatch, Match, MatchType};
+pub use types::{RawKeyData, KeyBatch, Match, MatchType, GpuError, GpuErrorCode};
 pub use traits::{KeyGenerator, Matcher, MatchOutput, MatcherStats, ConsoleOutput, FileOutput, CombinedOutput};
 pub use pipeline::{IntegratedPipeline, PipelineConfig, PipelineStats};
 
