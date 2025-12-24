@@ -14,12 +14,15 @@ use super::{KeyEntry, RawKeyData};
 pub struct AddressEncoder {
     /// Reusable buffer for Base58Check encoding
     base58_buffer: Vec<u8>,
+    /// Reusable buffer for Bech32 encoding
+    bech32_buffer: Vec<bech32::u5>,
 }
 
 impl AddressEncoder {
     pub fn new() -> Self {
         Self {
             base58_buffer: Vec::with_capacity(64),
+            bech32_buffer: Vec::with_capacity(33), // 1 (version) + 32 (hash in base32)
         }
     }
     
@@ -78,12 +81,13 @@ impl AddressEncoder {
     /// P2WPKH: Native SegWit Bech32 address
     /// Format: bech32(bc, 0, pubkey_hash)
     #[inline]
-    fn encode_p2wpkh(&self, pubkey_hash: &[u8; 20]) -> String {
-        // Witness version 0 + pubkey hash in base32
-        let mut data = vec![bech32::u5::try_from_u8(0).unwrap()];
-        data.extend(pubkey_hash.to_base32());
+    fn encode_p2wpkh(&mut self, pubkey_hash: &[u8; 20]) -> String {
+        // Reuse buffer - witness version 0 + pubkey hash in base32
+        self.bech32_buffer.clear();
+        self.bech32_buffer.push(bech32::u5::try_from_u8(0).unwrap());
+        self.bech32_buffer.extend(pubkey_hash.to_base32());
         
-        bech32::encode("bc", data, Variant::Bech32).unwrap_or_default()
+        bech32::encode("bc", &self.bech32_buffer, Variant::Bech32).unwrap_or_default()
     }
     
     // ========================================================================
@@ -111,7 +115,7 @@ impl AddressEncoder {
     
     /// P2WPKH from pre-computed pubkey hash
     #[inline]
-    pub fn encode_p2wpkh_from_hash(&self, pubkey_hash: &[u8; 20]) -> String {
+    pub fn encode_p2wpkh_from_hash(&mut self, pubkey_hash: &[u8; 20]) -> String {
         self.encode_p2wpkh(pubkey_hash)
     }
 }
@@ -187,7 +191,7 @@ mod tests {
     
     #[test]
     fn test_p2wpkh_format() {
-        let encoder = AddressEncoder::new();
+        let mut encoder = AddressEncoder::new();
         let hash = [0u8; 20];
         let addr = encoder.encode_p2wpkh(&hash);
         assert!(addr.starts_with("bc1q"));

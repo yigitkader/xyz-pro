@@ -224,11 +224,12 @@ fn run_cpu_mode(config: GeneratorConfig, target: Option<u64>, args: &[String]) {
     println!();
     
     let seed = parse_seed(args);
+    // config is moved into BatchProcessor - no clone needed
     let processor = if let Some(s) = seed {
         println!("🌱 Using seed: {}", s);
-        Arc::new(BatchProcessor::with_seed(config.clone(), s))
+        Arc::new(BatchProcessor::with_seed(config, s))
     } else {
-        Arc::new(BatchProcessor::new(config.clone()))
+        Arc::new(BatchProcessor::new(config))
     };
     
     let processor_clone = processor.clone();

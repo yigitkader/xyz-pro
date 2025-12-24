@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashSet;
 
 use rayon::prelude::*;
 
@@ -20,12 +21,36 @@ const MAGIC: &[u8; 4] = b"BTCR";
 const HEADER_SIZE: usize = 12; // magic(4) + count(8)
 const ENTRY_SIZE: usize = 72; // privkey(32) + hash160(20) + p2sh_hash(20)
 
+/// Address type enum - avoids String allocation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressType {
+    P2PKH,
+    P2SH,
+    P2WPKH,
+}
+
+impl AddressType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AddressType::P2PKH => "P2PKH",
+            AddressType::P2SH => "P2SH",
+            AddressType::P2WPKH => "P2WPKH",
+        }
+    }
+}
+
+impl std::fmt::Display for AddressType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// A match found during scanning
 #[derive(Debug, Clone)]
 pub struct Match {
     pub private_key: String,
     pub address: String,
-    pub address_type: String, // "P2PKH", "P2SH", "P2WPKH"
+    pub address_type: AddressType, // No heap allocation
     pub file: String,
     pub offset: u64,
 }
@@ -164,12 +189,19 @@ impl RawFileScanner {
         let chunk_size = 10_000; // Process 10K keys per chunk
         let num_chunks = (count as usize + chunk_size - 1) / chunk_size;
         
+        // Clone filename once, share via Arc to avoid per-match cloning
+        let filename_arc = Arc::new(filename);
+        
         let matches: Vec<Match> = (0..num_chunks)
             .into_par_iter()
             .flat_map(|chunk_idx| {
                 let start_key = chunk_idx * chunk_size;
                 let end_key = ((chunk_idx + 1) * chunk_size).min(count as usize);
-                let mut chunk_matches = Vec::new();
+                // Pre-allocate with reasonable capacity (matches are rare)
+                let mut chunk_matches = Vec::with_capacity(8);
+                
+                // Clone filename once per chunk instead of per match
+                let chunk_filename = filename_arc.to_string();
                 
                 for key_idx in start_key..end_key {
                     let offset = key_idx * ENTRY_SIZE;
@@ -182,8 +214,8 @@ impl RawFileScanner {
                     let pubkey_hash: [u8; 20] = entry[32..52].try_into().unwrap();
                     let p2sh_hash: [u8; 20] = entry[52..72].try_into().unwrap();
                     
-                    // Skip zero keys
-                    if privkey.iter().all(|&b| b == 0) {
+                    // Skip zero keys (fast check on first byte)
+                    if privkey[0] == 0 && privkey.iter().all(|&b| b == 0) {
                         continue;
                     }
                     
@@ -192,46 +224,49 @@ impl RawFileScanner {
                         self.targets.check_raw(&pubkey_hash, &p2sh_hash);
                     
                     if p2pkh_match || p2sh_match || p2wpkh_match {
-                        let privkey_hex = hex::encode(privkey);
+                        // Only encode private key once (hex is expensive)
+                        let mut privkey_hex = hex::encode(privkey);
                         
-                        // Create encoder for address generation
+                        // Thread-local encoder avoids allocation per call
                         thread_local! {
                             static ENCODER: std::cell::RefCell<AddressEncoder> = 
                                 std::cell::RefCell::new(AddressEncoder::new());
                         }
                         
+                        // Count matches to minimize privkey_hex cloning
+                        let match_count = p2pkh_match as u8 + p2sh_match as u8 + p2wpkh_match as u8;
+                        let mut matches_remaining = match_count;
+                        
                         if p2pkh_match {
+                            matches_remaining -= 1;
+                            let privkey = if matches_remaining > 0 { privkey_hex.clone() } else { std::mem::take(&mut privkey_hex) };
                             chunk_matches.push(Match {
-                                private_key: privkey_hex.clone(),
-                                address: ENCODER.with(|enc| {
-                                    enc.borrow().encode_p2pkh(&pubkey_hash)
-                                }),
-                                address_type: "P2PKH".to_string(),
-                                file: filename.clone(),
+                                private_key: privkey,
+                                address: ENCODER.with(|enc| enc.borrow_mut().encode_p2pkh(&pubkey_hash)),
+                                address_type: AddressType::P2PKH,
+                                file: chunk_filename.clone(),
                                 offset: key_idx as u64,
                             });
                         }
                         
                         if p2sh_match {
+                            matches_remaining -= 1;
+                            let privkey = if matches_remaining > 0 { privkey_hex.clone() } else { std::mem::take(&mut privkey_hex) };
                             chunk_matches.push(Match {
-                                private_key: privkey_hex.clone(),
-                                address: ENCODER.with(|enc| {
-                                    enc.borrow().encode_p2sh(&p2sh_hash)
-                                }),
-                                address_type: "P2SH".to_string(),
-                                file: filename.clone(),
+                                private_key: privkey,
+                                address: ENCODER.with(|enc| enc.borrow_mut().encode_p2sh(&p2sh_hash)),
+                                address_type: AddressType::P2SH,
+                                file: chunk_filename.clone(),
                                 offset: key_idx as u64,
                             });
                         }
                         
                         if p2wpkh_match {
                             chunk_matches.push(Match {
-                                private_key: privkey_hex.clone(),
-                                address: ENCODER.with(|enc| {
-                                    enc.borrow().encode_p2wpkh(&pubkey_hash)
-                                }),
-                                address_type: "P2WPKH".to_string(),
-                                file: filename.clone(),
+                                private_key: privkey_hex, // Last use, move instead of clone
+                                address: ENCODER.with(|enc| enc.borrow_mut().encode_p2wpkh(&pubkey_hash)),
+                                address_type: AddressType::P2WPKH,
+                                file: chunk_filename.clone(),
                                 offset: key_idx as u64,
                             });
                         }
@@ -243,7 +278,7 @@ impl RawFileScanner {
             .collect();
         
         if !matches.is_empty() {
-            println!("🎯 Found {} matches in {}", matches.len(), filename);
+            println!("🎯 Found {} matches in {}", matches.len(), filename_arc);
         }
         
         Ok((count, matches))
@@ -251,7 +286,6 @@ impl RawFileScanner {
     
     /// Watch directory for new files and scan them
     pub fn watch_and_scan<P: AsRef<Path>>(&self, dir: P, interval_secs: u64) -> Result<(), String> {
-        use std::collections::HashSet;
         use std::thread;
         use std::time::Duration;
         
@@ -311,7 +345,7 @@ pub fn save_matches<P: AsRef<Path>>(matches: &[Match], path: P) -> std::io::Resu
         writeln!(writer, "    {{")?;
         writeln!(writer, "      \"private_key\": \"{}\",", m.private_key)?;
         writeln!(writer, "      \"address\": \"{}\",", m.address)?;
-        writeln!(writer, "      \"type\": \"{}\",", m.address_type)?;
+        writeln!(writer, "      \"type\": \"{}\",", m.address_type.as_str())?;
         writeln!(writer, "      \"file\": \"{}\",", m.file)?;
         writeln!(writer, "      \"offset\": {}", m.offset)?;
         writeln!(writer, "    }}{}", comma)?;
