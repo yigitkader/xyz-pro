@@ -2,8 +2,34 @@
 //!
 //! Converts hash160/script_hash to Bitcoin addresses.
 //! No dependencies on generator module.
+//!
+//! Uses thread-local singleton pattern for zero-allocation encoding.
 
+use std::cell::RefCell;
 use sha2::{Sha256, Digest};
+
+// Thread-local singleton encoder - avoids repeated allocations
+thread_local! {
+    static ENCODER: RefCell<AddressEncoder> = RefCell::new(AddressEncoder::new_internal());
+}
+
+/// Encode P2PKH address from hash using thread-local singleton
+#[inline]
+pub fn encode_p2pkh(hash160: &[u8; 20]) -> String {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode_p2pkh(hash160))
+}
+
+/// Encode P2SH address from hash using thread-local singleton
+#[inline]
+pub fn encode_p2sh(script_hash: &[u8; 20]) -> String {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode_p2sh(script_hash))
+}
+
+/// Encode P2WPKH address from hash using thread-local singleton
+#[inline]
+pub fn encode_p2wpkh(hash160: &[u8; 20]) -> String {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode_p2wpkh(hash160))
+}
 
 /// Standalone address encoder with pre-allocated buffers
 pub struct AddressEncoder {
@@ -14,11 +40,21 @@ pub struct AddressEncoder {
 }
 
 impl AddressEncoder {
-    pub fn new() -> Self {
+    /// Internal constructor - use thread-local functions instead
+    fn new_internal() -> Self {
         Self {
             payload_buf: [0u8; 25],
             bech32_buf: Vec::with_capacity(33),
         }
+    }
+    
+    /// Create a new encoder instance
+    /// 
+    /// **Prefer using the module-level functions** (`encode_p2pkh`, etc.)
+    /// which use a thread-local singleton for better performance.
+    #[inline]
+    pub fn new() -> Self {
+        Self::new_internal()
     }
     
     /// Encode hash160 to P2PKH address (1...)

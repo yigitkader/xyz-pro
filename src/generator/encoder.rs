@@ -3,12 +3,46 @@
 //! - P2PKH: Legacy addresses (1...)
 //! - P2SH: Nested SegWit (3...)
 //! - P2WPKH: Native SegWit Bech32 (bc1q...)
+//!
+//! Uses thread-local singleton pattern for zero-allocation encoding.
+
+use std::cell::RefCell;
 
 use sha2::{Digest, Sha256};
 use ripemd::Ripemd160;
 use bech32::{self, ToBase32, Variant};
 
 use super::{KeyEntry, RawKeyData};
+
+// Thread-local singleton encoder - avoids repeated allocations
+thread_local! {
+    static ENCODER: RefCell<AddressEncoder> = RefCell::new(AddressEncoder::new_internal());
+}
+
+/// Encode raw key data using thread-local singleton encoder
+/// This is the preferred API - zero allocation after first use per thread
+#[inline]
+pub fn encode_key(raw: &RawKeyData) -> KeyEntry {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode(raw))
+}
+
+/// Encode P2PKH address from hash using thread-local singleton
+#[inline]
+pub fn encode_p2pkh(pubkey_hash: &[u8; 20]) -> String {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode_p2pkh_from_hash(pubkey_hash))
+}
+
+/// Encode P2SH address from hash using thread-local singleton
+#[inline]
+pub fn encode_p2sh(script_hash: &[u8; 20]) -> String {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode_p2sh_from_hash(script_hash))
+}
+
+/// Encode P2WPKH address from hash using thread-local singleton
+#[inline]
+pub fn encode_p2wpkh(pubkey_hash: &[u8; 20]) -> String {
+    ENCODER.with(|encoder| encoder.borrow_mut().encode_p2wpkh_from_hash(pubkey_hash))
+}
 
 /// Address encoder with pre-allocated buffers
 pub struct AddressEncoder {
@@ -19,11 +53,23 @@ pub struct AddressEncoder {
 }
 
 impl AddressEncoder {
-    pub fn new() -> Self {
+    /// Internal constructor - use thread-local functions instead
+    fn new_internal() -> Self {
         Self {
             base58_buffer: Vec::with_capacity(64),
             bech32_buffer: Vec::with_capacity(33), // 1 (version) + 32 (hash in base32)
         }
+    }
+    
+    /// Create a new encoder instance
+    /// 
+    /// **Prefer using the module-level functions** (`encode_key`, `encode_p2pkh`, etc.)
+    /// which use a thread-local singleton for better performance.
+    /// 
+    /// Only use this if you need explicit lifetime control.
+    #[inline]
+    pub fn new() -> Self {
+        Self::new_internal()
     }
     
     /// Encode raw key data to full KeyEntry with all address types

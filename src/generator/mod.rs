@@ -35,6 +35,8 @@ mod adapter;
 
 pub use keygen::KeyGenerator as CpuKeyGenerator;
 pub use encoder::AddressEncoder;
+// Singleton encoder functions (preferred API - zero allocation)
+pub use encoder::{encode_key, encode_p2pkh, encode_p2sh, encode_p2wpkh};
 pub use writer::{OutputWriter, OutputFormat, AsyncRawWriter};
 pub use batch::BatchProcessor;
 pub use gpu::{GpuKeyGenerator, BufferSet};
