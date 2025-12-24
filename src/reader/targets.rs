@@ -2,15 +2,23 @@
 //!
 //! Loads targets.json and provides fast O(1) lookup using HashSet.
 //! Supports all address types: P2PKH, P2SH, P2WPKH, P2WSH
+//!
+//! **Cache Support**: Parses JSON once, saves binary cache for fast reload.
+//! Cache is invalidated when source file changes (size or mtime).
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use serde::{Serialize, Deserialize};
+
+/// Cache file format version (increment when format changes)
+const CACHE_VERSION: u32 = 1;
+
 /// Statistics about loaded targets
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TargetStats {
     pub total: usize,
     pub p2pkh: usize,   // 1...
@@ -18,6 +26,23 @@ pub struct TargetStats {
     pub p2wpkh: usize,  // bc1q (short)
     pub p2wsh: usize,   // bc1q (long)
     pub load_time_ms: u64,
+}
+
+/// Cache metadata for invalidation
+#[derive(Serialize, Deserialize)]
+struct CacheMetadata {
+    version: u32,
+    source_size: u64,
+    source_mtime: u64,
+}
+
+/// Cached target data
+#[derive(Serialize, Deserialize)]
+struct CachedTargets {
+    metadata: CacheMetadata,
+    hash160_list: Vec<[u8; 20]>,
+    p2sh_list: Vec<[u8; 20]>,
+    stats: TargetStats,
 }
 
 /// Fast target lookup using HashSet
@@ -33,11 +58,130 @@ pub struct TargetSet {
 }
 
 impl TargetSet {
-    /// Load targets from JSON file
-    /// Format: { "addresses": ["addr1", "addr2", ...] }
+    /// Load targets from JSON file with automatic caching
+    /// 
+    /// Cache is stored as `{path}.cache` and invalidated when source changes.
+    /// First load: Parse JSON (~10s for 10M addresses)
+    /// Cached load: Binary deserialize (~0.5s for 10M addresses)
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let path = path.as_ref();
+        let cache_path = path.with_extension("json.cache");
+        
+        // Try to load from cache first
+        if let Some(cached) = Self::try_load_cache(path, &cache_path) {
+            return Ok(cached);
+        }
+        
+        // Cache miss or invalid - parse JSON
+        let result = Self::load_from_json(path)?;
+        
+        // Save cache for next time
+        if let Err(e) = result.save_cache(path, &cache_path) {
+            eprintln!("⚠️ Failed to save cache: {}", e);
+        }
+        
+        Ok(result)
+    }
+    
+    /// Try to load from cache if valid
+    fn try_load_cache(source_path: &Path, cache_path: &Path) -> Option<Self> {
         let start = Instant::now();
-        let file = File::open(path.as_ref())
+        
+        // Check if cache file exists
+        if !cache_path.exists() {
+            return None;
+        }
+        
+        // Get source file metadata
+        let source_meta = fs::metadata(source_path).ok()?;
+        let source_size = source_meta.len();
+        let source_mtime = source_meta.modified().ok()?
+            .duration_since(std::time::UNIX_EPOCH).ok()?
+            .as_secs();
+        
+        // Read cache file
+        let cache_data = fs::read(cache_path).ok()?;
+        let cached: CachedTargets = bincode::deserialize(&cache_data).ok()?;
+        
+        // Validate cache
+        if cached.metadata.version != CACHE_VERSION {
+            println!("📦 Cache version mismatch, rebuilding...");
+            return None;
+        }
+        
+        if cached.metadata.source_size != source_size || 
+           cached.metadata.source_mtime != source_mtime {
+            println!("📦 Source file changed, rebuilding cache...");
+            return None;
+        }
+        
+        // Cache is valid - rebuild HashSets from lists
+        let hash160_set: HashSet<[u8; 20]> = cached.hash160_list.into_iter().collect();
+        let p2sh_set: HashSet<[u8; 20]> = cached.p2sh_list.into_iter().collect();
+        
+        let load_time = start.elapsed().as_millis() as u64;
+        
+        println!("⚡ Loaded {} targets from cache in {}ms", 
+                 cached.stats.total, load_time);
+        println!("   P2PKH: {}, P2SH: {}, P2WPKH: {}, P2WSH: {}", 
+                 cached.stats.p2pkh, cached.stats.p2sh, 
+                 cached.stats.p2wpkh, cached.stats.p2wsh);
+        
+        // Create empty addresses set (not needed for matching, saves memory)
+        let addresses = HashSet::new();
+        
+        Some(Self {
+            addresses,
+            hash160_set,
+            p2sh_set,
+            stats: TargetStats {
+                load_time_ms: load_time,
+                ..cached.stats
+            },
+        })
+    }
+    
+    /// Save current data to cache
+    fn save_cache(&self, source_path: &Path, cache_path: &Path) -> Result<(), String> {
+        let source_meta = fs::metadata(source_path)
+            .map_err(|e| format!("Failed to get source metadata: {}", e))?;
+        
+        let source_mtime = source_meta.modified()
+            .map_err(|e| format!("Failed to get mtime: {}", e))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("Time error: {}", e))?
+            .as_secs();
+        
+        let cached = CachedTargets {
+            metadata: CacheMetadata {
+                version: CACHE_VERSION,
+                source_size: source_meta.len(),
+                source_mtime,
+            },
+            hash160_list: self.hash160_set.iter().copied().collect(),
+            p2sh_list: self.p2sh_set.iter().copied().collect(),
+            stats: self.stats.clone(),
+        };
+        
+        let encoded = bincode::serialize(&cached)
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        
+        let mut file = File::create(cache_path)
+            .map_err(|e| format!("Failed to create cache file: {}", e))?;
+        
+        file.write_all(&encoded)
+            .map_err(|e| format!("Failed to write cache: {}", e))?;
+        
+        let cache_size_mb = encoded.len() as f64 / (1024.0 * 1024.0);
+        println!("💾 Cache saved: {} ({:.1} MB)", cache_path.display(), cache_size_mb);
+        
+        Ok(())
+    }
+    
+    /// Load targets directly from JSON (no cache)
+    fn load_from_json(path: &Path) -> Result<Self, String> {
+        let start = Instant::now();
+        let file = File::open(path)
             .map_err(|e| format!("Failed to open targets file: {}", e))?;
         
         let reader = BufReader::with_capacity(64 * 1024 * 1024, file); // 64MB buffer
@@ -47,7 +191,7 @@ impl TargetSet {
         let mut p2sh_set = HashSet::new();
         let mut stats = TargetStats::default();
         
-        println!("📂 Loading targets...");
+        println!("📂 Parsing targets from JSON (first run, will cache)...");
         
         // Parse JSON - handles both compact and multi-line formats
         for line in reader.lines() {
@@ -111,7 +255,7 @@ impl TargetSet {
         
         stats.load_time_ms = start.elapsed().as_millis() as u64;
         
-        println!("✅ Loaded {} targets in {}ms", stats.total, stats.load_time_ms);
+        println!("✅ Parsed {} targets in {}ms", stats.total, stats.load_time_ms);
         println!("   P2PKH: {}, P2SH: {}, P2WPKH: {}, P2WSH: {}", 
                  stats.p2pkh, stats.p2sh, stats.p2wpkh, stats.p2wsh);
         println!("   Hash160 set: {} entries", hash160_set.len());
