@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Generator module
-use xyz_pro::generator::{BatchProcessor, GeneratorConfig, GpuKeyGenerator, GpuGeneratorAdapter, OutputFormat};
+use xyz_pro::generator::{BatchProcessor, GeneratorConfig, GlvMode, GpuKeyGenerator, GpuGeneratorAdapter, OutputFormat};
 
 // Reader module  
 use xyz_pro::reader::ParallelMatcher;
@@ -398,6 +398,24 @@ fn parse_args(args: &[String]) -> GeneratorConfig {
                     std::process::exit(1);
                 }
             }
+            "--glv" | "-G" => {
+                if i + 1 < args.len() {
+                    let mode_str = args[i + 1].to_lowercase();
+                    config.glv_mode = match mode_str.as_str() {
+                        "off" | "0" | "disabled" => GlvMode::Disabled,
+                        "2x" | "2" | "glv" => GlvMode::Glv2x,
+                        "3x" | "3" | "glv3" => GlvMode::Glv3x,
+                        _ => {
+                            eprintln!("❌ Invalid GLV mode '{}'. Valid: off, 2x (default), 3x", mode_str);
+                            std::process::exit(1);
+                        }
+                    };
+                    i += 1;
+                } else {
+                    eprintln!("❌ --glv requires a mode (off, 2x, 3x)");
+                    std::process::exit(1);
+                }
+            }
             "--start-offset" => {
                 if i + 1 < args.len() {
                     let val = &args[i + 1];
@@ -484,6 +502,11 @@ fn print_help() {
     println!("    -k, --keys-per-file N    Keys per file (default: 1000000000)");
     println!("    -n, --target N           Stop after N keys");
     println!("    --start-offset N         Starting private key offset");
+    println!();
+    println!("GLV ENDOMORPHISM:");
+    println!("    -G, --glv MODE           GLV mode: off, 2x, 3x (default)");
+    println!("                             2x: 2 keys per EC op");
+    println!("                             3x: 3 keys per EC op (default, max throughput)");
     println!();
     println!("OTHER:");
     println!("    -t, --threads N          Number of threads (default: auto)");

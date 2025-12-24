@@ -107,6 +107,38 @@ impl RawKeyData {
     }
 }
 
+/// GLV Endomorphism mode for throughput optimization
+/// 
+/// GLV (Gallant-Lambert-Vanstone) uses secp256k1's efficient endomorphism
+/// to generate multiple keys from a single EC point multiplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GlvMode {
+    /// Standard mode: 1 key per EC operation
+    Disabled,
+    /// GLV 2x mode: 2 keys per EC operation (k and λk)
+    Glv2x,
+    /// GLV 3x mode: 3 keys per EC operation (k, λk, λ²k)
+    /// Default: Maximum throughput with mathematically proven correctness.
+    #[default]
+    Glv3x,
+}
+
+impl GlvMode {
+    /// Keys generated per EC point multiplication
+    pub fn keys_per_ec_op(&self) -> usize {
+        match self {
+            GlvMode::Disabled => 1,
+            GlvMode::Glv2x => 2,
+            GlvMode::Glv3x => 3,
+        }
+    }
+    
+    /// Output size per batch entry in bytes
+    pub fn output_size_per_entry(&self) -> usize {
+        self.keys_per_ec_op() * 72  // 72 bytes per key
+    }
+}
+
 /// Generator configuration
 #[derive(Debug, Clone)]
 pub struct GeneratorConfig {
@@ -126,6 +158,8 @@ pub struct GeneratorConfig {
     /// When set, generator stops when current_offset reaches this value.
     /// This is useful for scanning specific ranges (e.g., Bitcoin Puzzle challenges).
     pub end_offset: Option<u64>,
+    /// GLV Endomorphism mode (default: Glv2x for 2x throughput)
+    pub glv_mode: GlvMode,
 }
 
 impl Default for GeneratorConfig {
@@ -138,6 +172,7 @@ impl Default for GeneratorConfig {
             keys_per_file: 1_000_000_000,
             start_offset: 1, // Start from 1 (0 is invalid private key)
             end_offset: None, // No limit by default
+            glv_mode: GlvMode::default(), // Glv2x for best stability
         }
     }
 }

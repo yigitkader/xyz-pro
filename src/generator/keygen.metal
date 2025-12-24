@@ -46,9 +46,25 @@ constant ulong SECP256K1_K = 4294968273ULL;
 
 // GLV ENDOMORPHISM CONSTANTS
 // β³ ≡ 1 (mod p), φ(x,y) = (β·x mod p, y)
+// λ³ ≡ 1 (mod n), privkey for φ(P) is λ·k mod n
+//
+// Endomorphism chain:
+//   φ⁰(P) = P           → privkey = k
+//   φ¹(P) = (β·x, y)    → privkey = λ·k mod n
+//   φ²(P) = (β²·x, y)   → privkey = λ²·k mod n
+//   φ³(P) = P           → λ³ = 1 (identity)
+
 constant ulong4 GLV_BETA = {
     0xc1396c28719501eeULL, 0x9cf0497512f58995ULL,
     0x6e64479eac3434e9ULL, 0x7ae96a2b657c0710ULL
+};
+
+// β² mod p - for second endomorphism φ²(P) = (β²·x, y)
+// Computed: β² = 0x851695d49a83f8ef919bb86153cbcb16630fb68aed0a766a3ec693d68e6afa40
+// Verified: β³ ≡ 1 (mod p)
+constant ulong4 GLV_BETA_SQ = {
+    0x3EC693D68E6AFA40ULL, 0x630FB68AED0A766AULL,
+    0x919BB86153CBCB16ULL, 0x851695D49A83F8EFULL
 };
 
 // ============================================================================
@@ -566,6 +582,14 @@ void compute_p2sh_hash(thread const uchar* pubkey_hash, thread uchar* script_has
 constant ulong4 GLV_LAMBDA = {
     0xDF02967C1B23BD72ULL, 0x122E22EA20816678ULL,
     0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL
+};
+
+// λ² mod n - for second endomorphism privkey: λ²·k mod n
+// Computed: λ² = 0xac9c52b33fa3cf1f5ad9e3fd77ed9ba4a880b9fc8ec739c2e0cfc810b51283ce
+// Verified: λ × λ² ≡ 1 (mod n), λ³ ≡ 1 (mod n)
+constant ulong4 GLV_LAMBDA_SQ = {
+    0xE0CFC810B51283CEULL, 0xA880B9FC8EC739C2ULL,
+    0x5AD9E3FD77ED9BA4ULL, 0xAC9C52B33FA3CF1FULL
 };
 
 // GLV Lambda constant verification
@@ -1170,6 +1194,231 @@ kernel void generate_btc_keys_glv(
             }
             for (int i = 0; i < 20; i++) {
                 output[out_base_glv + 52 + i] = glv_p2sh_hash[i];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// GLV3 KERNEL: 3 Keys per EC Operation (50% more throughput vs GLV2)
+// 
+// Endomorphism chain (all from single EC point multiplication):
+//   k   → P           = k·G           → hash160(P)
+//   λk  → φ(P)        = (β·x, y)      → hash160(φ(P))
+//   λ²k → φ²(P)       = (β²·x, y)     → hash160(φ²(P))
+//
+// Output: 3 keys × 72 bytes = 216 bytes per batch entry
+// ============================================================================
+
+#define GLV3_OUTPUT_SIZE 216  // 3 keys per thread (primary + GLV + GLV2)
+
+kernel void generate_btc_keys_glv3(
+    constant uchar* base_privkey [[buffer(0)]],
+    constant uchar* base_pubkey_x [[buffer(1)]],
+    constant uchar* base_pubkey_y [[buffer(2)]],
+    constant uchar* wnaf_table [[buffer(3)]],
+    device uchar* output [[buffer(4)]],
+    constant uint* keys_per_thread [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint kpt = *keys_per_thread;
+    uint thread_offset = gid * kpt;
+    
+    // Load base private key and pubkey
+    ulong4 base_priv = load_be(base_privkey);
+    ulong4 base_x = load_be(base_pubkey_x);
+    ulong4 base_y = load_be(base_pubkey_y);
+    
+    // Compute thread start point using wNAF table
+    ulong4 cur_X = base_x;
+    ulong4 cur_Y = base_y;
+    ulong4 cur_Z = {1,0,0,0};
+    ulong4 cur_ZZ = {1,0,0,0};
+    
+    if (thread_offset > 0) {
+        #define WINDOW_ADD(window) { \
+            uint digit = (thread_offset >> (4 * window)) & 0xF; \
+            if (digit != 0) { \
+                uint idx = window * 15 + (digit - 1); \
+                constant uchar* wp = wnaf_table + idx * 64; \
+                ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ, \
+                                   load_be(wp), load_be(wp + 32), \
+                                   cur_X, cur_Y, cur_Z, cur_ZZ); \
+            } \
+        }
+        WINDOW_ADD(0)
+        WINDOW_ADD(1)
+        WINDOW_ADD(2)
+        WINDOW_ADD(3)
+        WINDOW_ADD(4)
+        #undef WINDOW_ADD
+    }
+    
+    // Thread-local arrays
+    ulong4 batch_X[BATCH_SIZE];
+    ulong4 batch_Y[BATCH_SIZE];
+    ulong4 batch_Z[BATCH_SIZE];
+    ulong4 batch_ZZ[BATCH_SIZE];
+    ulong4 batch_Zinv[BATCH_SIZE];
+    ulong4 batch_privkey[BATCH_SIZE];
+    bool batch_valid[BATCH_SIZE];
+    
+    ulong4 products[BATCH_SIZE];
+    int product_map[BATCH_SIZE];
+    
+    // Phase 1: Generate batch points
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        ulong4 priv = base_priv;
+        scalar_add_u64(priv, thread_offset + b);
+        batch_privkey[b] = priv;
+        
+        batch_X[b] = cur_X;
+        batch_Y[b] = cur_Y;
+        batch_Z[b] = cur_Z;
+        batch_ZZ[b] = cur_ZZ;
+        batch_valid[b] = !IsZero(cur_Z);
+        
+        ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
+                           SECP256K1_GX, SECP256K1_GY,
+                           cur_X, cur_Y, cur_Z, cur_ZZ);
+    }
+    
+    // Phase 2: Montgomery Batch Inversion
+    int valid_count = 0;
+    
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        if (batch_valid[b]) {
+            if (valid_count == 0) {
+                products[0] = batch_Z[b];
+            } else {
+                products[valid_count] = mod_mul(products[valid_count - 1], batch_Z[b]);
+            }
+            product_map[valid_count] = b;
+            valid_count++;
+        } else {
+            batch_Zinv[b] = ulong4{0, 0, 0, 0};
+        }
+    }
+    
+    if (valid_count > 0) {
+        ulong4 inv = mod_inv(products[valid_count - 1]);
+        
+        for (int i = valid_count - 1; i > 0; i--) {
+            int b = product_map[i];
+            batch_Zinv[b] = mod_mul(inv, products[i - 1]);
+            inv = mod_mul(inv, batch_Z[b]);
+        }
+        batch_Zinv[product_map[0]] = inv;
+    }
+    
+    // Phase 3: Output - 3 keys per point (PRIMARY + GLV + GLV2)
+    for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
+        // Output position: 3 keys per batch entry
+        uint out_base_primary = (gid * BATCH_SIZE * 3 + b * 3) * OUTPUT_SIZE;
+        uint out_base_glv = out_base_primary + OUTPUT_SIZE;
+        uint out_base_glv2 = out_base_glv + OUTPUT_SIZE;
+        
+        if (!batch_valid[b]) {
+            // Zero out all three entries
+            for (int i = 0; i < OUTPUT_SIZE; i++) {
+                output[out_base_primary + i] = 0;
+                output[out_base_glv + i] = 0;
+                output[out_base_glv2 + i] = 0;
+            }
+            continue;
+        }
+        
+        // Convert to affine coordinates
+        ulong4 z_inv2 = mod_sqr(batch_Zinv[b]);
+        ulong4 z_inv3 = mod_mul(z_inv2, batch_Zinv[b]);
+        ulong4 ax = mod_mul(batch_X[b], z_inv2);
+        ulong4 ay = mod_mul(batch_Y[b], z_inv3);
+        
+        // ========================
+        // PRIMARY KEY OUTPUT (k)
+        // ========================
+        {
+            uchar pubkey_hash[20];
+            hash160_compressed(ax, ay, pubkey_hash);
+            
+            uchar p2sh_hash[20];
+            compute_p2sh_hash(pubkey_hash, p2sh_hash);
+            
+            uchar privkey_bytes[32];
+            store_be(batch_privkey[b], privkey_bytes);
+            
+            for (int i = 0; i < 32; i++) {
+                output[out_base_primary + i] = privkey_bytes[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_primary + 32 + i] = pubkey_hash[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_primary + 52 + i] = p2sh_hash[i];
+            }
+        }
+        
+        // ========================
+        // GLV KEY OUTPUT (λk)
+        // φ(x, y) = (β·x mod p, y)
+        // privkey_glv = λ·k mod n
+        // ========================
+        {
+            ulong4 glv_x, glv_y;
+            glv_endomorphism(ax, ay, glv_x, glv_y);
+            
+            ulong4 glv_priv = scalar_mul_mod_n(batch_privkey[b], GLV_LAMBDA);
+            
+            uchar glv_pubkey_hash[20];
+            hash160_compressed(glv_x, glv_y, glv_pubkey_hash);
+            
+            uchar glv_p2sh_hash[20];
+            compute_p2sh_hash(glv_pubkey_hash, glv_p2sh_hash);
+            
+            uchar glv_privkey_bytes[32];
+            store_be(glv_priv, glv_privkey_bytes);
+            
+            for (int i = 0; i < 32; i++) {
+                output[out_base_glv + i] = glv_privkey_bytes[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_glv + 32 + i] = glv_pubkey_hash[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_glv + 52 + i] = glv_p2sh_hash[i];
+            }
+        }
+        
+        // ========================
+        // GLV2 KEY OUTPUT (λ²k)
+        // φ²(x, y) = (β²·x mod p, y)
+        // privkey_glv2 = λ²·k mod n
+        // ========================
+        {
+            // Apply second endomorphism: φ²(P) = (β²·x, y)
+            ulong4 glv2_x = mod_mul(ax, GLV_BETA_SQ);
+            ulong4 glv2_y = ay;  // y unchanged
+            
+            // Compute GLV2 private key: λ²·k mod n
+            ulong4 glv2_priv = scalar_mul_mod_n(batch_privkey[b], GLV_LAMBDA_SQ);
+            
+            uchar glv2_pubkey_hash[20];
+            hash160_compressed(glv2_x, glv2_y, glv2_pubkey_hash);
+            
+            uchar glv2_p2sh_hash[20];
+            compute_p2sh_hash(glv2_pubkey_hash, glv2_p2sh_hash);
+            
+            uchar glv2_privkey_bytes[32];
+            store_be(glv2_priv, glv2_privkey_bytes);
+            
+            for (int i = 0; i < 32; i++) {
+                output[out_base_glv2 + i] = glv2_privkey_bytes[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_glv2 + 32 + i] = glv2_pubkey_hash[i];
+            }
+            for (int i = 0; i < 20; i++) {
+                output[out_base_glv2 + 52 + i] = glv2_p2sh_hash[i];
             }
         }
     }

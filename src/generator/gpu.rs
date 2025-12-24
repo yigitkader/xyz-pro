@@ -25,7 +25,7 @@ use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
 
-use super::{AddressEncoder, GeneratorConfig, GeneratorStats, KeyEntry, RawKeyData, OutputFormat, OutputWriter, AsyncRawWriter};
+use super::{AddressEncoder, GeneratorConfig, GeneratorStats, GlvMode, KeyEntry, RawKeyData, OutputFormat, OutputWriter, AsyncRawWriter};
 
 // ============================================================================
 // CONSTANTS
@@ -223,9 +223,11 @@ impl GpuTier {
         };
         
         // Calculate memory requirements per buffer set
-        // Output buffer: threads * BATCH_SIZE * OUTPUT_SIZE * 2 (GLV)
+        // Output buffer: threads * BATCH_SIZE * OUTPUT_SIZE * GLV_MULTIPLIER
+        // Use 3x for worst-case (GLV3) to be conservative
+        const GLV_MAX_MULTIPLIER: usize = 3;
         let keys_per_dispatch = base_threads * BATCH_SIZE as usize;
-        let output_buffer_mb = (keys_per_dispatch * OUTPUT_SIZE * 2) / (1024 * 1024);
+        let output_buffer_mb = (keys_per_dispatch * OUTPUT_SIZE * GLV_MAX_MULTIPLIER) / (1024 * 1024);
         let total_buffer_mb = output_buffer_mb * base_depth;
         
         // Reserve memory for other processes: AsyncRawWriter, Rayon, OS overhead
@@ -254,7 +256,7 @@ impl GpuTier {
             
             // Try reducing pipeline depth first (cheaper than reducing threads)
             while adj_depth > 2 {
-                let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * 2 * adj_depth) / (1024 * 1024);
+                let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * GLV_MAX_MULTIPLIER * adj_depth) / (1024 * 1024);
                 if (adj_buffer_mb as u64) <= available_for_gpu {
                     break;
                 }
@@ -264,7 +266,7 @@ impl GpuTier {
             
             // If still not enough, reduce threads
             while adj_threads > 16_384 {
-                let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * 2 * adj_depth) / (1024 * 1024);
+                let adj_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * GLV_MAX_MULTIPLIER * adj_depth) / (1024 * 1024);
                 if (adj_buffer_mb as u64) <= available_for_gpu {
                     break;
                 }
@@ -272,7 +274,7 @@ impl GpuTier {
                 adj_pool = std::cmp::max(adj_pool.saturating_sub(1), 3);
             }
             
-            let final_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * 2 * adj_depth) / (1024 * 1024);
+            let final_buffer_mb = (adj_threads * BATCH_SIZE as usize * OUTPUT_SIZE * GLV_MAX_MULTIPLIER * adj_depth) / (1024 * 1024);
             println!("[GPU] Adjusted: {} threads, {} depth, {} pool ({} MB)",
                      adj_threads, adj_depth, adj_pool, final_buffer_mb);
             
@@ -395,7 +397,8 @@ pub struct GpuKeyGenerator {
     #[allow(dead_code)]
     device: Device,
     pipeline: ComputePipelineState,
-    pipeline_glv: ComputePipelineState,  // GLV kernel for 2x throughput
+    pipeline_glv: ComputePipelineState,   // GLV kernel for 2x throughput
+    pipeline_glv3: ComputePipelineState,  // GLV3 kernel for 3x throughput (NEW)
     config: GeneratorConfig,
     tier: GpuTier,
     
@@ -472,9 +475,21 @@ impl GpuKeyGenerator {
         
         println!("✅ GLV Endomorphism kernel loaded (2x throughput)");
         
+        // GLV3 kernel for 3x throughput (NEW)
+        let function_glv3 = library
+            .get_function("generate_btc_keys_glv3", None)
+            .map_err(|e| format!("Failed to get GLV3 kernel function: {}", e))?;
+        
+        let pipeline_glv3 = device
+            .new_compute_pipeline_state_with_function(&function_glv3)
+            .map_err(|e| format!("Failed to create GLV3 pipeline: {}", e))?;
+        
+        println!("✅ GLV3 Endomorphism kernel loaded (3x throughput)");
+        
         let storage = MTLResourceOptions::StorageModeShared;
-        // GLV outputs 2x keys per dispatch
-        let output_buffer_size = tier.keys_per_dispatch * OUTPUT_SIZE * 2;
+        // Buffer size based on GLV mode: 1x (disabled), 2x (glv2), 3x (glv3)
+        let glv_multiplier = config.glv_mode.keys_per_ec_op();
+        let output_buffer_size = tier.keys_per_dispatch * OUTPUT_SIZE * glv_multiplier;
         
         // Create buffer sets for pipelining
         println!("   Creating {} command queues for async pipelining", tier.pipeline_depth);
@@ -528,6 +543,7 @@ impl GpuKeyGenerator {
             device,
             pipeline,
             pipeline_glv,
+            pipeline_glv3,
             config,
             tier,
             buffer_sets,
@@ -686,11 +702,6 @@ impl GpuKeyGenerator {
         self.total_generated.fetch_add(count, Ordering::Relaxed);
     }
     
-    /// Dispatch with GLV (public for adapter)
-    pub fn dispatch_glv(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
-        self.dispatch_batch_glv(buf_idx, base_offset)
-    }
-    
     // ========================================================================
     
     /// Pre-compute base public key from private key (CPU side)
@@ -751,7 +762,8 @@ impl GpuKeyGenerator {
         (key_scalar * *GLV_LAMBDA_SCALAR).to_repr().into()
     }
     
-    /// Dispatch a batch on the specified buffer set
+    /// Dispatch a batch on the specified buffer set (standard, no GLV)
+    #[allow(dead_code)]
     fn dispatch_batch(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
         self.dispatch_batch_internal(buf_idx, base_offset, false)
     }
@@ -759,6 +771,32 @@ impl GpuKeyGenerator {
     /// Dispatch batch with GLV endomorphism (2x output)
     fn dispatch_batch_glv(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
         self.dispatch_batch_internal(buf_idx, base_offset, true)
+    }
+    
+    /// Dispatch batch with GLV3 endomorphism (3x output)
+    /// Uses generate_btc_keys_glv3 kernel for 50% more throughput than GLV2
+    fn dispatch_batch_glv3(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        self.dispatch_batch_internal_v3(buf_idx, base_offset)
+    }
+    
+    /// Dispatch using configured GLV mode
+    /// Automatically selects the correct kernel based on config.glv_mode
+    pub fn dispatch_with_mode(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        match self.config.glv_mode {
+            GlvMode::Disabled => self.dispatch_batch(buf_idx, base_offset),
+            GlvMode::Glv2x => self.dispatch_batch_glv(buf_idx, base_offset),
+            GlvMode::Glv3x => self.dispatch_batch_glv3(buf_idx, base_offset),
+        }
+    }
+    
+    /// Public dispatch for adapter (uses configured GLV mode)
+    pub fn dispatch_glv(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        self.dispatch_with_mode(buf_idx, base_offset)
+    }
+    
+    /// Get configured GLV mode
+    pub fn glv_mode(&self) -> GlvMode {
+        self.config.glv_mode
     }
     
     fn dispatch_batch_internal(&self, buf_idx: usize, base_offset: u64, use_glv: bool) -> Result<(), String> {
@@ -845,6 +883,88 @@ impl GpuKeyGenerator {
         // CRITICAL FIX: Store the ACTUAL command buffer for proper sync
         // Previously we were creating an empty buffer and waiting on THAT,
         // which is an anti-pattern and can cause race conditions
+        if let Ok(mut pending) = bs.pending_command.lock() {
+            *pending = Some(command_buffer.to_owned());
+        }
+        
+        Ok(())
+    }
+    
+    /// Dispatch batch with GLV3 endomorphism (3x output)
+    /// 
+    /// This is a separate function (not merged into dispatch_batch_internal)
+    /// to avoid breaking existing GLV2 code paths while testing GLV3.
+    #[allow(dead_code)]
+    fn dispatch_batch_internal_v3(&self, buf_idx: usize, base_offset: u64) -> Result<(), String> {
+        let bs = &self.buffer_sets[buf_idx];
+        
+        // RACE CONDITION PREVENTION: Wait for CPU to finish reading this buffer
+        let mut spin_count = 0;
+        const MAX_SPINS: u32 = 1000;
+        const YIELD_THRESHOLD: u32 = 10;
+        
+        while bs.in_use.load(Ordering::Acquire) {
+            spin_count += 1;
+            
+            if spin_count > MAX_SPINS {
+                if spin_count == MAX_SPINS + 1 {
+                    eprintln!("⚠️ Buffer {} still in use - CPU lagging behind GPU", buf_idx);
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            } else if spin_count > YIELD_THRESHOLD {
+                std::thread::yield_now();
+            }
+            
+            if self.should_stop.load(Ordering::SeqCst) {
+                return Err("Generator stopped while waiting for buffer".to_string());
+            }
+        }
+        
+        let base_privkey = Self::offset_to_privkey(base_offset);
+        
+        // LOOK-AHEAD: Try to use pre-computed pubkey
+        let (pubkey_x, pubkey_y) = {
+            let cached = self.lookahead_pubkey.lock()
+                .map_err(|_| "Mutex poisoned")?
+                .take();
+            if let Some((x, y)) = cached {
+                (x, y)
+            } else {
+                Self::compute_base_pubkey(&base_privkey)?
+            }
+        };
+        
+        unsafe {
+            let priv_ptr = bs.base_privkey_buf.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(base_privkey.as_ptr(), priv_ptr, 32);
+            
+            let x_ptr = bs.base_pubkey_x_buf.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(pubkey_x.as_ptr(), x_ptr, 32);
+            
+            let y_ptr = bs.base_pubkey_y_buf.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(pubkey_y.as_ptr(), y_ptr, 32);
+        }
+        
+        let command_buffer = bs.queue.new_command_buffer();
+        let compute_encoder = command_buffer.new_compute_command_encoder();
+        
+        // Use GLV3 pipeline for 3x throughput
+        compute_encoder.set_compute_pipeline_state(&self.pipeline_glv3);
+        compute_encoder.set_buffer(0, Some(&bs.base_privkey_buf), 0);
+        compute_encoder.set_buffer(1, Some(&bs.base_pubkey_x_buf), 0);
+        compute_encoder.set_buffer(2, Some(&bs.base_pubkey_y_buf), 0);
+        compute_encoder.set_buffer(3, Some(&self.wnaf_table_buffer), 0);
+        compute_encoder.set_buffer(4, Some(&bs.output_buffer), 0);
+        compute_encoder.set_buffer(5, Some(&bs.keys_per_thread_buf), 0);
+        
+        let grid_size = MTLSize::new(self.tier.threads_per_dispatch as u64, 1, 1);
+        let threadgroup_size = MTLSize::new(self.tier.threadgroup_size as u64, 1, 1);
+        
+        compute_encoder.dispatch_threads(grid_size, threadgroup_size);
+        compute_encoder.end_encoding();
+        
+        command_buffer.commit();
+        
         if let Ok(mut pending) = bs.pending_command.lock() {
             *pending = Some(command_buffer.to_owned());
         }
@@ -1165,11 +1285,13 @@ impl GpuKeyGenerator {
         let mut async_writer = AsyncRawWriter::new(self.config.output_dir.clone())
             .map_err(|e| format!("Failed to create async writer: {}", e))?;
         
-        // GLV mode: 2 keys per EC operation (consistent with run_scan)
-        let keys_per_dispatch = self.tier.keys_per_dispatch * 2;
+        // GLV mode: multiply keys per dispatch based on mode
+        let glv_multiplier = self.config.glv_mode.keys_per_ec_op();
+        let keys_per_dispatch = self.tier.keys_per_dispatch * glv_multiplier;
         let output_size_per_dispatch = keys_per_dispatch * OUTPUT_SIZE;
         
         println!("🚀 NASA-GRADE RAW OUTPUT MODE + GLV ENDOMORPHISM");
+        println!("   ✓ GLV Mode: {:?} ({}x throughput)", self.config.glv_mode, glv_multiplier);
         println!("   ✓ Zero CPU processing");
         println!("   ✓ Async I/O thread (GPU never waits)");
         println!("   ✓ Memory-mapped files (mmap)");
@@ -1194,7 +1316,7 @@ impl GpuKeyGenerator {
             }
             
             let offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            self.dispatch_batch_glv(i, offset)?;
+            self.dispatch_with_mode(i, offset)?;
         }
         
         let mut current_buf = 0;
@@ -1265,8 +1387,8 @@ impl GpuKeyGenerator {
             // Mark buffer as available BEFORE dispatch (CPU read complete)
             bs.in_use.store(false, Ordering::Release);
             
-            // Dispatch to the SAME buffer we just read from (GLV mode)
-            self.dispatch_batch_glv(process_idx, next_offset)?;
+            // Dispatch to the SAME buffer we just read from (configured GLV mode)
+            self.dispatch_with_mode(process_idx, next_offset)?;
             
             current_buf += 1;
             
@@ -1341,13 +1463,14 @@ impl GpuKeyGenerator {
         let depth = self.tier.pipeline_depth;
         let hits_found = AtomicU64::new(0);
         
-        // GLV mode: 2 keys per EC operation
-        let keys_per_dispatch = self.tier.keys_per_dispatch * 2;
+        // GLV mode: multiply keys per dispatch based on mode
+        let glv_multiplier = self.config.glv_mode.keys_per_ec_op();
+        let keys_per_dispatch = self.tier.keys_per_dispatch * glv_multiplier;
         let output_size = keys_per_dispatch * OUTPUT_SIZE;
         
         println!("🚀 NASA-GRADE INTEGRATED SCAN MODE + GLV ENDOMORPHISM");
         println!("   ✓ Zero Disk I/O (Matching in RAM)");
-        println!("   ✓ GLV Endomorphism: 2x throughput (2 keys per EC op)");
+        println!("   ✓ GLV Mode: {:?} ({}x throughput)", self.config.glv_mode, glv_multiplier);
         println!("   ✓ GPU generates → CPU matches (parallel)");
         println!("   ✓ Unified Memory (zero-copy access)");
         println!("   ✓ Target Count: {} (Hash160: {}, P2SH: {})", 
@@ -1376,12 +1499,13 @@ impl GpuKeyGenerator {
         // GLV Key Space Note:
         // - Primary keys:  k, k+1, ..., k+N-1 (from offset)
         // - GLV keys:      λ*k, λ*(k+1), ... (endomorphism, different key space)
+        // - GLV² keys:     λ²*k, λ²*(k+1), ... (GLV3 mode only)
         // GLV λ is a large constant (~2^256), so GLV keys don't overlap with
-        // sequential primary keys. Offset increments by keys_per_dispatch (not 2x)
-        // because we're scanning 2 independent key spaces in parallel.
+        // sequential primary keys. Offset increments by keys_per_dispatch (not 2x/3x)
+        // because we're scanning multiple independent key spaces in parallel.
         for i in 0..depth {
             let offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            self.dispatch_batch_glv(i, offset)?;
+            self.dispatch_with_mode(i, offset)?;
         }
         
         let mut current_buf = 0;
@@ -1483,8 +1607,8 @@ impl GpuKeyGenerator {
             // Mark buffer as available BEFORE dispatch (CPU processing complete)
             bs.in_use.store(false, Ordering::Release);
             
-            // Dispatch to the SAME buffer we just processed
-            self.dispatch_batch_glv(process_idx, next_offset)?;
+            // Dispatch to the SAME buffer we just processed (configured GLV mode)
+            self.dispatch_with_mode(process_idx, next_offset)?;
             
             current_buf += 1;
             

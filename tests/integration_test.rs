@@ -2511,3 +2511,185 @@ fn test_glv_mode_consistency() {
     println!("   ✓ GLV mode producing 2x keys as expected");
     println!("✅ GLV mode consistency test PASSED");
 }
+
+/// Test #9: GLV λ² and β² constants verification
+/// 
+/// Mathematical verification:
+/// - λ³ ≡ 1 (mod n) → λ × λ² = 1
+/// - β³ ≡ 1 (mod p) → β × β² = 1
+/// 
+/// These constants enable 3x throughput (k, λk, λ²k per EC operation)
+#[test]
+fn test_glv_lambda_squared_constants() {
+    use num_bigint::BigUint;
+    use num_traits::{One, Zero};
+    
+    println!("\n🧪 GLV λ² and β² Constants Verification");
+    println!("{}", "=".repeat(60));
+    
+    // secp256k1 curve order n
+    let n = BigUint::parse_bytes(
+        b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+        16
+    ).unwrap();
+    
+    // secp256k1 field prime p
+    let p = BigUint::parse_bytes(
+        b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
+        16
+    ).unwrap();
+    
+    // GLV Lambda (from keygen.metal)
+    let lambda = BigUint::parse_bytes(
+        b"5363AD4CC05C30E0A5261C028812645A122E22EA20816678DF02967C1B23BD72",
+        16
+    ).unwrap();
+    
+    // GLV Lambda² (NEW - from keygen.metal)
+    let lambda_sq = BigUint::parse_bytes(
+        b"AC9C52B33FA3CF1F5AD9E3FD77ED9BA4A880B9FC8EC739C2E0CFC810B51283CE",
+        16
+    ).unwrap();
+    
+    // GLV Beta (from keygen.metal)
+    let beta = BigUint::parse_bytes(
+        b"7AE96A2B657C07106E64479EAC3434E99CF0497512F58995C1396C28719501EE",
+        16
+    ).unwrap();
+    
+    // GLV Beta² (NEW - from keygen.metal)
+    let beta_sq = BigUint::parse_bytes(
+        b"851695D49A83F8EF919BB86153CBCB16630FB68AED0A766A3EC693D68E6AFA40",
+        16
+    ).unwrap();
+    
+    // Verification 1: λ × λ² ≡ 1 (mod n)
+    let lambda_times_lambda_sq = (&lambda * &lambda_sq) % &n;
+    assert!(
+        lambda_times_lambda_sq.is_one(),
+        "λ × λ² should equal 1 (mod n), got {:x}",
+        lambda_times_lambda_sq
+    );
+    println!("   ✓ λ × λ² ≡ 1 (mod n)");
+    
+    // Verification 2: λ³ ≡ 1 (mod n)
+    let lambda_cubed = lambda.modpow(&BigUint::from(3u32), &n);
+    assert!(
+        lambda_cubed.is_one(),
+        "λ³ should equal 1 (mod n), got {:x}",
+        lambda_cubed
+    );
+    println!("   ✓ λ³ ≡ 1 (mod n)");
+    
+    // Verification 3: β × β² ≡ 1 (mod p)
+    let beta_times_beta_sq = (&beta * &beta_sq) % &p;
+    assert!(
+        beta_times_beta_sq.is_one(),
+        "β × β² should equal 1 (mod p), got {:x}",
+        beta_times_beta_sq
+    );
+    println!("   ✓ β × β² ≡ 1 (mod p)");
+    
+    // Verification 4: β³ ≡ 1 (mod p)
+    let beta_cubed = beta.modpow(&BigUint::from(3u32), &p);
+    assert!(
+        beta_cubed.is_one(),
+        "β³ should equal 1 (mod p), got {:x}",
+        beta_cubed
+    );
+    println!("   ✓ β³ ≡ 1 (mod p)");
+    
+    // Verification 5: λ² = λ × λ (mod n) - computed correctly
+    let lambda_sq_computed = (&lambda * &lambda) % &n;
+    assert_eq!(
+        lambda_sq, lambda_sq_computed,
+        "λ² constant should equal λ × λ mod n"
+    );
+    println!("   ✓ λ² = λ × λ (mod n) verified");
+    
+    // Verification 6: β² = β × β (mod p) - computed correctly
+    let beta_sq_computed = (&beta * &beta) % &p;
+    assert_eq!(
+        beta_sq, beta_sq_computed,
+        "β² constant should equal β × β mod p"
+    );
+    println!("   ✓ β² = β × β (mod p) verified");
+    
+    println!("✅ All GLV λ² and β² constants verified mathematically");
+}
+
+/// Test #10: GlvMode configuration and output size calculation
+/// 
+/// Verifies that GlvMode enum correctly calculates:
+/// - keys_per_ec_op() returns 1, 2, or 3
+/// - output_size_per_entry() returns correct byte sizes
+#[test]
+fn test_glv_mode_configuration() {
+    use xyz_pro::generator::GlvMode;
+    
+    println!("\n🧪 GlvMode Configuration Test");
+    println!("{}", "=".repeat(60));
+    
+    // Test Disabled mode
+    let disabled = GlvMode::Disabled;
+    assert_eq!(disabled.keys_per_ec_op(), 1, "Disabled mode should produce 1 key/op");
+    assert_eq!(disabled.output_size_per_entry(), 72, "Disabled mode: 72 bytes/entry");
+    println!("   ✓ GlvMode::Disabled: 1 key/op, 72 bytes/entry");
+    
+    // Test Glv2x mode
+    let glv2x = GlvMode::Glv2x;
+    assert_eq!(glv2x.keys_per_ec_op(), 2, "Glv2x mode should produce 2 keys/op");
+    assert_eq!(glv2x.output_size_per_entry(), 144, "Glv2x mode: 144 bytes/entry");
+    println!("   ✓ GlvMode::Glv2x: 2 keys/op, 144 bytes/entry");
+    
+    // Test Glv3x mode
+    let glv3x = GlvMode::Glv3x;
+    assert_eq!(glv3x.keys_per_ec_op(), 3, "Glv3x mode should produce 3 keys/op");
+    assert_eq!(glv3x.output_size_per_entry(), 216, "Glv3x mode: 216 bytes/entry");
+    println!("   ✓ GlvMode::Glv3x: 3 keys/op, 216 bytes/entry");
+    
+    // Test default is Glv3x (max throughput)
+    let default_mode = GlvMode::default();
+    assert_eq!(default_mode, GlvMode::Glv3x, "Default should be Glv3x");
+    println!("   ✓ Default mode is Glv3x (max throughput)");
+    
+    println!("✅ GlvMode configuration test PASSED");
+}
+
+/// Test #11: GeneratorConfig with GLV mode
+/// 
+/// Verifies that GeneratorConfig correctly stores and uses glv_mode
+#[test]
+fn test_generator_config_glv_mode() {
+    use xyz_pro::generator::{GeneratorConfig, GlvMode};
+    
+    println!("\n🧪 GeneratorConfig GLV Mode Test");
+    println!("{}", "=".repeat(60));
+    
+    // Default config should use Glv3x (max throughput)
+    let default_config = GeneratorConfig::default();
+    assert_eq!(default_config.glv_mode, GlvMode::Glv3x, "Default glv_mode should be Glv3x");
+    println!("   ✓ Default config uses Glv3x mode (max throughput)");
+    
+    // Create config with Glv3x
+    let mut config_3x = GeneratorConfig::default();
+    config_3x.glv_mode = GlvMode::Glv3x;
+    assert_eq!(config_3x.glv_mode, GlvMode::Glv3x, "Should be Glv3x after assignment");
+    assert_eq!(config_3x.glv_mode.keys_per_ec_op(), 3, "Glv3x should give 3 keys/op");
+    println!("   ✓ Config with Glv3x mode: 3 keys/op");
+    
+    // Create config with Disabled
+    let mut config_off = GeneratorConfig::default();
+    config_off.glv_mode = GlvMode::Disabled;
+    assert_eq!(config_off.glv_mode, GlvMode::Disabled, "Should be Disabled after assignment");
+    assert_eq!(config_off.glv_mode.keys_per_ec_op(), 1, "Disabled should give 1 key/op");
+    println!("   ✓ Config with Disabled mode: 1 key/op");
+    
+    // Validate configs
+    assert!(default_config.validate().is_ok(), "Default config should be valid");
+    assert!(config_3x.validate().is_ok(), "Glv3x config should be valid");
+    assert!(config_off.validate().is_ok(), "Disabled config should be valid");
+    println!("   ✓ All configs pass validation");
+    
+    println!("✅ GeneratorConfig GLV mode test PASSED");
+}

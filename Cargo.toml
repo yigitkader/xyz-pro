@@ -97,6 +97,8 @@ legacy-mode = []
 hex = "0.4"  # For test vectors
 rand = "0.8"  # For random test data
 k256 = { version = "0.13", features = ["ecdsa"] }  # For pubkey tests
+num-bigint = "0.4"  # For GLV constant verification tests
+num-traits = "0.2"  # For BigUint trait methods
 
 [[bin]]
 name = "btc_keygen"
