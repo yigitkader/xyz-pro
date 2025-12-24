@@ -210,6 +210,10 @@ impl TargetSet {
     
     /// Save current data to cache using atomic write (temp file + rename)
     /// This prevents corruption if multiple processes write simultaneously
+    /// 
+    /// # Concurrency Safety
+    /// Uses PID-based temp file naming to prevent collisions when multiple
+    /// processes try to write the cache simultaneously.
     fn save_cache(&self, source_path: &Path, cache_path: &Path) -> Result<(), String> {
         let source_meta = fs::metadata(source_path)
             .map_err(|e| format!("Failed to get source metadata: {}", e))?;
@@ -234,9 +238,15 @@ impl TargetSet {
         let encoded = bincode::serialize(&cached)
             .map_err(|e| format!("Serialization error: {}", e))?;
         
-        // Atomic write: write to temp file, then rename
-        // This prevents corruption from concurrent writes
-        let temp_path = cache_path.with_extension("json.cache.tmp");
+        // Atomic write: write to PID-unique temp file, then rename
+        // PID ensures no collision when multiple processes write simultaneously
+        let pid = std::process::id();
+        let temp_filename = format!(
+            "{}.cache.{}.tmp",
+            cache_path.file_stem().unwrap_or_default().to_string_lossy(),
+            pid
+        );
+        let temp_path = cache_path.with_file_name(&temp_filename);
         
         let mut file = File::create(&temp_path)
             .map_err(|e| format!("Failed to create temp cache file: {}", e))?;
@@ -252,8 +262,14 @@ impl TargetSet {
         drop(file);
         
         // Platform-specific atomic rename
-        atomic_rename_file(&temp_path, cache_path)
-            .map_err(|e| format!("Failed to rename cache file: {}", e))?;
+        let rename_result = atomic_rename_file(&temp_path, cache_path);
+        
+        // Clean up temp file on rename failure
+        if rename_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        
+        rename_result.map_err(|e| format!("Failed to rename cache file: {}", e))?;
         
         let cache_size_mb = encoded.len() as f64 / (1024.0 * 1024.0);
         println!("💾 Cache saved: {} ({:.1} MB)", cache_path.display(), cache_size_mb);

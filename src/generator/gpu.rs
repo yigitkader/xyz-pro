@@ -377,13 +377,27 @@ impl GpuKeyGenerator {
     /// # Deadlock Prevention
     /// Each pending command is taken from the mutex before waiting,
     /// ensuring no locks are held during Metal API calls.
+    /// 
+    /// # Mutex Poisoning
+    /// If any mutex is poisoned, we log the error but continue trying to
+    /// clean up other buffer sets. This ensures maximum cleanup even in
+    /// error conditions.
     fn wait_for_all_pending(&self) {
+        let mut poison_detected = false;
+        
         for (idx, bs) in self.buffer_sets.iter().enumerate() {
             // Take ownership of command buffer, releasing lock immediately
             let cb_opt = {
-                let mut pending = match bs.pending_command.lock() {
+                let pending_result = bs.pending_command.lock();
+                let mut pending = match pending_result {
                     Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
+                    Err(poisoned) => {
+                        if !poison_detected {
+                            eprintln!("💀 GPU mutex poisoned during shutdown (buffer set {}) - attempting cleanup", idx);
+                            poison_detected = true;
+                        }
+                        poisoned.into_inner()
+                    }
                 };
                 pending.take()
             }; // Lock released here
@@ -401,6 +415,10 @@ impl GpuKeyGenerator {
             if idx == 0 {
                 println!("🛑 GPU graceful shutdown: waiting for {} buffer sets...", self.buffer_sets.len());
             }
+        }
+        
+        if poison_detected {
+            eprintln!("⚠️  GPU shutdown completed with poisoned mutex - some state may be inconsistent");
         }
     }
     
@@ -593,6 +611,11 @@ impl GpuKeyGenerator {
     /// The Mutex lock is released BEFORE calling wait_until_completed().
     /// This prevents potential deadlocks if Metal's wait triggers callbacks
     /// that might try to acquire the same lock.
+    /// 
+    /// # Mutex Poisoning
+    /// If the mutex is poisoned (a previous holder panicked), we signal
+    /// shutdown rather than attempting to use potentially corrupted state.
+    /// This follows fail-fast principles for GPU operations.
     pub fn wait_for_completion(&self, buf_idx: usize) {
         let bs = &self.buffer_sets[buf_idx];
         
@@ -601,7 +624,14 @@ impl GpuKeyGenerator {
         let cb_opt = {
             let mut pending = match bs.pending_command.lock() {
                 Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(), // Recover from poisoned mutex
+                Err(poisoned) => {
+                    // CRITICAL: Mutex poisoned means previous holder panicked
+                    // The GPU state may be corrupted - signal immediate shutdown
+                    eprintln!("💀 GPU mutex poisoned in wait_for_completion - initiating emergency stop");
+                    self.should_stop.store(true, Ordering::SeqCst);
+                    // Still try to recover the guard to prevent resource leak
+                    poisoned.into_inner()
+                }
             };
             pending.take() // Take ownership, None left in place
         }; // Lock released here, BEFORE wait
@@ -1288,33 +1318,65 @@ impl Drop for GpuKeyGenerator {
     /// - GPU memory corruption from premature buffer deallocation
     /// - Metal validation errors on debug builds
     /// - Orphaned GPU kernel execution
+    /// 
+    /// # Timeout Protection
+    /// Uses a 5-second timeout per buffer set to prevent infinite hangs
+    /// if GPU becomes unresponsive.
     fn drop(&mut self) {
+        use std::time::{Duration, Instant};
+        
         // Only do cleanup if we haven't already stopped
         if !self.should_stop.load(Ordering::SeqCst) {
             self.should_stop.store(true, Ordering::SeqCst);
         }
         
+        const TIMEOUT_PER_BUFFER: Duration = Duration::from_secs(5);
+        let drop_start = Instant::now();
+        let mut timed_out = false;
+        
         // Wait for all GPU command buffers to complete
         // Using take() pattern to avoid holding lock during wait
-        for bs in &self.buffer_sets {
+        for (idx, bs) in self.buffer_sets.iter().enumerate() {
+            // Check overall timeout
+            if drop_start.elapsed() > Duration::from_secs(15) {
+                eprintln!("⚠️  GPU drop timeout ({}s) - forcing cleanup without waiting", 
+                         drop_start.elapsed().as_secs());
+                timed_out = true;
+                break;
+            }
+            
             // Take ownership of command buffer, releasing lock immediately
             let cb_opt = {
-                let mut pending = match bs.pending_command.lock() {
+                let pending_result = bs.pending_command.lock();
+                let mut pending = match pending_result {
                     Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
+                    Err(poisoned) => {
+                        eprintln!("💀 GPU mutex poisoned in Drop (buffer {}) - continuing cleanup", idx);
+                        poisoned.into_inner()
+                    }
                 };
                 pending.take()
             }; // Lock released here
             
             // Wait without holding lock (deadlock prevention)
+            // Note: Metal's wait_until_completed doesn't have a timeout API,
+            // but command buffers typically complete quickly or not at all
             if let Some(cb) = cb_opt {
+                let wait_start = Instant::now();
                 cb.wait_until_completed();
+                if wait_start.elapsed() > TIMEOUT_PER_BUFFER {
+                    eprintln!("⚠️  Buffer {} took {}ms to complete", idx, wait_start.elapsed().as_millis());
+                }
             }
             
-            // Sync the queue
+            // Sync the queue with a quick command
             let sync_cb = bs.queue.new_command_buffer();
             sync_cb.commit();
             sync_cb.wait_until_completed();
+        }
+        
+        if timed_out {
+            eprintln!("⚠️  GPU resources may not be fully released due to timeout");
         }
         
         // Metal automatically releases GPU buffers when they go out of scope

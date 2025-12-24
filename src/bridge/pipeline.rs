@@ -387,6 +387,44 @@ fn format_number(n: u64) -> String {
     result
 }
 
+// ============================================================================
+// DROP IMPLEMENTATION - Graceful Pipeline Shutdown
+// ============================================================================
+
+impl<G, M, O> Drop for IntegratedPipeline<G, M, O>
+where
+    G: KeyGenerator,
+    M: Matcher,
+    O: MatchOutput,
+{
+    /// Graceful shutdown with timeout protection
+    /// 
+    /// Ensures the generator is stopped and resources are cleaned up.
+    /// Uses a timeout to prevent infinite hangs if GPU becomes unresponsive.
+    fn drop(&mut self) {
+        use std::time::{Duration, Instant};
+        
+        const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        let start = Instant::now();
+        
+        // Signal stop to generator
+        self.generator.stop();
+        
+        // Wait briefly for any pending operations
+        // The generator's Drop will handle the actual GPU cleanup
+        while !self.generator.should_stop() && start.elapsed() < SHUTDOWN_TIMEOUT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        
+        if start.elapsed() >= SHUTDOWN_TIMEOUT {
+            eprintln!("⚠️  Pipeline shutdown timed out after {}ms", SHUTDOWN_TIMEOUT.as_millis());
+        }
+        
+        // Flush output if possible (ignore errors during drop)
+        let _ = self.output.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
