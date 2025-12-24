@@ -1,16 +1,20 @@
 //! High-performance private key generation
 //! 
-//! Uses Philox RNG for deterministic, parallelizable random number generation.
-//! Each thread gets its own counter space to avoid contention.
+//! ## Modes
+//! 
+//! ### Sequential Mode (GPU-compatible) - DEFAULT
+//! Generates keys as `base_privkey + offset`, matching GPU behavior exactly.
+//! This is the recommended mode for range scanning.
+//! 
+//! ### Random Mode (Philox RNG) - LEGACY
+//! Uses Philox RNG for pseudo-random key generation.
+//! WARNING: Not compatible with GPU mode - searches different key space!
 //!
 //! ## GLV Endomorphism Support
 //! 
-//! For consistency with GPU mode, CPU mode also supports GLV endomorphism.
-//! Each base key k generates two search candidates:
+//! Both modes support GLV endomorphism for 2x throughput:
 //! - k (base key)
 //! - λ·k mod n (GLV transformed key)
-//!
-//! This ensures CPU and GPU modes scan the same address space.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -46,7 +50,263 @@ lazy_static::lazy_static! {
     static ref GLV_LAMBDA_SCALAR: Scalar = {
         Scalar::from_repr_vartime(GLV_LAMBDA.into()).expect("GLV_LAMBDA is valid")
     };
+    
+    /// Pre-computed GLV Lambda Squared for GLV3 mode: λ² mod n
+    static ref GLV_LAMBDA_SQ_SCALAR: Scalar = {
+        *GLV_LAMBDA_SCALAR * *GLV_LAMBDA_SCALAR
+    };
 }
+
+// ============================================================================
+// SEQUENTIAL KEY GENERATOR (GPU-COMPATIBLE)
+// ============================================================================
+
+/// Sequential key generator that matches GPU behavior exactly
+/// 
+/// Generates keys as: base_privkey + offset
+/// This ensures CPU and GPU scan the SAME key space.
+/// 
+/// ## GPU Compatibility
+/// - Uses same offset arithmetic as GPU shader
+/// - Supports GLV endomorphism (2x or 3x throughput)
+/// - Range scanning works identically between CPU and GPU
+pub struct CpuKeyGenerator {
+    /// Base private key (256-bit, big-endian)
+    base_privkey: [u8; 32],
+    /// Current offset from base
+    current_offset: AtomicU64,
+    /// End offset (for range limiting)
+    end_offset: Option<u64>,
+    /// GLV mode: 1 (disabled), 2 (GLV2), 3 (GLV3)
+    glv_multiplier: usize,
+}
+
+impl CpuKeyGenerator {
+    /// Create a new sequential generator starting from offset
+    /// 
+    /// # Arguments
+    /// * `start_offset` - Starting offset (must be >= 1)
+    /// * `end_offset` - Optional end offset for range limiting
+    /// * `glv_multiplier` - 1 (no GLV), 2 (GLV2), or 3 (GLV3)
+    pub fn new(start_offset: u64, end_offset: Option<u64>, glv_multiplier: usize) -> Self {
+        assert!(start_offset >= 1, "start_offset must be >= 1 (zero is invalid private key)");
+        assert!(glv_multiplier >= 1 && glv_multiplier <= 3, "glv_multiplier must be 1, 2, or 3");
+        
+        // Create base private key from start_offset
+        // Layout: 256-bit big-endian, offset in lowest 64 bits
+        let mut base_privkey = [0u8; 32];
+        base_privkey[24..32].copy_from_slice(&start_offset.to_be_bytes());
+        
+        Self {
+            base_privkey,
+            current_offset: AtomicU64::new(0),
+            end_offset: end_offset.map(|e| e.saturating_sub(start_offset)),
+            glv_multiplier,
+        }
+    }
+    
+    /// Backwards-compatible constructor with seed (interpreted as start_offset)
+    /// 
+    /// For easy migration from PhiloxKeyGenerator.
+    /// The 'seed' parameter is now used as start_offset for sequential generation.
+    pub fn with_seed(seed: u64) -> Self {
+        Self::new(seed.max(1), None, 2)  // GLV2 mode by default
+    }
+    
+    /// Create with explicit base private key (256-bit)
+    /// 
+    /// For advanced use cases where you need a specific starting point
+    /// in the full 256-bit key space.
+    pub fn with_base_key(base_privkey: [u8; 32], end_offset: Option<u64>, glv_multiplier: usize) -> Self {
+        Self {
+            base_privkey,
+            current_offset: AtomicU64::new(0),
+            end_offset,
+            glv_multiplier,
+        }
+    }
+    
+    /// Generate a batch of sequential keys
+    /// 
+    /// Returns keys for offsets [current, current + count)
+    /// With GLV enabled, returns glv_multiplier * count keys
+    pub fn generate_batch(&self, count: usize) -> Vec<RawKeyData> {
+        let start_offset = self.current_offset.fetch_add(count as u64, Ordering::Relaxed);
+        
+        // Check range limit
+        if let Some(end) = self.end_offset {
+            if start_offset >= end {
+                return Vec::new();
+            }
+        }
+        
+        (0..count)
+            .into_par_iter()
+            .flat_map(|i| {
+                let offset = start_offset + i as u64;
+                
+                // Check range limit per-key
+                if let Some(end) = self.end_offset {
+                    if offset >= end {
+                        return Vec::new();
+                    }
+                }
+                
+                self.generate_at_offset(offset)
+            })
+            .collect()
+    }
+    
+    /// Generate key(s) at specific offset from base
+    /// 
+    /// Returns 1, 2, or 3 keys depending on GLV mode
+    fn generate_at_offset(&self, offset: u64) -> Vec<RawKeyData> {
+        let mut results = Vec::with_capacity(self.glv_multiplier);
+        
+        // Compute private_key = base + offset (256-bit addition)
+        let private_key = match self.add_offset_to_base(offset) {
+            Some(k) => k,
+            None => return results,
+        };
+        
+        // Validate and generate base key
+        if !is_valid_private_key(&private_key) {
+            return results;
+        }
+        
+        if let Some((pubkey_hash, p2sh_hash)) = compute_pubkey_hash(&private_key) {
+            results.push(RawKeyData {
+                private_key,
+                pubkey_hash,
+                p2sh_hash,
+            });
+        }
+        
+        // GLV key: λ·k mod n
+        if self.glv_multiplier >= 2 {
+            if let Some(glv_key) = compute_glv_key(&private_key) {
+                if is_valid_private_key(&glv_key) {
+                    if let Some((glv_hash, glv_p2sh)) = compute_pubkey_hash(&glv_key) {
+                        results.push(RawKeyData {
+                            private_key: glv_key,
+                            pubkey_hash: glv_hash,
+                            p2sh_hash: glv_p2sh,
+                        });
+                    }
+                }
+            }
+        }
+        
+        // GLV² key: λ²·k mod n
+        if self.glv_multiplier >= 3 {
+            if let Some(glv2_key) = compute_glv2_key(&private_key) {
+                if is_valid_private_key(&glv2_key) {
+                    if let Some((glv2_hash, glv2_p2sh)) = compute_pubkey_hash(&glv2_key) {
+                        results.push(RawKeyData {
+                            private_key: glv2_key,
+                            pubkey_hash: glv2_hash,
+                            p2sh_hash: glv2_p2sh,
+                        });
+                    }
+                }
+            }
+        }
+        
+        results
+    }
+    
+    /// Add 64-bit offset to 256-bit base private key
+    /// 
+    /// Matches GPU's scalar_add_u64 behavior exactly
+    fn add_offset_to_base(&self, offset: u64) -> Option<[u8; 32]> {
+        let mut result = self.base_privkey;
+        
+        // Add offset to the low 64 bits (bytes 24-31, big-endian)
+        let mut carry = offset;
+        for i in (0..32).rev() {
+            if carry == 0 {
+                break;
+            }
+            let sum = result[i] as u64 + (carry & 0xFF);
+            result[i] = sum as u8;
+            carry = (carry >> 8) + (sum >> 8);
+        }
+        
+        // Check if we overflowed or exceeded curve order
+        // (extremely unlikely for reasonable offsets)
+        if carry != 0 {
+            return None;
+        }
+        
+        Some(result)
+    }
+    
+    /// Get current offset
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset.load(Ordering::Relaxed)
+    }
+    
+    /// Check if range is complete
+    pub fn is_range_complete(&self) -> bool {
+        if let Some(end) = self.end_offset {
+            self.current_offset.load(Ordering::Relaxed) >= end
+        } else {
+            false
+        }
+    }
+    
+    /// Get progress percentage (0.0 to 100.0)
+    pub fn progress_percent(&self) -> Option<f64> {
+        self.end_offset.map(|end| {
+            let current = self.current_offset.load(Ordering::Relaxed);
+            if end == 0 {
+                100.0
+            } else {
+                (current as f64 / end as f64 * 100.0).min(100.0)
+            }
+        })
+    }
+    
+    /// Get GLV multiplier
+    pub fn glv_multiplier(&self) -> usize {
+        self.glv_multiplier
+    }
+    
+    /// Check if GLV mode is enabled (backwards compatibility)
+    pub fn is_glv_enabled(&self) -> bool {
+        self.glv_multiplier > 1
+    }
+    
+    /// Create without GLV (backwards compatibility)
+    pub fn without_glv(start_offset: u64) -> Self {
+        Self::new(start_offset.max(1), None, 1)
+    }
+    
+    /// Get current count (backwards compatibility, same as current_offset)
+    pub fn current_count(&self) -> u64 {
+        self.current_offset.load(Ordering::Relaxed)
+    }
+    
+    /// Get effective keys generated (count * glv_multiplier)
+    pub fn effective_keys_generated(&self) -> u64 {
+        self.current_offset.load(Ordering::Relaxed) * self.glv_multiplier as u64
+    }
+}
+
+/// Compute GLV² transformed key: λ²·k mod n
+#[inline]
+fn compute_glv2_key(private_key: &[u8; 32]) -> Option<[u8; 32]> {
+    let k = Scalar::from_repr_vartime((*private_key).into())?;
+    let glv2_k = k * *GLV_LAMBDA_SQ_SCALAR;
+    let glv2_bytes = glv2_k.to_repr();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&glv2_bytes);
+    Some(result)
+}
+
+// ============================================================================
+// LEGACY PHILOX KEY GENERATOR (Random Mode)
+// ============================================================================
 
 /// Philox 4x32 constants
 const PHILOX_M0: u32 = 0xD2511F53;
@@ -54,14 +314,17 @@ const PHILOX_M1: u32 = 0xCD9E8D57;
 const PHILOX_W0: u32 = 0x9E3779B9;
 const PHILOX_W1: u32 = 0xBB67AE85;
 
-/// High-performance key generator with GLV endomorphism support
+/// LEGACY Philox-based random key generator
+/// 
+/// WARNING: This generates RANDOM keys using Philox RNG, which is
+/// NOT compatible with GPU's sequential mode. Use CpuKeyGenerator
+/// for GPU-compatible sequential key generation.
 /// 
 /// For each base key k, generates two keys:
 /// - k (base key)
 /// - λ·k mod n (GLV transformed key)
-/// 
-/// This matches GPU behavior for consistent scanning between modes.
-pub struct KeyGenerator {
+#[deprecated(since = "0.4.0", note = "Use CpuKeyGenerator for GPU-compatible sequential mode")]
+pub struct PhiloxKeyGenerator {
     /// Global counter for unique key generation
     counter: AtomicU64,
     /// Seed for RNG
@@ -70,7 +333,7 @@ pub struct KeyGenerator {
     glv_enabled: bool,
 }
 
-impl KeyGenerator {
+impl PhiloxKeyGenerator {
     /// Create a new key generator with cryptographically strong random seed
     /// Uses OS-provided entropy via `rand::thread_rng()` (backed by getrandom)
     /// GLV mode is enabled by default for GPU compatibility
@@ -276,7 +539,7 @@ fn compute_glv_key(private_key: &[u8; 32]) -> Option<[u8; 32]> {
     Some(result)
 }
 
-impl Default for KeyGenerator {
+impl Default for PhiloxKeyGenerator {
     fn default() -> Self {
         Self::new()
     }
@@ -317,16 +580,10 @@ fn mulhilo(a: u32, b: u32) -> (u32, u32) {
 /// Check if private key is valid (non-zero and less than curve order)
 #[inline(always)]
 fn is_valid_private_key(key: &[u8; 32]) -> bool {
-    // SIMD-optimized zero check: read 4 u64s and OR together
-    // 8x faster than byte-by-byte iteration
-    let ptr = key.as_ptr() as *const u64;
-    let is_zero = unsafe {
-        let v0 = std::ptr::read_unaligned(ptr);
-        let v1 = std::ptr::read_unaligned(ptr.add(1));
-        let v2 = std::ptr::read_unaligned(ptr.add(2));
-        let v3 = std::ptr::read_unaligned(ptr.add(3));
-        (v0 | v1 | v2 | v3) == 0
-    };
+    // Safe zero check: compiler auto-vectorizes to efficient SIMD
+    // This is faster than manual unaligned reads on ARM64 (M1/M2)
+    // and avoids potential UB from unaligned pointer casts
+    let is_zero = !key.iter().any(|&b| b != 0);
     
     if is_zero {
         return false;
@@ -379,9 +636,96 @@ fn compute_pubkey_hash(private_key: &[u8; 32]) -> Option<([u8; 20], [u8; 20])> {
 mod tests {
     use super::*;
     
+    // ========================================================================
+    // CpuKeyGenerator (Sequential, GPU-compatible) Tests
+    // ========================================================================
+    
     #[test]
-    fn test_key_generation() {
-        let gen = KeyGenerator::with_seed(12345);
+    fn test_cpu_sequential_generation() {
+        let gen = CpuKeyGenerator::new(1, None, 1);
+        let batch = gen.generate_batch(100);
+        
+        assert!(!batch.is_empty());
+        assert!(batch.len() <= 100);
+        
+        // All keys should be unique
+        let mut seen = std::collections::HashSet::new();
+        for key in &batch {
+            assert!(seen.insert(key.private_key), "Duplicate key found");
+        }
+    }
+    
+    #[test]
+    fn test_cpu_sequential_is_sequential() {
+        let gen = CpuKeyGenerator::new(1, None, 1);
+        let batch = gen.generate_batch(10);
+        
+        // Keys should be sequential: 1, 2, 3, ...
+        for (i, key) in batch.iter().enumerate() {
+            let expected_offset = (i + 1) as u64;
+            let mut expected_key = [0u8; 32];
+            expected_key[24..32].copy_from_slice(&expected_offset.to_be_bytes());
+            
+            assert_eq!(key.private_key, expected_key, 
+                "Key {} should be offset {}", i, expected_offset);
+        }
+    }
+    
+    #[test]
+    fn test_cpu_sequential_glv2() {
+        let gen = CpuKeyGenerator::new(1, None, 2);
+        let batch = gen.generate_batch(50);
+        
+        // With GLV2, we should get ~2x keys
+        assert!(batch.len() >= 90, "GLV2 should produce ~100 keys from 50 offsets, got {}", batch.len());
+        
+        // All keys should be unique
+        let mut seen = std::collections::HashSet::new();
+        for key in &batch {
+            assert!(seen.insert(key.private_key), "Duplicate key found");
+        }
+    }
+    
+    #[test]
+    fn test_cpu_sequential_glv3() {
+        let gen = CpuKeyGenerator::new(1, None, 3);
+        let batch = gen.generate_batch(50);
+        
+        // With GLV3, we should get ~3x keys
+        assert!(batch.len() >= 140, "GLV3 should produce ~150 keys from 50 offsets, got {}", batch.len());
+        
+        // All keys should be unique
+        let mut seen = std::collections::HashSet::new();
+        for key in &batch {
+            assert!(seen.insert(key.private_key), "Duplicate key found");
+        }
+    }
+    
+    #[test]
+    fn test_cpu_sequential_range_limit() {
+        let gen = CpuKeyGenerator::new(1, Some(10), 1);
+        
+        // First batch should work
+        let batch1 = gen.generate_batch(5);
+        assert_eq!(batch1.len(), 5);
+        assert!(!gen.is_range_complete());
+        
+        // Second batch should hit limit
+        let batch2 = gen.generate_batch(10);
+        assert!(batch2.len() <= 5, "Should stop at end_offset");
+        
+        // Now range should be complete
+        assert!(gen.is_range_complete());
+    }
+    
+    // ========================================================================
+    // PhiloxKeyGenerator (Legacy Random) Tests
+    // ========================================================================
+    
+    #[test]
+    #[allow(deprecated)]
+    fn test_philox_key_generation() {
+        let gen = PhiloxKeyGenerator::with_seed(12345);
         let batch = gen.generate_batch(100);
         assert!(!batch.is_empty());
         
@@ -391,6 +735,10 @@ mod tests {
             assert!(seen.insert(key.private_key));
         }
     }
+    
+    // ========================================================================
+    // Common Tests
+    // ========================================================================
     
     #[test]
     fn test_valid_key_check() {
@@ -412,8 +760,9 @@ mod tests {
     }
     
     #[test]
+    #[allow(deprecated)]
     fn test_glv_key_generation() {
-        let gen = KeyGenerator::with_seed(12345);
+        let gen = PhiloxKeyGenerator::with_seed(12345);
         assert!(gen.is_glv_enabled());
         
         // With GLV, we should get ~2x keys
@@ -430,8 +779,9 @@ mod tests {
     }
     
     #[test]
+    #[allow(deprecated)]
     fn test_glv_disabled() {
-        let gen = KeyGenerator::without_glv(12345);
+        let gen = PhiloxKeyGenerator::without_glv(12345);
         assert!(!gen.is_glv_enabled());
         
         let batch = gen.generate_batch(100);
@@ -459,6 +809,32 @@ mod tests {
         
         // GLV key should equal GLV_LAMBDA (since 1 * λ = λ)
         assert_eq!(glv_key, GLV_LAMBDA, "1 * λ should equal λ");
+    }
+    
+    #[test]
+    fn test_glv2_lambda_squared() {
+        // Test GLV² transform: λ²·k mod n
+        let base_key: [u8; 32] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        
+        let glv2_key = compute_glv2_key(&base_key).expect("GLV2 should work for key=1");
+        let glv_key = compute_glv_key(&base_key).expect("GLV should work for key=1");
+        
+        // GLV² key should be different from both base and GLV
+        assert_ne!(base_key, glv2_key);
+        assert_ne!(glv_key, glv2_key);
+        
+        // GLV² key should be valid
+        assert!(is_valid_private_key(&glv2_key));
+        
+        // Verify λ³ = 1: λ²·λ = λ³ ≡ 1 (mod n)
+        // So glv2 * lambda should equal base_key (for k=1)
+        let glv3_key = compute_glv_key(&glv2_key).expect("GLV of GLV2 should work");
+        assert_eq!(glv3_key, base_key, "λ³ should equal 1 (identity)");
     }
 }
 

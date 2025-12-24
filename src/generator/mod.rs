@@ -36,7 +36,10 @@ mod batch;
 mod gpu;
 mod adapter;
 
-pub use keygen::KeyGenerator as CpuKeyGenerator;
+// CPU Key Generators
+pub use keygen::CpuKeyGenerator;  // Sequential, GPU-compatible (recommended)
+#[allow(deprecated)]
+pub use keygen::PhiloxKeyGenerator;  // Legacy random mode (not GPU-compatible)
 pub use encoder::AddressEncoder;
 // Singleton encoder functions (preferred API - zero allocation)
 pub use encoder::{encode_key, encode_p2pkh, encode_p2sh, encode_p2wpkh};

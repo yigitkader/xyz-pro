@@ -989,9 +989,14 @@ impl GpuKeyGenerator {
     /// This follows fail-fast principles for GPU operations.
     /// 
     /// # Return Value
-    /// Returns Ok(()) on success, or Err with GpuError on failure.
+    /// Returns Ok(()) on success, or Err with String message on failure.
     /// Fatal errors (OutOfMemory, PageFault, etc.) trigger automatic shutdown.
+    /// 
+    /// Note: Error message includes GPU error code classification for reliable
+    /// error type detection by is_fatal_error() in pipeline.rs.
     pub fn wait_for_completion(&self, buf_idx: usize) -> Result<(), String> {
+        use crate::bridge::{GpuError, GpuErrorCode};
+        
         let bs = &self.buffer_sets[buf_idx];
         
         // Take ownership of command buffer while releasing lock immediately
@@ -1021,20 +1026,23 @@ impl GpuKeyGenerator {
             let status = cb.status();
             
             if status == metal::MTLCommandBufferStatus::Error {
-                // Extract error code from Metal
-                // MTLCommandBufferError codes are defined in Metal framework
-                let error_msg = format!(
-                    "GPU command buffer failed with status Error. \
-                     This may indicate OutOfMemory, PageFault, or other GPU errors. \
-                     Status code: {:?}",
-                    status
-                );
+                // Metal Rust bindings don't expose error_code() directly.
+                // We classify as Internal error since Status::Error is always fatal.
+                let gpu_error_code = GpuErrorCode::Internal;
+                let gpu_error = GpuError::new(gpu_error_code, format!(
+                    "GPU command buffer failed. Status: Error. ErrorCode: {}. Buffer index: {}",
+                    gpu_error_code, buf_idx
+                ));
                 
                 // Signal shutdown for fatal errors
-                eprintln!("❌ GPU ERROR: {}", error_msg);
-                self.should_stop.store(true, Ordering::SeqCst);
+                eprintln!("❌ GPU ERROR: {}", gpu_error);
+                if gpu_error.is_fatal() {
+                    self.should_stop.store(true, Ordering::SeqCst);
+                }
                 
-                return Err(error_msg);
+                // Return String for API compatibility, but include error code in message
+                // This allows is_fatal_error() to detect the error type reliably
+                return Err(gpu_error.to_string());
             }
         }
         

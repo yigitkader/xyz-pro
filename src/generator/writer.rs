@@ -20,7 +20,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
 use std::thread::{self, JoinHandle};
 use serde::{Deserialize, Serialize};
 
@@ -326,17 +326,38 @@ pub enum WriterMessage {
 }
 
 /// Async writer that runs in separate thread - GPU never blocks on I/O
+/// 
+/// ## Backpressure Mechanism
+/// Uses a bounded channel to prevent unbounded memory growth when disk I/O
+/// is slower than GPU generation. When the channel is full, `write_async()`
+/// blocks until a slot is available, naturally throttling the GPU.
+/// 
+/// Channel capacity is set to match triple buffering (3 buffers in flight),
+/// plus 1 extra for margin. This ensures GPU never starves for work while
+/// preventing runaway memory usage.
 pub struct AsyncRawWriter {
-    sender: Sender<WriterMessage>,
+    sender: SyncSender<WriterMessage>,
     handle: Option<JoinHandle<u64>>,
 }
 
+/// Maximum number of write requests buffered before backpressure kicks in
+/// - 3 = triple buffer (GPU has 3 dispatches in flight)
+/// - +1 = margin to avoid stalls on boundary conditions
+const ASYNC_WRITE_BUFFER_COUNT: usize = 4;
+
 impl AsyncRawWriter {
     /// Create new async writer with dedicated I/O thread
+    /// 
+    /// Uses bounded channel for backpressure:
+    /// - If GPU produces faster than disk can write, channel fills up
+    /// - When full, write_async() blocks, naturally throttling GPU
+    /// - This prevents unbounded memory growth from queued writes
     pub fn new(output_dir: String) -> std::io::Result<Self> {
         fs::create_dir_all(&output_dir)?;
         
-        let (sender, receiver) = channel::<WriterMessage>();
+        // Bounded channel for backpressure control
+        // Capacity matches triple buffering + margin
+        let (sender, receiver) = sync_channel::<WriterMessage>(ASYNC_WRITE_BUFFER_COUNT);
         
         let handle = thread::spawn(move || {
             Self::writer_thread(output_dir, receiver)
@@ -348,7 +369,14 @@ impl AsyncRawWriter {
         })
     }
     
-    /// Non-blocking write - returns immediately, I/O happens in background
+    /// Write with backpressure - blocks if I/O is falling behind
+    /// 
+    /// This provides natural flow control:
+    /// - Fast disk: returns immediately (non-blocking)
+    /// - Slow disk: blocks until space available (backpressure)
+    /// 
+    /// This prevents unbounded memory growth from queued writes
+    /// while maintaining maximum throughput when I/O can keep up.
     pub fn write_async(&self, data: Vec<u8>, key_count: usize) -> Result<(), String> {
         self.sender.send(WriterMessage::WriteRaw(data, key_count))
             .map_err(|e| format!("Failed to send to writer: {}", e))

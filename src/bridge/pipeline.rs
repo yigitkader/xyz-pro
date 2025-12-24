@@ -36,12 +36,48 @@ impl Default for PipelineConfig {
         Self {
             report_interval_secs: 2,
             parallel_matching: true,
-            // 100K chunks minimize rayon overhead for high-throughput matching
-            parallel_chunk_size: 100_000,
+            // Dynamic chunk size based on CPU cores for optimal parallelism:
+            // - Target: 2-4 chunks per CPU core for good load balancing
+            // - Example: 12 cores → ~4K chunk size (48K batch / 12 = 4K)
+            // - This ensures all cores are utilized regardless of GPU batch size
+            // - Previous static 100K value caused single-threading when batch < 100K
+            parallel_chunk_size: Self::compute_optimal_chunk_size(),
             // Retry configuration for transient GPU errors
             max_retries: 3,
             retry_delay_ms: 10,
         }
+    }
+}
+
+impl PipelineConfig {
+    /// Compute optimal chunk size based on available CPU cores
+    /// 
+    /// Strategy: Target 2-4 chunks per core for good load balancing
+    /// - Too few chunks: cores sit idle waiting for work
+    /// - Too many chunks: excessive overhead from task scheduling
+    /// 
+    /// Returns chunk size in number of keys (not bytes)
+    fn compute_optimal_chunk_size() -> usize {
+        let num_cores = rayon::current_num_threads();
+        
+        // Target: 3 chunks per core on average
+        // Minimum: 1K keys per chunk (avoid excessive task overhead)
+        // Maximum: 8K keys per chunk (ensure reasonable granularity)
+        const MIN_CHUNK: usize = 1_000;
+        const MAX_CHUNK: usize = 8_000;
+        const CHUNKS_PER_CORE: usize = 3;
+        
+        // Assume typical GPU batch size of ~65K-131K keys
+        // For M1 Pro (10 cores): 65K / (10 * 3) ≈ 2.1K → use 2K
+        // For M2 Ultra (24 cores): 131K / (24 * 3) ≈ 1.8K → use 2K
+        let target_chunks = num_cores * CHUNKS_PER_CORE;
+        
+        // Use a reasonable default batch estimate
+        const TYPICAL_BATCH_SIZE: usize = 65_536;
+        let computed = TYPICAL_BATCH_SIZE / target_chunks.max(1);
+        
+        // Clamp to reasonable bounds
+        computed.clamp(MIN_CHUNK, MAX_CHUNK)
     }
 }
 

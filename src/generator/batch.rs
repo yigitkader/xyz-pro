@@ -44,9 +44,12 @@ impl BatchProcessor {
             }
         }
         
+        // Use sequential mode matching GPU behavior
+        let glv_mult = config.glv_mode.keys_per_ec_op();
+        
         Self {
-            config,
-            keygen: Arc::new(CpuKeyGenerator::new()),
+            config: config.clone(),
+            keygen: Arc::new(CpuKeyGenerator::new(config.start_offset, config.end_offset, glv_mult)),
             seen_keys: Arc::new(DashSet::new()),
             total_generated: Arc::new(AtomicU64::new(0)),
             duplicates: Arc::new(AtomicU64::new(0)),
@@ -54,8 +57,11 @@ impl BatchProcessor {
         }
     }
     
-    /// Create with specific seed for reproducibility
-    pub fn with_seed(config: GeneratorConfig, seed: u64) -> Self {
+    /// Create with specific start offset for reproducibility
+    /// 
+    /// NOTE: The 'seed' parameter is now interpreted as 'start_offset' for
+    /// GPU-compatible sequential key generation.
+    pub fn with_seed(config: GeneratorConfig, start_offset: u64) -> Self {
         if config.threads > 0 {
             if let Err(e) = rayon::ThreadPoolBuilder::new()
                 .num_threads(config.threads)
@@ -65,9 +71,11 @@ impl BatchProcessor {
             }
         }
         
+        let glv_mult = config.glv_mode.keys_per_ec_op();
+        
         Self {
-            config,
-            keygen: Arc::new(CpuKeyGenerator::with_seed(seed)),
+            config: config.clone(),
+            keygen: Arc::new(CpuKeyGenerator::new(start_offset.max(1), config.end_offset, glv_mult)),
             seen_keys: Arc::new(DashSet::new()),
             total_generated: Arc::new(AtomicU64::new(0)),
             duplicates: Arc::new(AtomicU64::new(0)),
