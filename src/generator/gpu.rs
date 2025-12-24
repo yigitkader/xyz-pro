@@ -433,10 +433,21 @@ impl GpuKeyGenerator {
     }
     
     /// Create private key bytes from offset
+    /// 
+    /// Layout: 256-bit big-endian where offset occupies the LSW (bytes 24-31)
+    /// GPU's load_be() reads this correctly:
+    ///   .w = bytes 0-7 (MSW) = 0
+    ///   .z = bytes 8-15 = 0
+    ///   .y = bytes 16-23 = 0
+    ///   .x = bytes 24-31 (LSW) = offset
+    /// 
+    /// CRITICAL: offset must be >= 1 (config.start_offset enforces this)
+    /// Previous bug: key[0]=0x01 made the key > secp256k1 n (INVALID!)
     fn offset_to_privkey(offset: u64) -> [u8; 32] {
+        debug_assert!(offset > 0, "Private key offset must be non-zero");
         let mut key = [0u8; 32];
         key[24..32].copy_from_slice(&offset.to_be_bytes());
-        key[0] = 0x01; // Ensure non-zero
+        // NOTE: No key[0]=0x01 - that made key > curve order!
         key
     }
     
