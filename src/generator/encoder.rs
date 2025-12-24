@@ -147,26 +147,11 @@ fn hash160(data: &[u8]) -> [u8; 20] {
 }
 
 /// Base58Check encode with proper leading zero handling
-/// In Bitcoin's Base58Check, each leading 0x00 byte becomes a '1' character
+/// Note: bs58 crate already handles leading zero bytes correctly,
+/// prepending '1' for each leading 0x00 byte automatically.
 #[inline]
 fn base58check_encode(data: &[u8]) -> String {
-    // Count leading zero bytes
-    let leading_zeros = data.iter().take_while(|&&b| b == 0).count();
-    
-    // Encode the data
-    let encoded = bs58::encode(data).into_string();
-    
-    // Prepend '1' for each leading zero byte
-    if leading_zeros > 0 {
-        let mut result = String::with_capacity(leading_zeros + encoded.len());
-        for _ in 0..leading_zeros {
-            result.push('1');
-        }
-        result.push_str(&encoded);
-        result
-    } else {
-        encoded
-    }
+    bs58::encode(data).into_string()
 }
 
 #[cfg(test)]
