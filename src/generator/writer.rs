@@ -330,19 +330,31 @@ impl AsyncRawWriter {
     }
     
     /// Shutdown and wait for pending writes
-    pub fn shutdown(mut self) -> u64 {
-        let _ = self.sender.send(WriterMessage::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            handle.join().unwrap_or(0)
-        } else {
-            0
+    /// 
+    /// This properly closes the channel by dropping the sender,
+    /// ensuring the writer thread sees the disconnect and exits cleanly.
+    pub fn shutdown(self) -> u64 {
+        // Destructure self to get ownership of both fields
+        let AsyncRawWriter { sender, handle } = self;
+        
+        // Send shutdown message for clean exit
+        let _ = sender.send(WriterMessage::Shutdown);
+        
+        // Drop sender to close channel - this ensures recv() returns Err
+        // if the thread is blocked waiting. Belt-and-suspenders approach:
+        // either the Shutdown message or the channel close will trigger exit.
+        drop(sender);
+        
+        // Wait for thread to complete all pending writes
+        match handle {
+            Some(h) => h.join().unwrap_or(0),
+            None => 0,
         }
     }
     
     /// Writer thread - processes writes in background
     fn writer_thread(output_dir: String, receiver: Receiver<WriterMessage>) -> u64 {
         let mut file_counter = 0u64;
-        let mut total_keys = 0u64;
         
         while let Ok(msg) = receiver.recv() {
             match msg {
@@ -353,8 +365,6 @@ impl AsyncRawWriter {
                     
                     if let Err(e) = Self::write_raw_mmap(&filename, &data, key_count) {
                         eprintln!("❌ Write error: {}", e);
-                    } else {
-                        total_keys += key_count as u64;
                     }
                 }
                 WriterMessage::Shutdown => break,

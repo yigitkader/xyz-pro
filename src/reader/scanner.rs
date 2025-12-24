@@ -52,6 +52,7 @@ impl ScanResult {
 /// Scanner for RAW files
 pub struct RawFileScanner {
     targets: Arc<TargetSet>,
+    #[allow(dead_code)]
     threads: usize,
 }
 

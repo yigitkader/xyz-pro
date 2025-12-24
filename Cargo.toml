@@ -26,6 +26,7 @@ serde_json = "1.0"
 crossbeam-channel = "0.5"
 rayon = "1.10"
 dashmap = "5.5"  # Lock-free concurrent hashmap for deduplication
+parking_lot = "0.12"  # Fast mutex implementation (no timeout, no poison)
 
 # Memory mapping
 memmap2 = "0.9"
@@ -54,18 +55,15 @@ philox-rng = []        # GPU-native Philox4x32 RNG
 # Phase 2: Xor Filter
 xor-filter = []         # O(1) Xor filter (vs Bloom + Binary)
 
-# Phase 3: SIMD Math
-simd-math = []          # SIMD-group 256-bit arithmetic
-
-# Phase 4: PID Thermal
+# Phase 3: PID Thermal
 pid-thermal = []        # PID thermal controller
 
-# Phase 5: Zero-Copy
+# Phase 4: Zero-Copy
 zero-copy = []          # Zero-copy unified memory
 
 # Convenience feature sets
-all-features = ["philox-rng", "xor-filter", "simd-math", "pid-thermal", "zero-copy"]
-safe-features = ["philox-rng", "xor-filter", "pid-thermal"]  # Exclude risky SIMD and zero-copy
+all-features = ["philox-rng", "xor-filter", "pid-thermal", "zero-copy"]
+safe-features = ["philox-rng", "xor-filter", "pid-thermal"]
 
 # Legacy mode (all new features disabled)
 legacy-mode = []

@@ -62,25 +62,36 @@ impl TargetSet {
                     continue;
                 }
             
-                // Classify and store
+                // Classify and store - only count if decode succeeds
                 if addr.starts_with('1') {
-                    stats.p2pkh += 1;
                     if let Some(hash) = decode_p2pkh(&addr) {
                         hash160_set.insert(hash);
+                        stats.p2pkh += 1;
+                    } else {
+                        eprintln!("   ⚠️ Failed to decode P2PKH address (skipped): {}", addr);
+                        continue;
                     }
                 } else if addr.starts_with('3') {
-                    stats.p2sh += 1;
                     if let Some(hash) = decode_p2sh(&addr) {
                         p2sh_set.insert(hash);
+                        stats.p2sh += 1;
+                    } else {
+                        eprintln!("   ⚠️ Failed to decode P2SH address (skipped): {}", addr);
+                        continue;
                     }
                 } else if addr.starts_with("bc1q") {
                     if addr.len() <= 44 {
-                        stats.p2wpkh += 1;
+                        // Only count as P2WPKH if decode succeeds
                         match decode_bech32(&addr) {
-                            Some(hash) => { hash160_set.insert(hash); }
+                            Some(hash) => { 
+                                hash160_set.insert(hash);
+                                stats.p2wpkh += 1;
+                            }
                             None => {
                                 // Log decode failures - important for debugging invalid target addresses
-                                eprintln!("   ⚠️ Failed to decode bech32 address (skipped): {}", addr); 
+                                // Don't increment stats for failed decodes
+                                eprintln!("   ⚠️ Failed to decode bech32 address (skipped): {}", addr);
+                                continue; // Skip this invalid address entirely
                             }
                         }
                     } else {

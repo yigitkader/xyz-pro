@@ -13,14 +13,13 @@
 //! Target: Maximum throughput on Apple Silicon.
 
 use std::ops::Deref;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::{elliptic_curve::PrimeField, ProjectivePoint, Scalar};
+use k256::{ProjectivePoint, Scalar};
 
 use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
@@ -31,6 +30,10 @@ use super::{AddressEncoder, GeneratorConfig, GeneratorStats, KeyEntry, OutputFor
 // ============================================================================
 // CONSTANTS
 // ============================================================================
+
+/// Metal shader source - embedded at compile time for release builds
+/// This ensures the binary is self-contained and doesn't require external shader files
+const SHADER_SOURCE: &str = include_str!("keygen.metal");
 
 /// Keys per thread (Montgomery batch size) - must match shader
 const BATCH_SIZE: u32 = 32;
@@ -43,6 +46,8 @@ const WNAF_TABLE_SIZE: usize = 75 * 64;
 
 /// GLV Lambda constant for endomorphism: k → λ·k (mod n)
 /// φ(P) = λ·P where φ(x,y) = (β·x, y)
+/// Note: This is now computed in the GPU kernel, kept for potential CPU verification
+#[allow(dead_code)]
 const GLV_LAMBDA: [u8; 32] = [
     0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0,
     0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
@@ -51,6 +56,7 @@ const GLV_LAMBDA: [u8; 32] = [
 ];
 
 lazy_static::lazy_static! {
+    #[allow(dead_code)]
     static ref GLV_LAMBDA_SCALAR: Scalar = {
         use k256::elliptic_curve::PrimeField;
         Scalar::from_repr_vartime(GLV_LAMBDA.into()).unwrap()
@@ -250,15 +256,9 @@ impl GpuKeyGenerator {
         // Detect GPU tier
         let tier = GpuTier::detect(&device);
         
-        // Load and compile shader
-        let shader_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/generator/keygen.metal");
-        
-        let shader_source = std::fs::read_to_string(&shader_path)
-            .map_err(|e| format!("Failed to read shader: {}", e))?;
-        
+        // Compile embedded shader (self-contained binary, no external file needed)
         let library = device
-            .new_library_with_source(&shader_source, &metal::CompileOptions::new())
+            .new_library_with_source(SHADER_SOURCE, &metal::CompileOptions::new())
             .map_err(|e| format!("Failed to compile shader: {}", e))?;
         
         let function = library
@@ -438,6 +438,8 @@ impl GpuKeyGenerator {
     }
     
     /// GLV transform: k → λ·k (mod n)
+    /// Note: This is now computed in the GPU kernel, kept for potential CPU verification
+    #[allow(dead_code)]
     fn glv_transform_key(key: &[u8; 32]) -> [u8; 32] {
         use k256::elliptic_curve::PrimeField;
         
