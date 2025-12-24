@@ -537,10 +537,20 @@ void compute_p2sh_hash(thread const uchar* pubkey_hash, thread uchar* script_has
 
 // GLV Lambda constant for private key transformation
 // λ·k mod n gives the private key for the endomorphic point φ(P)
+// 
+// Value: 0x5363AD4CC05C30E0A5261C028812645A122E22EA20816678DF02967C1B23BD72
+// This is verified at compile-time via static_assert below.
 constant ulong4 GLV_LAMBDA = {
     0xDF02967C1B23BD72ULL, 0x122E22EA20816678ULL,
     0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL
 };
+
+// Compile-time verification of GLV Lambda constant
+// If this fails, the constant has been corrupted
+static_assert(GLV_LAMBDA.x == 0xDF02967C1B23BD72ULL, "GLV_LAMBDA.x corrupted");
+static_assert(GLV_LAMBDA.y == 0x122E22EA20816678ULL, "GLV_LAMBDA.y corrupted");
+static_assert(GLV_LAMBDA.z == 0xA5261C028812645AULL, "GLV_LAMBDA.z corrupted");
+static_assert(GLV_LAMBDA.w == 0x5363AD4CC05C30E0ULL, "GLV_LAMBDA.w corrupted");
 
 // Compare 256-bit numbers: returns -1 if a < b, 0 if a == b, 1 if a > b
 inline int cmp256(ulong4 a, ulong4 b) {
