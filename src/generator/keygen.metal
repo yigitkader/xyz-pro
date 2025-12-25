@@ -209,26 +209,69 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
             break; // Already in valid range [0, n-1] with no overflow
         }
         
-        // Subtract n with borrow chain
-        // CRITICAL: This subtraction handles the 257-bit case correctly.
-        // If overflow was true, we're subtracting n from (s + 2^256).
-        // The result is (s + 2^256 - n), which is < 2^256 since n ≈ 2^256.
-        ulong bw = 0;
+        // =====================================================================
+        // SUBTRACT n WITH PROPER BORROW CHAIN (257-bit precision)
+        // =====================================================================
+        // CRITICAL FIX: Previous code had overflow bug in borrow comparison.
+        // The expression (s.y < SECP256K1_N.y + bw) can overflow if SECP256K1_N.y
+        // is near 0xFFFFFFFFFFFFFFFF. We must compare WITHOUT adding bw first.
+        // 
+        // Safe borrow detection:
+        //   borrow occurs if: s.word < n.word + prev_borrow
+        //   Equivalent to:    s.word < n.word || (s.word == n.word && prev_borrow)
+        //   Or:               s.word - prev_borrow < n.word (but must check underflow)
+        // =====================================================================
         ulong4 r;
-        r.x = s.x - SECP256K1_N.x; bw = (s.x < SECP256K1_N.x) ? 1 : 0;
-        r.y = s.y - SECP256K1_N.y - bw; bw = (s.y < SECP256K1_N.y + bw) ? 1 : 0;
-        r.z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z + bw) ? 1 : 0;
-        r.w = s.w - SECP256K1_N.w - bw;
+        bool borrow = false;
         
-        // After subtraction: if there was overflow (257th bit set), the borrow
-        // chain would have consumed it. Check if result still needs reduction.
-        // CRITICAL FIX: Only clear overflow if the subtraction was valid
-        // (i.e., we actually had enough to subtract n without going negative)
+        // r.x = s.x - n.x (with borrow out)
+        r.x = s.x - SECP256K1_N.x;
+        borrow = (s.x < SECP256K1_N.x);
+        
+        // r.y = s.y - n.y - borrow (with borrow out)
+        // SAFE: Check borrow condition without overflow
+        ulong sub_y = SECP256K1_N.y + (borrow ? 1UL : 0UL);
+        bool sub_y_overflow = borrow && (SECP256K1_N.y == 0xFFFFFFFFFFFFFFFFUL);
+        r.y = s.y - SECP256K1_N.y - (borrow ? 1UL : 0UL);
+        borrow = sub_y_overflow || (s.y < sub_y);
+        
+        // r.z = s.z - n.z - borrow
+        ulong sub_z = SECP256K1_N.z + (borrow ? 1UL : 0UL);
+        bool sub_z_overflow = borrow && (SECP256K1_N.z == 0xFFFFFFFFFFFFFFFFUL);
+        r.z = s.z - SECP256K1_N.z - (borrow ? 1UL : 0UL);
+        borrow = sub_z_overflow || (s.z < sub_z);
+        
+        // r.w = s.w - n.w - borrow
+        // Note: If overflow was true (257th bit), the borrow chain consumes it
+        ulong sub_w = SECP256K1_N.w + (borrow ? 1UL : 0UL);
+        bool sub_w_overflow = borrow && (SECP256K1_N.w == 0xFFFFFFFFFFFFFFFFUL);
+        r.w = s.w - SECP256K1_N.w - (borrow ? 1UL : 0UL);
+        bool final_borrow = sub_w_overflow || (s.w < sub_w);
+        
+        // =====================================================================
+        // 257-BIT BORROW RESOLUTION
+        // =====================================================================
+        // If overflow was true (value was s + 2^256), the subtraction of n
+        // effectively subtracts from bit 256, which cancels the overflow.
+        // After subtraction: result = (s + 2^256) - n
+        //                           = s + (2^256 - n)  where (2^256 - n) ≈ 2^128
+        // This is always positive and < 2^256.
+        //
+        // If overflow was false but we still had a final borrow, the subtraction
+        // was invalid (s < n). This shouldn't happen because needs_reduction
+        // already verified s >= n. But if it does (edge case), we should NOT
+        // apply the subtraction. We handle this by checking final_borrow.
+        // =====================================================================
         if (overflow) {
-            // We subtracted n from (s + 2^256). Result is definitely < 2^256.
+            // Subtract consumed the 257th bit - result is definitely valid
             overflow = false;
+            s = r;
+        } else if (!final_borrow) {
+            // Normal case: s >= n, subtraction is valid
+            s = r;
         }
-        s = r;
+        // else: final_borrow without overflow means s < n, shouldn't happen
+        // but if it does, we keep s unchanged (break will trigger next iter)
     }
 }
 
@@ -974,6 +1017,17 @@ kernel void generate_btc_keys(
     ulong4 cur_Z = {1,0,0,0};
     ulong4 cur_ZZ = {1,0,0,0};
     
+    // =========================================================================
+    // wNAF POINT LOOKUP (7 windows = 28 bits of offset coverage)
+    // =========================================================================
+    // CRITICAL FIX: Extended from 5 to 7 windows to prevent key collision.
+    // 
+    // Previous bug: Only 5 windows covered 20 bits (2^20 = 1M offsets).
+    // ULTRA tier uses up to 2^23 = 8M offsets, causing bits 20-22 to be
+    // ignored and resulting in massive duplicate key generation.
+    //
+    // Now: 7 windows × 4 bits = 28 bits = 2^28 = 268M offset coverage.
+    // =========================================================================
     if (thread_offset > 0) {
         #define WINDOW_ADD(window) { \
             uint digit = (thread_offset >> (4 * window)) & 0xF; \
@@ -990,6 +1044,8 @@ kernel void generate_btc_keys(
         WINDOW_ADD(2)
         WINDOW_ADD(3)
         WINDOW_ADD(4)
+        WINDOW_ADD(5)  // NEW: Covers bits 20-23 (16^5 = 2^20)
+        WINDOW_ADD(6)  // NEW: Covers bits 24-27 (16^6 = 2^24)
         #undef WINDOW_ADD
     }
     
@@ -1050,8 +1106,11 @@ kernel void generate_btc_keys(
     int valid_count = 0;
     
     for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
-        if (batch_valid[b]) {
-            // SAFETY: batch_valid guarantees batch_Z[b] != 0
+        // DOUBLE SAFETY CHECK: Verify both batch_valid AND batch_Z explicitly
+        // This catches any theoretical edge case where batch_valid is true
+        // but Z became 0 due to unexpected behavior in prior operations.
+        // mod_inv(0) would poison the entire batch - we must prevent this.
+        if (batch_valid[b] && !IsZero(batch_Z[b])) {
             if (valid_count == 0) {
                 products[0] = batch_Z[b];
             } else {
@@ -1060,14 +1119,20 @@ kernel void generate_btc_keys(
             product_map[valid_count] = b;
             valid_count++;
         } else {
+            // Mark as invalid - will be zero-filled in output
             batch_Zinv[b] = ulong4{0, 0, 0, 0};
         }
     }
     
+    // CRITICAL: Only perform inversion if we have valid points
+    // valid_count == 0 means entire batch is invalid (all points at infinity)
+    // This is extremely rare but must be handled gracefully - skip inversion
     if (valid_count > 0) {
-        // SAFETY: products[valid_count-1] != 0 because all contributors had Z != 0
+        // SAFETY GUARANTEE: products[valid_count-1] is non-zero because every
+        // contributor passed the !IsZero(batch_Z[b]) check above.
         ulong4 inv = mod_inv(products[valid_count - 1]);
         
+        // Backtrack to compute individual Z inverses
         for (int i = valid_count - 1; i > 0; i--) {
             int b = product_map[i];
             batch_Zinv[b] = mod_mul(inv, products[i - 1]);
@@ -1075,6 +1140,7 @@ kernel void generate_btc_keys(
         }
         batch_Zinv[product_map[0]] = inv;
     }
+    // else: valid_count == 0, all Zinv already zeroed, output will be zeros
     
     // Phase 3: Output
     for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
@@ -1206,11 +1272,12 @@ kernel void generate_btc_keys_glv(
                            cur_X, cur_Y, cur_Z, cur_ZZ);
     }
     
-    // Phase 2: Montgomery Batch Inversion
+    // Phase 2: Montgomery Batch Inversion (with Z=0 poisoning protection)
     int valid_count = 0;
     
     for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
-        if (batch_valid[b]) {
+        // DOUBLE SAFETY: Check both batch_valid AND batch_Z to prevent batch poisoning
+        if (batch_valid[b] && !IsZero(batch_Z[b])) {
             if (valid_count == 0) {
                 products[0] = batch_Z[b];
             } else {
@@ -1357,6 +1424,17 @@ kernel void generate_btc_keys_glv3(
     ulong4 cur_Z = {1,0,0,0};
     ulong4 cur_ZZ = {1,0,0,0};
     
+    // =========================================================================
+    // wNAF POINT LOOKUP (7 windows = 28 bits of offset coverage)
+    // =========================================================================
+    // CRITICAL FIX: Extended from 5 to 7 windows to prevent key collision.
+    // 
+    // Previous bug: Only 5 windows covered 20 bits (2^20 = 1M offsets).
+    // ULTRA tier uses up to 2^23 = 8M offsets, causing bits 20-22 to be
+    // ignored and resulting in massive duplicate key generation.
+    //
+    // Now: 7 windows × 4 bits = 28 bits = 2^28 = 268M offset coverage.
+    // =========================================================================
     if (thread_offset > 0) {
         #define WINDOW_ADD(window) { \
             uint digit = (thread_offset >> (4 * window)) & 0xF; \
@@ -1373,6 +1451,8 @@ kernel void generate_btc_keys_glv3(
         WINDOW_ADD(2)
         WINDOW_ADD(3)
         WINDOW_ADD(4)
+        WINDOW_ADD(5)  // NEW: Covers bits 20-23 (16^5 = 2^20)
+        WINDOW_ADD(6)  // NEW: Covers bits 24-27 (16^6 = 2^24)
         #undef WINDOW_ADD
     }
     
@@ -1410,11 +1490,12 @@ kernel void generate_btc_keys_glv3(
                            cur_X, cur_Y, cur_Z, cur_ZZ);
     }
     
-    // Phase 2: Montgomery Batch Inversion
+    // Phase 2: Montgomery Batch Inversion (with Z=0 poisoning protection)
     int valid_count = 0;
     
     for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
-        if (batch_valid[b]) {
+        // DOUBLE SAFETY: Check both batch_valid AND batch_Z to prevent batch poisoning
+        if (batch_valid[b] && !IsZero(batch_Z[b])) {
             if (valid_count == 0) {
                 products[0] = batch_Z[b];
             } else {

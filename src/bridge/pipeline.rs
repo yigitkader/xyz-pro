@@ -209,23 +209,32 @@ where
             }
         }
         
-        // CRITICAL: Drain the pipeline when range is complete
+        // =========================================================================
+        // CRITICAL: Drain the pipeline on ANY exit condition
+        // =========================================================================
         // The GPU pipeline has `pipeline_depth` batches dispatched ahead.
-        // When we break out of the loop, there are still batches waiting in the
-        // GPU that have been computed but not yet retrieved.
+        // When we break out of the loop (for ANY reason), there are still batches
+        // waiting in the GPU that have been computed but not yet retrieved.
         // Without draining, we lose the last `pipeline_depth - 1` batches of data!
         //
-        // FIX: Use drain_buffer() instead of generate_with_retry() to avoid
-        // dispatching new work beyond the range. drain_buffer() only reads
-        // pending GPU results without scheduling new computations.
-        if range_complete {
+        // IMPORTANT FIX: Drain on BOTH conditions:
+        // 1. range_complete - normal end of range scan
+        // 2. should_stop() - user interrupt (Ctrl+C) or programmatic stop
+        //
+        // This ensures we never lose computed results, especially important when
+        // the target key might be in the last few batches before shutdown.
+        // =========================================================================
+        let should_drain = range_complete || self.generator.should_stop();
+        
+        if should_drain {
             let depth = self.generator.pipeline_depth();
             if depth > 1 {
-                println!("🔄 Draining pipeline ({} pending batches)...", depth - 1);
+                let reason = if range_complete { "range complete" } else { "stop requested" };
+                println!("🔄 Draining pipeline ({} pending batches, reason: {})...", depth - 1, reason);
+                
                 for i in 0..(depth - 1) {
-                    // CRITICAL FIX: Use drain_buffer instead of generate_batch
-                    // This retrieves pending GPU results WITHOUT dispatching new work
-                    // that would scan beyond the configured range.
+                    // CRITICAL: Use drain_buffer instead of generate_batch
+                    // This retrieves pending GPU results WITHOUT dispatching new work.
                     match self.generator.drain_buffer(i) {
                         Ok(batch_data) => {
                             let batch = KeyBatch::new(batch_data);
@@ -248,7 +257,7 @@ where
                         }
                     }
                 }
-                println!("   ✓ Pipeline drained");
+                println!("   ✓ Pipeline drained successfully");
             }
         }
         

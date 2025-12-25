@@ -43,8 +43,24 @@ const BATCH_SIZE: u32 = 32;
 /// Output size per key: 32 (privkey) + 20 (pubkey_hash) + 20 (p2sh_hash) = 72 bytes
 const OUTPUT_SIZE: usize = 72;
 
-/// wNAF table: 5 windows × 15 entries × 64 bytes (x + y coordinates)
-const WNAF_TABLE_SIZE: usize = 75 * 64;
+/// wNAF table: 7 windows × 15 entries × 64 bytes (x + y coordinates)
+/// 
+/// CRITICAL FIX: Extended from 5 to 7 windows to support ULTRA tier offsets.
+/// 
+/// Bit coverage calculation:
+/// - Each window covers 4 bits (digit 1-15, 0 means skip)
+/// - 7 windows × 4 bits = 28 bits = 2^28 = 268 million offset range
+/// 
+/// ULTRA tier requirement:
+/// - threads_per_dispatch = 262,144 = 2^18
+/// - keys_per_thread (BATCH_SIZE) = 32 = 2^5  
+/// - max thread_offset = 2^18 × 2^5 = 2^23 ≈ 8.4 million
+/// - Safety margin: 28 bits >> 23 bits ✓
+/// 
+/// Previous bug: Only 5 windows (20 bits) caused bits 20-22 to be ignored,
+/// resulting in massive key duplication for large gid values.
+const WNAF_WINDOWS: usize = 7;
+const WNAF_TABLE_SIZE: usize = WNAF_WINDOWS * 15 * 64;  // 7 × 15 × 64 = 6720 bytes
 
 /// GLV Lambda constant for endomorphism: k → λ·k (mod n)
 /// φ(P) = λ·P where φ(x,y) = (β·x, y)
@@ -602,7 +618,8 @@ impl GpuKeyGenerator {
             wnaf_table.len() as u64,
             storage,
         );
-        println!("   wNAF table: {} entries ({} bytes)", 75, wnaf_table.len());
+        println!("   wNAF table: {} windows × 15 entries = {} entries ({} bytes)", 
+                 WNAF_WINDOWS, WNAF_WINDOWS * 15, wnaf_table.len());
         
         // Buffer pool for zero-copy transfers
         // GLV CRITICAL: Pool must accommodate GLV-multiplied keys per dispatch
@@ -913,25 +930,46 @@ impl GpuKeyGenerator {
         //
         // =========================================================================
         
-        let mut spin_count = 0;
-        const MAX_SPINS: u32 = 1000;
-        const YIELD_THRESHOLD: u32 = 10;
+        // =========================================================================
+        // ENERGY-EFFICIENT WAIT STRATEGY
+        // =========================================================================
+        // Problem: Naive spin-wait causes thermal throttling on M-series Macs.
+        // When CPU spins at 100%, the SoC heats up, causing GPU to throttle.
+        // 
+        // Solution: Hybrid approach with 3 phases:
+        // 1. Brief spin (fast path for short waits)
+        // 2. Yield (moderate contention)
+        // 3. Sleep (heavy contention - saves power, prevents throttling)
+        //
+        // Tuned for Apple M1/M2/M3 SoCs where CPU and GPU share thermal budget.
+        // =========================================================================
+        let mut spin_count = 0u32;
+        const SPIN_PHASE: u32 = 5;        // Very brief spin (< 1µs)
+        const YIELD_PHASE: u32 = 20;      // Yield to scheduler
+        const SLEEP_PHASE: u32 = 100;     // Short sleep (10µs)
+        const WARN_THRESHOLD: u32 = 500;  // Log warning
         
-        // Wait for CPU to finish reading this buffer
-        // ACQUIRE ordering ensures we see all CPU writes before proceeding
         while bs.in_use.load(Ordering::Acquire) {
             spin_count += 1;
             
-            if spin_count > MAX_SPINS {
-                // Buffer still in use after many attempts - CPU is severely lagging
-                if spin_count == MAX_SPINS + 1 {
-                    eprintln!("⚠️ Buffer {} still in use - CPU lagging behind GPU", buf_idx);
+            if spin_count > WARN_THRESHOLD {
+                // Heavy contention - increase sleep duration to reduce thermal load
+                if spin_count == WARN_THRESHOLD + 1 {
+                    eprintln!("⚠️ Buffer {} contention detected - CPU lagging behind GPU", buf_idx);
                 }
-                std::thread::sleep(Duration::from_micros(100));
-            } else if spin_count > YIELD_THRESHOLD {
+                // Longer sleep reduces CPU power consumption and thermal throttling
+                std::thread::sleep(Duration::from_micros(500));
+            } else if spin_count > SLEEP_PHASE {
+                // Moderate contention - short sleep saves power
+                std::thread::sleep(Duration::from_micros(10));
+            } else if spin_count > YIELD_PHASE {
+                // Light contention - yield to other threads
                 std::thread::yield_now();
+            } else if spin_count > SPIN_PHASE {
+                // Fast path - hint to CPU this is a spin loop
+                std::hint::spin_loop();
             }
-            // else: spin-wait (fast path)
+            // else: pure spin (first few iterations)
             
             if self.should_stop.load(Ordering::SeqCst) {
                 return Err("Generator stopped while waiting for buffer".to_string());
@@ -1851,13 +1889,16 @@ impl ScanStats {
 /// Generate wNAF lookup table with verification
 /// 
 /// Table structure:
-/// - 5 windows × 15 entries × 64 bytes = 4800 bytes total
+/// - 7 windows × 15 entries × 64 bytes = 6720 bytes total
 /// - Window i contains: (2^(4i) * G) * digit for digit in 1..=15
 /// - Entry format: [X: 32 bytes][Y: 32 bytes] (affine coordinates, big-endian)
+/// 
+/// CRITICAL: Must match WNAF_WINDOWS constant and Metal shader window count.
 fn generate_wnaf_table() -> Vec<u8> {
     let mut table = vec![0u8; WNAF_TABLE_SIZE];
     
-    for window in 0..5 {
+    // CRITICAL FIX: Generate all 7 windows (was 5, causing key collision)
+    for window in 0..WNAF_WINDOWS {
         let window_multiplier = 1u64 << (4 * window);
         let window_scalar = Scalar::from(window_multiplier);
         let window_base = ProjectivePoint::GENERATOR * window_scalar;
@@ -1899,10 +1940,14 @@ fn verify_wnaf_table(table: &[u8]) -> Result<(), String> {
         (0, 2, 2u64, "2*G"),
         (0, 5, 5u64, "5*G"),
         (0, 15, 15u64, "15*G"),
-        (1, 1, 16u64, "16*G"),      // First entry of window 1
-        (1, 5, 80u64, "80*G"),      // 16*5
-        (2, 1, 256u64, "256*G"),    // First entry of window 2
-        (4, 1, 65536u64, "65536*G"), // First entry of window 4
+        (1, 1, 16u64, "16*G"),          // First entry of window 1: 16^1
+        (1, 5, 80u64, "80*G"),          // 16*5
+        (2, 1, 256u64, "256*G"),        // First entry of window 2: 16^2
+        (4, 1, 65536u64, "65536*G"),    // First entry of window 4: 16^4
+        // CRITICAL: Test new windows 5 and 6 (added for ULTRA tier support)
+        (5, 1, 1048576u64, "2^20*G"),   // First entry of window 5: 16^5 = 2^20
+        (5, 15, 15728640u64, "15*2^20*G"), // Last entry of window 5
+        (6, 1, 16777216u64, "2^24*G"),  // First entry of window 6: 16^6 = 2^24
     ];
     
     for (window, digit, scalar_val, label) in test_cases.iter() {
