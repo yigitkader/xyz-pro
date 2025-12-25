@@ -98,12 +98,12 @@ fn main() {
     let args = Args::parse();
     
     // Determine mode
-    match &args.command {
+    match args.command {
         Some(Commands::Generate { target }) => {
-            run_generator_mode(&args, *target);
+            run_generator_mode(&args, target);
         }
         Some(Commands::Scan { targets, start }) => {
-            run_scan_mode(&args, targets.clone(), start.clone());
+            run_scan_mode(&args, targets, start);
         }
         None => {
             // DEFAULT: Scan mode
