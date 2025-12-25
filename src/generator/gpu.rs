@@ -1851,14 +1851,19 @@ impl GpuKeyGenerator {
                         let priv_hex = hex::encode(&entry[0..32]);
                         let mut result = format!("🎯 FOUND! Key: {}", priv_hex);
                         
+                        // FIX: Now shows REAL Bitcoin addresses, not just hashes!
+                        // Users can directly use these addresses to verify on blockchain.
                         if match_p2pkh {
-                            result.push_str(&format!(" | P2PKH hash: {}", hex::encode(pubkey_hash)));
+                            let addr = AddressEncoder::new().encode_p2pkh_from_hash(pubkey_hash);
+                            result.push_str(&format!(" | P2PKH: {}", addr));
                         }
                         if match_p2sh {
-                            result.push_str(&format!(" | P2SH hash: {}", hex::encode(p2sh_hash)));
+                            let addr = AddressEncoder::new().encode_p2sh_from_hash(p2sh_hash);
+                            result.push_str(&format!(" | P2SH: {}", addr));
                         }
                         if match_p2wpkh {
-                            result.push_str(&format!(" | P2WPKH hash: {}", hex::encode(pubkey_hash)));
+                            let addr = AddressEncoder::new().encode_p2wpkh_from_hash(pubkey_hash);
+                            result.push_str(&format!(" | P2WPKH: {}", addr));
                         }
                         
                         Some(result)
@@ -1875,9 +1880,19 @@ impl GpuKeyGenerator {
                 if let Ok(mut file) = matches_file.lock() {
                     for hit in &batch_hits {
                         println!("{}", hit);
-                        let _ = writeln!(file, "{}", hit);
+                        // FIX: Don't silently ignore write errors - log them!
+                        if let Err(e) = writeln!(file, "{}", hit) {
+                            eprintln!("⚠️ CRITICAL: Failed to write match to file: {}", e);
+                        }
                     }
-                    let _ = file.flush();
+                    // FIX: Use sync_all() instead of flush() to guarantee disk write
+                    // flush() only clears the buffer, sync_all() ensures physical disk write
+                    // This prevents match loss on power failure or crash
+                    if let Err(e) = file.sync_all() {
+                        eprintln!("⚠️ CRITICAL: Failed to sync matches to disk: {}", e);
+                    }
+                } else {
+                    eprintln!("⚠️ CRITICAL: Failed to acquire file lock for match write!");
                 }
             }
             

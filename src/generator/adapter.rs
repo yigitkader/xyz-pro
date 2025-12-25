@@ -196,37 +196,28 @@ impl KeyGenerator for GpuGeneratorAdapter {
             return Err(format!("GPU command buffer error: {}", e));
         }
         
-        // OPTIMIZATION: Dispatch BEFORE copy to minimize GPU idle time
+        // CRITICAL FIX: Copy BEFORE dispatch to prevent race condition!
         // 
-        // Timeline with depth=2:
-        //   generate_batch(0): wait(0) → dispatch(0) → copy(0) [GPU 1 running]
-        //   generate_batch(1): wait(1) → dispatch(1) → copy(1) [GPU 0 running]
+        // Previous bug: dispatch_glv was called BEFORE copy, starting new GPU
+        // work on the SAME buffer while CPU was still reading old data.
+        // Metal's async dispatch means GPU could overwrite data mid-copy!
         //
-        // By dispatching immediately after wait completes, we start the next
-        // GPU computation while CPU is still copying. This hides copy latency.
+        // Correct Timeline with depth=2:
+        //   generate_batch(0): wait(0) → copy(0) → dispatch(0) [GPU 1 running]
+        //   generate_batch(1): wait(1) → copy(1) → dispatch(1) [GPU 0 running]
         //
-        // The in_use flag is set AFTER dispatch to allow GPU to start,
-        // then we do CPU copy, which doesn't conflict because:
-        // 1. GPU writes to THIS buffer are complete (we just waited)
-        // 2. GPU writes to NEXT dispatch go to the SAME buffer but won't
-        //    start until current dispatch is processed by the GPU queue
+        // This ensures data is fully copied before GPU starts writing new data.
+        // GPU idle time is minimal because wait() → copy() is fast (~1ms).
         
         // SUCCESS: Increment indices for next call (commit point)
         self.gpu_buf_idx.fetch_add(1, Ordering::SeqCst);
         self.output_buf_idx.fetch_add(1, Ordering::SeqCst);
         
-        // Dispatch next GPU batch IMMEDIATELY after wait
-        // This starts GPU work while we do CPU copy below
-        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
-        if let Err(e) = self.inner.dispatch_glv(gpu_idx, next_offset) {
-            eprintln!("⚠️ GPU dispatch warning (will retry): {}", e);
-        }
-        
-        // Now do CPU copy - GPU is already working on next batch
-        // Mark buffer as in-use during copy (prevents early buffer reuse)
+        // STEP 1: Mark buffer as in-use during copy
         bs.in_use.store(true, std::sync::atomic::Ordering::Release);
         
-        // Get GPU output pointer (Unified Memory - zero-copy)
+        // STEP 2: Copy GPU data FIRST (before dispatch)
+        // Get GPU output pointer (Unified Memory - zero-copy address)
         let gpu_ptr = bs.output_buffer.contents() as *const u8;
         
         // SAFETY: We hold the write_lock, so no concurrent writes.
@@ -235,13 +226,18 @@ impl KeyGenerator for GpuGeneratorAdapter {
         let buffer = unsafe { &mut *self.batch_buffers[out_idx].get() };
         
         // Copy GPU data to our output buffer
-        // This happens WHILE GPU is processing the next batch we just dispatched
         unsafe {
             std::ptr::copy_nonoverlapping(gpu_ptr, buffer.as_mut_ptr(), self.buffer_size);
         }
         
-        // Copy complete - buffer can be reused
+        // STEP 3: Copy complete - release buffer
         bs.in_use.store(false, std::sync::atomic::Ordering::Release);
+        
+        // STEP 4: NOW dispatch next GPU batch (buffer is safe to overwrite)
+        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
+        if let Err(e) = self.inner.dispatch_glv(gpu_idx, next_offset) {
+            eprintln!("⚠️ GPU dispatch warning (will retry): {}", e);
+        }
         
         // Update stats
         self.inner.add_generated(self.batch_size() as u64);
