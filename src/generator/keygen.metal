@@ -938,7 +938,11 @@ kernel void generate_btc_keys(
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
-        batch_valid[b] = !IsZero(cur_Z);
+        // CRITICAL FIX: Check BOTH conditions for validity:
+        // 1. EC point is not at infinity (Z != 0)
+        // 2. Private key is not zero (priv != 0)
+        // If base_priv + offset = n (curve order), reduction gives 0 = invalid key
+        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv);
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
@@ -1084,7 +1088,11 @@ kernel void generate_btc_keys_glv(
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
-        batch_valid[b] = !IsZero(cur_Z);
+        // CRITICAL FIX: Check BOTH conditions for validity:
+        // 1. EC point is not at infinity (Z != 0)
+        // 2. Private key is not zero (priv != 0)
+        // If base_priv + offset = n (curve order), reduction gives 0 = invalid key
+        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv);
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
@@ -1276,7 +1284,11 @@ kernel void generate_btc_keys_glv3(
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
-        batch_valid[b] = !IsZero(cur_Z);
+        // CRITICAL FIX: Check BOTH conditions for validity:
+        // 1. EC point is not at infinity (Z != 0)
+        // 2. Private key is not zero (priv != 0)
+        // If base_priv + offset = n (curve order), reduction gives 0 = invalid key
+        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv);
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
