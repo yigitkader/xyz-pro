@@ -215,26 +215,129 @@ impl CpuKeyGenerator {
     
     /// Add 64-bit offset to 256-bit base private key
     /// 
-    /// Matches GPU's scalar_add_u64 behavior exactly
+    /// CRITICAL: Matches GPU's scalar_add_u64 behavior EXACTLY
+    /// 
+    /// GPU uses 64-bit word arithmetic (not byte-by-byte):
+    /// - load_be() converts big-endian bytes to ulong4 (4×64-bit words)
+    /// - s.x = bytes 24-31 (LSW - Least Significant Word)
+    /// - s.y = bytes 16-23
+    /// - s.z = bytes 8-15
+    /// - s.w = bytes 0-7 (MSW - Most Significant Word)
+    /// - scalar_add_u64 adds offset to s.x, then propagates carry through s.y, s.z, s.w
+    /// 
+    /// This function simulates the exact same 64-bit word arithmetic to ensure
+    /// CPU and GPU produce identical results, even for very large offsets (>2^32).
     fn add_offset_to_base(&self, offset: u64) -> Option<[u8; 32]> {
-        let mut result = self.base_privkey;
+        // Convert big-endian bytes to 64-bit words (matching GPU's load_be)
+        // GPU layout: w=MSW (bytes 0-7), z (bytes 8-15), y (bytes 16-23), x=LSW (bytes 24-31)
+        let mut words = [
+            u64::from_be_bytes([
+                self.base_privkey[0], self.base_privkey[1], self.base_privkey[2], self.base_privkey[3],
+                self.base_privkey[4], self.base_privkey[5], self.base_privkey[6], self.base_privkey[7],
+            ]), // w (MSW)
+            u64::from_be_bytes([
+                self.base_privkey[8], self.base_privkey[9], self.base_privkey[10], self.base_privkey[11],
+                self.base_privkey[12], self.base_privkey[13], self.base_privkey[14], self.base_privkey[15],
+            ]), // z
+            u64::from_be_bytes([
+                self.base_privkey[16], self.base_privkey[17], self.base_privkey[18], self.base_privkey[19],
+                self.base_privkey[20], self.base_privkey[21], self.base_privkey[22], self.base_privkey[23],
+            ]), // y
+            u64::from_be_bytes([
+                self.base_privkey[24], self.base_privkey[25], self.base_privkey[26], self.base_privkey[27],
+                self.base_privkey[28], self.base_privkey[29], self.base_privkey[30], self.base_privkey[31],
+            ]), // x (LSW)
+        ];
         
-        // Add offset to the low 64 bits (bytes 24-31, big-endian)
-        let mut carry = offset;
-        for i in (0..32).rev() {
-            if carry == 0 {
+        // GPU's scalar_add_u64 logic: add offset to x (LSW), propagate carry
+        let old_x = words[3];
+        words[3] += offset;
+        let mut overflow = false;
+        
+        // Carry propagation (matching GPU exactly)
+        if words[3] < old_x {
+            let old_y = words[2];
+            words[2] += 1;
+            if words[2] < old_y {
+                let old_z = words[1];
+                words[1] += 1;
+                if words[1] < old_z {
+                    let old_w = words[0];
+                    words[0] += 1;
+                    if words[0] < old_w {
+                        overflow = true; // Overflow beyond 256 bits
+                    }
+                }
+            }
+        }
+        
+        // GPU's mod n reduction: subtract n if result >= n or overflow occurred
+        // SECP256K1_N = curve order n (256-bit)
+        // GPU layout (after load_be): w=MSW, z, y, x=LSW
+        // Big-endian bytes: [0-7]=w, [8-15]=z, [16-23]=y, [24-31]=x
+        const SECP256K1_N: [u64; 4] = [
+            0xFFFFFFFFFFFFFFFF, // w (MSW, bytes 0-7)
+            0xFFFFFFFFFFFFFFFE, // z (bytes 8-15)
+            0xBAAEDCE6AF48A03B, // y (bytes 16-23)
+            0xBFD25E8CD0364141, // x (LSW, bytes 24-31)
+        ];
+        
+        // Iterative reduction (matching GPU's loop, max 4 iterations)
+        for _iter in 0..4 {
+            // Check if reduction needed: overflow OR words >= SECP256K1_N
+            let needs_reduction = overflow ||
+                words[0] > SECP256K1_N[0] ||
+                (words[0] == SECP256K1_N[0] && words[1] > SECP256K1_N[1]) ||
+                (words[0] == SECP256K1_N[0] && words[1] == SECP256K1_N[1] && words[2] > SECP256K1_N[2]) ||
+                (words[0] == SECP256K1_N[0] && words[1] == SECP256K1_N[1] && words[2] == SECP256K1_N[2] && words[3] >= SECP256K1_N[3]);
+            
+            if !needs_reduction {
                 break;
             }
-            let sum = result[i] as u64 + (carry & 0xFF);
-            result[i] = sum as u8;
-            carry = (carry >> 8) + (sum >> 8);
+            
+            // Subtract n with borrow chain (matching GPU exactly)
+            // GPU order: x (LSW), y, z, w (MSW) - same as our words[3], words[2], words[1], words[0]
+            let mut borrow = 0u64;
+            let mut new_words = [0u64; 4];
+            
+            // x = s.x - SECP256K1_N.x; bw = (s.x < SECP256K1_N.x) ? 1 : 0;
+            new_words[3] = words[3].wrapping_sub(SECP256K1_N[3]);
+            borrow = if words[3] < SECP256K1_N[3] { 1 } else { 0 };
+            
+            // y = s.y - SECP256K1_N.y - bw; bw = (s.y < SECP256K1_N.y + bw) ? 1 : 0;
+            let y_sub = SECP256K1_N[2].wrapping_add(borrow);
+            new_words[2] = words[2].wrapping_sub(y_sub);
+            borrow = if words[2] < y_sub { 1 } else { 0 };
+            
+            // z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z + bw) ? 1 : 0;
+            let z_sub = SECP256K1_N[1].wrapping_add(borrow);
+            new_words[1] = words[1].wrapping_sub(z_sub);
+            borrow = if words[1] < z_sub { 1 } else { 0 };
+            
+            // w = s.w - SECP256K1_N.w - bw;
+            new_words[0] = words[0].wrapping_sub(SECP256K1_N[0]).wrapping_sub(borrow);
+            
+            words = new_words;
+            
+            // Clear overflow when result < n (matching GPU logic)
+            // GPU checks: s.w < N.w || (s.w == N.w && s.z < N.z) || ...
+            if overflow {
+                let s_lt_n = words[0] < SECP256K1_N[0] ||
+                    (words[0] == SECP256K1_N[0] && words[1] < SECP256K1_N[1]) ||
+                    (words[0] == SECP256K1_N[0] && words[1] == SECP256K1_N[1] && words[2] < SECP256K1_N[2]) ||
+                    (words[0] == SECP256K1_N[0] && words[1] == SECP256K1_N[1] && words[2] == SECP256K1_N[2] && words[3] < SECP256K1_N[3]);
+                if s_lt_n {
+                    overflow = false; // s < n guarantees s < 2^256, overflow resolved
+                }
+            }
         }
         
-        // Check if we overflowed or exceeded curve order
-        // (extremely unlikely for reasonable offsets)
-        if carry != 0 {
-            return None;
-        }
+        // Convert back to big-endian bytes (matching GPU's store_be)
+        let mut result = [0u8; 32];
+        result[0..8].copy_from_slice(&words[0].to_be_bytes());  // w (MSW)
+        result[8..16].copy_from_slice(&words[1].to_be_bytes()); // z
+        result[16..24].copy_from_slice(&words[2].to_be_bytes()); // y
+        result[24..32].copy_from_slice(&words[3].to_be_bytes()); // x (LSW)
         
         Some(result)
     }
