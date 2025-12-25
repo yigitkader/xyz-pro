@@ -1219,6 +1219,12 @@ kernel void generate_btc_keys_glv(
     ulong4 cur_Z = {1,0,0,0};
     ulong4 cur_ZZ = {1,0,0,0};
     
+    // =========================================================================
+    // wNAF POINT LOOKUP (7 windows = 28 bits of offset coverage)
+    // =========================================================================
+    // CRITICAL FIX: Must match generate_btc_keys and generate_btc_keys_glv3!
+    // All kernels must use 7 windows to support ULTRA tier offsets (2^23+).
+    // =========================================================================
     if (thread_offset > 0) {
         #define WINDOW_ADD(window) { \
             uint digit = (thread_offset >> (4 * window)) & 0xF; \
@@ -1235,6 +1241,8 @@ kernel void generate_btc_keys_glv(
         WINDOW_ADD(2)
         WINDOW_ADD(3)
         WINDOW_ADD(4)
+        WINDOW_ADD(5)  // NEW: Covers bits 20-23
+        WINDOW_ADD(6)  // NEW: Covers bits 24-27
         #undef WINDOW_ADD
     }
     

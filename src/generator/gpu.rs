@@ -840,6 +840,54 @@ impl GpuKeyGenerator {
         self.total_generated.fetch_add(count, Ordering::Relaxed);
     }
     
+    /// Drain all pending GPU buffers without dispatching new work
+    /// 
+    /// CRITICAL for graceful shutdown: When stopping (Ctrl+C or range complete),
+    /// there are `pipeline_depth` batches already computed in GPU buffers.
+    /// This method retrieves those results without starting new GPU work.
+    /// 
+    /// Returns: Vec of (buffer_index, raw_data_slice) for each drained buffer
+    /// 
+    /// # Usage
+    /// Call this after stopping the main loop to ensure no computed keys are lost.
+    /// The target key might be in one of these final batches!
+    pub fn drain_pending_buffers(&self) -> Vec<(usize, Result<(), String>)> {
+        let depth = self.tier.pipeline_depth;
+        let mut results = Vec::with_capacity(depth);
+        
+        for i in 0..depth {
+            let buf_idx = i % depth;
+            let wait_result = self.wait_for_completion(buf_idx);
+            
+            // Mark buffer as processed (release for potential reuse, though we're stopping)
+            let bs = &self.buffer_sets[buf_idx];
+            bs.in_use.store(false, Ordering::Release);
+            
+            results.push((buf_idx, wait_result));
+        }
+        
+        results
+    }
+    
+    /// Drain a single buffer and return raw output data
+    /// 
+    /// This is the low-level drain operation used by GpuGeneratorAdapter.
+    /// It waits for GPU completion on the specified buffer and returns
+    /// a pointer to the output data WITHOUT dispatching new work.
+    /// 
+    /// # Safety
+    /// The returned pointer is valid until the next dispatch to this buffer.
+    /// Caller must copy data before any new dispatch.
+    pub fn drain_buffer_raw(&self, buf_idx: usize) -> Result<*const u8, String> {
+        let bs = &self.buffer_sets[buf_idx % self.tier.pipeline_depth];
+        
+        // Wait for GPU to finish this buffer
+        self.wait_for_completion(buf_idx)?;
+        
+        // Return pointer to output data (unified memory - no copy needed)
+        Ok(bs.output_buffer.contents() as *const u8)
+    }
+    
     // ========================================================================
     
     /// Pre-compute base public key from private key (CPU side)

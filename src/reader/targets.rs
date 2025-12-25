@@ -270,6 +270,38 @@ impl TargetSet {
         // Drop file handle before rename (important on Windows)
         drop(file);
         
+        // =========================================================================
+        // RACE CONDITION PREVENTION: Verify source hasn't changed during write
+        // =========================================================================
+        // Scenario without this check:
+        //   Process A: reads source v1, starts writing cache
+        //   Process B: modifies source to v2
+        //   Process C: reads source v2, starts writing cache
+        //   Process A: renames cache (contains v1 data)
+        //   Process C: renames cache (overwrites with v2 data) - OK
+        //   BUT: If order is reversed, stale cache remains!
+        //
+        // With this check: We verify source is still the same before committing.
+        // =========================================================================
+        let current_meta = fs::metadata(source_path)
+            .map_err(|e| format!("Failed to verify source: {}", e))?;
+        
+        if current_meta.len() != source_meta.len() {
+            // Source file changed during cache write - abort to prevent stale cache
+            let _ = fs::remove_file(&temp_path);
+            return Err("Source file changed during cache write - aborting".to_string());
+        }
+        
+        // Also check mtime if available
+        if let Ok(current_mtime) = current_meta.modified() {
+            if let Ok(original_mtime) = source_meta.modified() {
+                if current_mtime != original_mtime {
+                    let _ = fs::remove_file(&temp_path);
+                    return Err("Source file modified during cache write - aborting".to_string());
+                }
+            }
+        }
+        
         // Platform-specific atomic rename
         let rename_result = atomic_rename_file(&temp_path, cache_path);
         
