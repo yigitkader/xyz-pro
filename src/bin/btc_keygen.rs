@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use clap::{Parser, Subcommand};
 
 // Generator module
 use xyz_pro::generator::{BatchProcessor, GeneratorConfig, GlvMode, GpuKeyGenerator, GpuGeneratorAdapter, OutputFormat};
@@ -24,143 +23,31 @@ use xyz_pro::reader::ParallelMatcher;
 // Bridge module - clean interface between generator and reader
 use xyz_pro::bridge::{IntegratedPipeline, PipelineConfig, CombinedOutput};
 
-// CLI module
-use xyz_pro::cli::{CliOutputFormat, CliGlvMode, parse_u64, format_number};
-
-#[derive(Parser, Debug)]
-#[command(name = "btc_keygen", about = "BTC Private Key Scanner & Generator", long_about = None)]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Commands>,
-    
-    // Common arguments (used in both modes)
-    /// Number of threads (default: auto-detect)
-    #[arg(short = 't', long = "threads")]
-    threads: Option<usize>,
-    
-    /// Output directory (generator mode) or matches file (scan mode)
-    #[arg(short = 'o', long = "output")]
-    output: Option<String>,
-    
-    /// Output format: json, binary, compact, raw, both
-    #[arg(short = 'f', long = "format", value_enum)]
-    format: Option<CliOutputFormat>,
-    
-    /// Batch size for parallel processing
-    #[arg(short = 'b', long = "batch")]
-    batch: Option<usize>,
-    
-    /// Keys per file
-    #[arg(short = 'k', long = "keys-per-file")]
-    keys_per_file: Option<u64>,
-    
-    /// GLV mode: off, 2x, 3x
-    #[arg(short = 'G', long = "glv", value_enum)]
-    glv: Option<CliGlvMode>,
-    
-    /// Starting private key offset (hex: 0x... or decimal)
-    #[arg(long = "start-offset")]
-    start_offset: Option<String>,
-    
-    /// End offset for range limiting (hex: 0x... or decimal)
-    #[arg(long = "end")]
-    end: Option<String>,
-    
-    /// Random seed (CPU mode only)
-    #[arg(short = 's', long = "seed")]
-    seed: Option<u64>,
-    
-    /// Use GPU acceleration (Metal)
-    #[arg(short = 'g', long = "gpu")]
-    gpu: bool,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Generator mode: Generate keys and write to disk
-    Generate {
-        /// Stop after generating N keys
-        #[arg(short = 'n', long = "target")]
-        target: Option<u64>,
-    },
-    /// Scan mode: Generate & Match via Bridge (DEFAULT)
-    Scan {
-        /// Path to targets.json file
-        #[arg(short = 'T', long = "targets", default_value = "targets.json")]
-        targets: String,
-        /// Start key (hex: 0x... or decimal)
-        #[arg(long = "start")]
-        start: Option<String>,
-    },
-}
-
 fn main() {
-    let args = Args::parse();
+    let args: Vec<String> = std::env::args().collect();
     
-    // Determine mode
-    match args.command {
-        Some(Commands::Generate { target }) => {
-            run_generator_mode(&args, target);
-        }
-        Some(Commands::Scan { targets, start }) => {
-            run_scan_mode(&args, targets, start);
-        }
-        None => {
-            // DEFAULT: Scan mode
-            run_scan_mode(&args, "targets.json".to_string(), None);
-        }
+    // Check for help
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
     }
+    
+    // Check for generator-only mode (writes to disk)
+    if args.iter().any(|a| a == "--generate" || a == "--gen") {
+        run_generator_mode(&args);
+        return;
+    }
+    
+    // DEFAULT: Integrated Pipeline (Scan Mode)
+    // Bridge connects Generator + Reader
+    // Zero disk I/O until match found
+    run_scan_mode(&args);
 }
 
-fn run_generator_mode(args: &Args, target: Option<u64>) {
-    let mut config = GeneratorConfig::default();
-    
-    // Apply arguments to config
-    if let Some(threads) = args.threads {
-        config.threads = threads;
-    }
-    if let Some(ref output) = args.output {
-        config.output_dir = output.clone();
-    }
-    if let Some(ref format) = args.format {
-        config.output_format = (*format).into();
-    }
-    if let Some(batch) = args.batch {
-        config.batch_size = batch;
-    }
-    if let Some(keys_per_file) = args.keys_per_file {
-        config.keys_per_file = keys_per_file;
-    }
-    if let Some(ref glv) = args.glv {
-        config.glv_mode = (*glv).into();
-    }
-    if let Some(ref start_offset_str) = args.start_offset {
-        match parse_u64(start_offset_str) {
-            Ok(n) if n > 0 => config.start_offset = n,
-            Ok(_) => {
-                eprintln!("❌ --start-offset must be greater than 0");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("❌ Invalid start-offset: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-    if let Some(ref end_str) = args.end {
-        match parse_u64(end_str) {
-            Ok(n) => config.end_offset = Some(n),
-            Err(e) => {
-                eprintln!("❌ Invalid end offset: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-    
-    if let Err(e) = config.validate() {
-        eprintln!("❌ Invalid configuration: {}", e);
-        std::process::exit(1);
-    }
+fn run_generator_mode(args: &[String]) {
+    let config = parse_args(args);
+    let target = parse_target(args);
+    let use_gpu = parse_gpu_flag(args);
     
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║           🔑 BTC Key Generator (Disk Mode)                 ║");
@@ -169,10 +56,10 @@ fn run_generator_mode(args: &Args, target: Option<u64>) {
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
     
-    if args.gpu {
+    if use_gpu {
         run_gpu_mode(config, target);
     } else {
-        run_cpu_mode(config, target, args.seed);
+        run_cpu_mode(config, target, args);
     }
 }
 
@@ -183,47 +70,29 @@ fn run_generator_mode(args: &Args, target: Option<u64>) {
 /// - Matcher: Checks against targets (HashSet O(1))
 /// - Output: Handles matches (file + console)
 /// - Pipeline: Orchestrates everything
-fn run_scan_mode(args: &Args, targets_path: String, start: Option<String>) {
-    let mut config = GeneratorConfig::default();
+fn run_scan_mode(args: &[String]) {
+    // Parse ALL arguments using centralized parser
+    // This ensures --batch, --threads, --format etc. are not ignored
+    let mut config = parse_args(args);
     
-    // Apply common arguments
-    if let Some(threads) = args.threads {
-        config.threads = threads;
-    }
-    if let Some(batch) = args.batch {
-        config.batch_size = batch;
-    }
-    if let Some(ref glv) = args.glv {
-        config.glv_mode = (*glv).into();
-    }
-    
-    // Scan-mode specific: start offset
-    if let Some(ref start_str) = start {
-        match parse_u64(start_str) {
-            Ok(n) if n > 0 => config.start_offset = n,
-            Ok(_) => {
-                eprintln!("❌ --start must be greater than 0");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("❌ Invalid start offset: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-    if let Some(ref end_str) = args.end {
-        match parse_u64(end_str) {
-            Ok(n) => config.end_offset = Some(n),
-            Err(e) => {
-                eprintln!("❌ Invalid end offset: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
+    // Scan-mode specific arguments:
+    // --targets / -T : Path to targets JSON file (note: -T uppercase, -t is for --threads)
+    // --output / -o  : Path to matches output file (overrides config.output_dir in scan mode)
+    let targets_path = parse_string_arg(args, "--targets").unwrap_or_else(|| "targets.json".to_string());
     
     // In scan mode, --output is the matches file, NOT output directory
-    let output_file = args.output.as_deref().unwrap_or("matches.txt");
-    config.output_dir = String::new(); // Not used in scan mode
+    // If user specified --output, use it; otherwise default to "matches.txt"
+    let output_file = parse_string_arg(args, "--output").unwrap_or_else(|| "matches.txt".to_string());
+    // Clear output_dir since it's not used in scan mode (prevents confusion)
+    config.output_dir = String::new();
+    
+    // Scan-mode specific overrides from command line
+    if let Some(start) = parse_u64_arg(args, "--start") {
+        config.start_offset = start;
+    }
+    if let Some(end) = parse_u64_arg(args, "--end") {
+        config.end_offset = Some(end);
+    }
     
     // Scan mode always uses Raw format (no disk I/O until match)
     config.output_format = OutputFormat::Raw;
@@ -318,6 +187,55 @@ fn run_scan_mode(args: &Args, targets_path: String, start: Option<String>) {
     }
 }
 
+/// Parse string argument with support for short flags
+/// Maps common short flags to their long equivalents:
+/// - `-o` → `--output`
+/// - `-t` → `--targets` (in scan mode)
+fn parse_string_arg(args: &[String], name: &str) -> Option<String> {
+    // Define short flag mappings
+    // NOTE: -t is reserved for --threads, so --targets uses -T (uppercase)
+    let short_flag = match name {
+        "--output" => Some("-o"),
+        "--targets" => Some("-T"),  // Uppercase T to avoid conflict with -t (threads)
+        "--input" => Some("-i"),
+        "--format" => Some("-f"),
+        _ => None,
+    };
+    
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == name || short_flag.map(|s| args[i] == s).unwrap_or(false) {
+            return Some(args[i + 1].clone());
+        }
+    }
+    None
+}
+
+/// Parse u64 argument with explicit error handling
+/// Returns None if flag not found, exits with error if value is invalid
+fn parse_u64_arg(args: &[String], name: &str) -> Option<u64> {
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == name {
+            let val = &args[i + 1];
+            
+            // Support hex (0x...) and decimal
+            let result = if val.starts_with("0x") || val.starts_with("0X") {
+                u64::from_str_radix(&val[2..], 16)
+            } else {
+                val.parse()
+            };
+            
+            match result {
+                Ok(n) => return Some(n),
+                Err(e) => {
+                    eprintln!("❌ Invalid value for {}: '{}' - {}", name, val, e);
+                    eprintln!("   Expected: decimal (123456) or hex (0x1E240)");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    None
+}
 
 fn run_gpu_mode(config: GeneratorConfig, target: Option<u64>) {
     println!("🎮 GPU Mode (Metal Accelerated)");
@@ -346,10 +264,11 @@ fn run_gpu_mode(config: GeneratorConfig, target: Option<u64>) {
     }
 }
 
-fn run_cpu_mode(config: GeneratorConfig, target: Option<u64>, seed: Option<u64>) {
+fn run_cpu_mode(config: GeneratorConfig, target: Option<u64>, args: &[String]) {
     println!("💻 CPU Mode (Parallel Processing)");
     println!();
     
+    let seed = parse_seed(args);
     // config is moved into BatchProcessor - no clone needed
     let processor = if let Some(s) = seed {
         println!("🌱 Using seed: {}", s);
@@ -391,5 +310,229 @@ fn print_stats(stats: xyz_pro::generator::GeneratorStats) {
     println!("╚════════════════════════════════════════════════════════════╝");
 }
 
+fn parse_args(args: &[String]) -> GeneratorConfig {
+    let mut config = GeneratorConfig::default();
+    
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" | "-o" => {
+                if i + 1 < args.len() {
+                    config.output_dir = args[i + 1].clone();
+                    i += 1;
+                } else {
+                    eprintln!("❌ --output requires a directory path");
+                    std::process::exit(1);
+                }
+            }
+            "--format" | "-f" => {
+                if i + 1 < args.len() {
+                    let format_str = args[i + 1].to_lowercase();
+                    config.output_format = match format_str.as_str() {
+                        "binary" | "bin" => OutputFormat::Binary,
+                        "both" => OutputFormat::Both,
+                        "compact" | "cbin" => OutputFormat::Compact,
+                        "raw" => OutputFormat::Raw,
+                        "json" => OutputFormat::Json,
+                        _ => {
+                            eprintln!("❌ Invalid format '{}'. Valid options: json, binary, compact, raw, both", format_str);
+                            std::process::exit(1);
+                        }
+                    };
+                    i += 1;
+                } else {
+                    eprintln!("❌ --format requires a value (json, binary, compact, raw, both)");
+                    std::process::exit(1);
+                }
+            }
+            "--batch" | "-b" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<usize>() {
+                        Ok(n) if n > 0 => config.batch_size = n,
+                        Ok(_) => {
+                            eprintln!("❌ --batch must be greater than 0");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid batch size '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 1;
+                } else {
+                    eprintln!("❌ --batch requires a number");
+                    std::process::exit(1);
+                }
+            }
+            "--keys-per-file" | "-k" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) if n > 0 => config.keys_per_file = n,
+                        Ok(_) => {
+                            eprintln!("❌ --keys-per-file must be greater than 0");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid keys-per-file value '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 1;
+                } else {
+                    eprintln!("❌ --keys-per-file requires a number");
+                    std::process::exit(1);
+                }
+            }
+            "--threads" | "-t" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<usize>() {
+                        Ok(n) => config.threads = n,
+                        Err(e) => {
+                            eprintln!("❌ Invalid thread count '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 1;
+                } else {
+                    eprintln!("❌ --threads requires a number");
+                    std::process::exit(1);
+                }
+            }
+            "--glv" | "-G" => {
+                if i + 1 < args.len() {
+                    let mode_str = args[i + 1].to_lowercase();
+                    config.glv_mode = match mode_str.as_str() {
+                        "off" | "0" | "disabled" => GlvMode::Disabled,
+                        "2x" | "2" | "glv" => GlvMode::Glv2x,
+                        "3x" | "3" | "glv3" => GlvMode::Glv3x,
+                        _ => {
+                            eprintln!("❌ Invalid GLV mode '{}'. Valid: off, 2x (default), 3x", mode_str);
+                            std::process::exit(1);
+                        }
+                    };
+                    i += 1;
+                } else {
+                    eprintln!("❌ --glv requires a mode (off, 2x, 3x)");
+                    std::process::exit(1);
+                }
+            }
+            "--start-offset" => {
+                if i + 1 < args.len() {
+                    let val = &args[i + 1];
+                    let result = if val.starts_with("0x") || val.starts_with("0X") {
+                        u64::from_str_radix(&val[2..], 16)
+                    } else {
+                        val.parse()
+                    };
+                    match result {
+                        Ok(n) if n > 0 => config.start_offset = n,
+                        Ok(_) => {
+                            eprintln!("❌ --start-offset must be greater than 0 (0 is invalid private key)");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid start-offset '{}': {}", val, e);
+                            eprintln!("   Expected: decimal (123456) or hex (0x1E240)");
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 1;
+                } else {
+                    eprintln!("❌ --start-offset requires a number");
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    config
+}
 
+fn parse_target(args: &[String]) -> Option<u64> {
+    // Use saturating_sub to prevent panic when args is empty or has 1 element
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--target" || args[i] == "-n" {
+            return args[i + 1].parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_seed(args: &[String]) -> Option<u64> {
+    // Use saturating_sub to prevent panic when args is empty or has 1 element
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--seed" || args[i] == "-s" {
+            return args[i + 1].parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_gpu_flag(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--gpu" || a == "-g")
+}
+
+fn print_help() {
+    println!("BTC Private Key Scanner & Generator");
+    println!();
+    println!("USAGE:");
+    println!("    btc_keygen [OPTIONS]");
+    println!();
+    println!("MODES:");
+    println!("    Scanner mode (DEFAULT):   Generate & Match via Bridge, zero I/O until hit");
+    println!("    Generator mode (--gen):   Generate keys and write to disk");
+    println!();
+    println!("SCANNER OPTIONS (DEFAULT MODE):");
+    println!("    --targets FILE           Path to targets.json (default: targets.json)");
+    println!("    --start N                Start key (hex: 0x... or decimal, default: 1)");
+    println!("    --output FILE            Output file for matches (default: matches.txt)");
+    println!();
+    println!("GENERATOR OPTIONS (--gen or --generate):");
+    println!("    --gen, --generate        Switch to generator mode (disk I/O)");
+    println!("    -g, --gpu                Use GPU acceleration (Metal)");
+    println!("    -o, --output DIR         Output directory (default: ./output)");
+    println!("    -f, --format FORMAT      Output format: json, binary, compact, raw, both");
+    println!("    -b, --batch SIZE         Batch size (default: 100000)");
+    println!("    -k, --keys-per-file N    Keys per file (default: 1000000000)");
+    println!("    -n, --target N           Stop after N keys");
+    println!("    --start-offset N         Starting private key offset");
+    println!();
+    println!("GLV ENDOMORPHISM:");
+    println!("    -G, --glv MODE           GLV mode: off, 2x, 3x (default)");
+    println!("                             2x: 2 keys per EC op");
+    println!("                             3x: 3 keys per EC op (default, max throughput)");
+    println!();
+    println!("OTHER:");
+    println!("    -t, --threads N          Number of threads (default: auto)");
+    println!("    -s, --seed N             Random seed (CPU only)");
+    println!("    -h, --help               Print this help");
+    println!();
+    println!("EXAMPLES:");
+    println!("    # Scanner mode (default) - NASA-grade Bridge architecture");
+    println!("    btc_keygen --targets targets.json --start 0x1");
+    println!();
+    println!("    # Generator mode - writes to disk");
+    println!("    btc_keygen --gen --gpu --format raw --target 100000000");
+}
+
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && (chars.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(*c);
+    }
+    
+    result
+}
 

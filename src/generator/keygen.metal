@@ -165,14 +165,10 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
     }
     
     // FAIL-SAFE: Iterative reduction to guarantee result is in [0, n-1]
-    // Even if sum exceeds 2*n or 2^256, this loop will correctly reduce it.
-    // CRITICAL FIX: The loop continues until overflow is completely cleared AND s < n.
-    // Overflow flag is only cleared when s < n (which guarantees s < 2^256 since n < 2^256).
-    // In practice: 1 iteration usually suffices, 2 for edge cases, 3+ for large overflows.
-    #pragma unroll 4
-    for (int iter = 0; iter < 4; iter++) {
-        // Check if reduction is needed: overflow OR s >= n
-        // CRITICAL: Keep overflow flag set until s < n is guaranteed
+    // Even if sum exceeds 2*n, this loop will correctly reduce it.
+    // In practice: 1 iteration usually suffices, 2 for edge cases, 3 for safety.
+    #pragma unroll 3
+    for (int iter = 0; iter < 3; iter++) {
         bool needs_reduction = overflow ||
             s.w > SECP256K1_N.w || 
             (s.w == SECP256K1_N.w && s.z > SECP256K1_N.z) ||
@@ -180,7 +176,7 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
             (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x >= SECP256K1_N.x);
         
         if (!needs_reduction) {
-            break; // Already in valid range [0, n-1] and no overflow
+            break; // Already in valid range [0, n-1]
         }
         
         // Subtract n with borrow chain
@@ -191,20 +187,7 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
         r.z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z + bw) ? 1 : 0;
         r.w = s.w - SECP256K1_N.w - bw;
         s = r;
-        
-        // CRITICAL FIX: Only clear overflow when s < n is guaranteed
-        // Since n < 2^256, if s < n then s < 2^256, so overflow is resolved
-        if (overflow) {
-            // Check if s < n after this subtraction
-            bool s_lt_n = s.w < SECP256K1_N.w || 
-                (s.w == SECP256K1_N.w && s.z < SECP256K1_N.z) ||
-                (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y < SECP256K1_N.y) ||
-                (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x < SECP256K1_N.x);
-            if (s_lt_n) {
-                overflow = false; // s < n guarantees s < 2^256, overflow resolved
-            }
-            // If s >= n, overflow remains true and loop continues
-        }
+        overflow = false; // Clear overflow flag after first reduction
     }
 }
 
@@ -906,17 +889,11 @@ kernel void generate_btc_keys(
     uint kpt = *keys_per_thread;
     uint thread_offset = gid * kpt;
     
-    // RANGE LIMIT: Control key generation bounds
-    // - 0 = range exceeded, skip ALL keys (saturating_sub resulted in 0)
-    // - UINT64_MAX = unlimited (no end_offset configured)
-    // - Other values = max keys to generate from base_offset
+    // RANGE LIMIT: Skip entire thread if beyond remaining keys
+    // 0 = unlimited (no range limit)
     ulong keys_remaining = *keys_remaining_ptr;
-    if (keys_remaining == 0) {
-        return; // Range exceeded - base_offset >= end_offset
-    }
-    bool is_unlimited = (keys_remaining == 0xFFFFFFFFFFFFFFFFULL);
-    if (!is_unlimited && thread_offset >= keys_remaining) {
-        return; // Thread out of range
+    if (keys_remaining > 0 && thread_offset >= keys_remaining) {
+        return; // Thread completely out of range
     }
     
     // Load base private key and pubkey
@@ -974,9 +951,8 @@ kernel void generate_btc_keys(
         // VALIDITY CHECK (3 conditions):
         // 1. EC point is not at infinity (Z != 0)
         // 2. Private key is not zero (priv != 0)  
-        // 3. RANGE LIMIT: Key offset within remaining range
-        // Note: is_unlimited already checked at thread level, keys_remaining==0 causes early return
-        bool in_range = is_unlimited || ((thread_offset + b) < keys_remaining);
+        // 3. RANGE LIMIT: Key offset within remaining range (if set)
+        bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
         batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
@@ -1072,14 +1048,9 @@ kernel void generate_btc_keys_glv(
     uint kpt = *keys_per_thread;
     uint thread_offset = gid * kpt;
     
-    // RANGE LIMIT: Control key generation bounds
-    // 0 = range exceeded, UINT64_MAX = unlimited
+    // RANGE LIMIT: Skip entire thread if beyond remaining keys
     ulong keys_remaining = *keys_remaining_ptr;
-    if (keys_remaining == 0) {
-        return; // Range exceeded
-    }
-    bool is_unlimited = (keys_remaining == 0xFFFFFFFFFFFFFFFFULL);
-    if (!is_unlimited && thread_offset >= keys_remaining) {
+    if (keys_remaining > 0 && thread_offset >= keys_remaining) {
         return;
     }
     
@@ -1138,9 +1109,8 @@ kernel void generate_btc_keys_glv(
         // VALIDITY CHECK (3 conditions):
         // 1. EC point is not at infinity (Z != 0)
         // 2. Private key is not zero (priv != 0)  
-        // 3. RANGE LIMIT: Key offset within remaining range
-        // Note: is_unlimited already checked at thread level, keys_remaining==0 causes early return
-        bool in_range = is_unlimited || ((thread_offset + b) < keys_remaining);
+        // 3. RANGE LIMIT: Key offset within remaining range (if set)
+        bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
         batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
@@ -1282,14 +1252,9 @@ kernel void generate_btc_keys_glv3(
     uint kpt = *keys_per_thread;
     uint thread_offset = gid * kpt;
     
-    // RANGE LIMIT: Control key generation bounds
-    // 0 = range exceeded, UINT64_MAX = unlimited
+    // RANGE LIMIT: Skip entire thread if beyond remaining keys
     ulong keys_remaining = *keys_remaining_ptr;
-    if (keys_remaining == 0) {
-        return; // Range exceeded
-    }
-    bool is_unlimited = (keys_remaining == 0xFFFFFFFFFFFFFFFFULL);
-    if (!is_unlimited && thread_offset >= keys_remaining) {
+    if (keys_remaining > 0 && thread_offset >= keys_remaining) {
         return;
     }
     
@@ -1348,9 +1313,8 @@ kernel void generate_btc_keys_glv3(
         // VALIDITY CHECK (3 conditions):
         // 1. EC point is not at infinity (Z != 0)
         // 2. Private key is not zero (priv != 0)  
-        // 3. RANGE LIMIT: Key offset within remaining range
-        // Note: is_unlimited already checked at thread level, keys_remaining==0 causes early return
-        bool in_range = is_unlimited || ((thread_offset + b) < keys_remaining);
+        // 3. RANGE LIMIT: Key offset within remaining range (if set)
+        bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
         batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,

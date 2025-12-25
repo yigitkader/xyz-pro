@@ -947,17 +947,12 @@ impl GpuKeyGenerator {
             std::ptr::copy_nonoverlapping(pubkey_y.as_ptr(), y_ptr, 32);
             
             // RANGE LIMIT: Calculate keys_remaining for this dispatch
-            // - 0 = range exceeded (base_offset >= end_offset), shader skips all
-            // - u64::MAX = unlimited (no end_offset configured)
-            // - other = keys remaining from base_offset to end_offset
+            // 0 = unlimited, >0 = max keys to generate
             let keys_remaining: u64 = if let Some(end) = self.config.end_offset {
-                if base_offset >= end {
-                    0 // Range exceeded - shader will skip all keys
-                } else {
-                    end - base_offset
-                }
+                // Keys remaining from base_offset to end_offset
+                end.saturating_sub(base_offset)
             } else {
-                u64::MAX // Unlimited
+                0 // No limit
             };
             let remaining_ptr = bs.keys_remaining_buf.contents() as *mut u64;
             *remaining_ptr = keys_remaining;
@@ -1056,15 +1051,10 @@ impl GpuKeyGenerator {
             std::ptr::copy_nonoverlapping(pubkey_y.as_ptr(), y_ptr, 32);
             
             // RANGE LIMIT: Calculate keys_remaining for this dispatch
-            // 0 = range exceeded, u64::MAX = unlimited
             let keys_remaining: u64 = if let Some(end) = self.config.end_offset {
-                if base_offset >= end {
-                    0 // Range exceeded
-                } else {
-                    end - base_offset
-                }
+                end.saturating_sub(base_offset)
             } else {
-                u64::MAX // Unlimited
+                0
             };
             let remaining_ptr = bs.keys_remaining_buf.contents() as *mut u64;
             *remaining_ptr = keys_remaining;
@@ -1174,18 +1164,6 @@ impl GpuKeyGenerator {
                 // This allows is_fatal_error() to detect the error type reliably
                 return Err(gpu_error.to_string());
             }
-            
-            // CRITICAL FIX: Set in_use flag atomically AFTER GPU completion
-            // This prevents race condition where dispatch thread could re-acquire
-            // the buffer before CPU starts reading. The flag is set here, immediately
-            // after wait_until_completed() succeeds, ensuring GPU has finished writing
-            // and buffer is now owned by CPU until in_use is cleared.
-            bs.in_use.store(true, Ordering::Release);
-        } else {
-            // No command buffer means no GPU work was dispatched
-            // Still set in_use to prevent dispatch thread from using this buffer
-            // until caller explicitly clears it
-            bs.in_use.store(true, Ordering::Release);
         }
         
         Ok(())
@@ -1230,9 +1208,9 @@ impl GpuKeyGenerator {
             return self.buffer_pool.wrap(self.buffer_pool.acquire());
         }
         
-        // RACE CONDITION PREVENTION: Buffer is already marked as in-use by wait_for_completion
-        // No need to set in_use again - wait_for_completion already did it atomically
-        // after GPU completion, preventing race condition with dispatch thread
+        // RACE CONDITION PREVENTION: Mark buffer as in-use before reading
+        // This prevents GPU from dispatching to this buffer while we're reading
+        bs.in_use.store(true, Ordering::Release);
         
         // GLV CRITICAL FIX: Read ALL keys including GLV variants
         // GPU produces: base_keys * glv_multiplier total keys
@@ -1517,18 +1495,10 @@ impl GpuKeyGenerator {
                 return Err(format!("GPU batch processing failed: {}", e));
             }
             
-            // LATENCY HIDING: Precompute next pubkey IMMEDIATELY after wait
-            // This overlaps EC point computation with memory copy below.
-            // On Apple Silicon, this runs on CPU while GPU prepares next batch.
-            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            let next_privkey = Self::offset_to_privkey(next_offset);
-            self.precompute_pubkey(&next_privkey);  // CPU work - overlaps with read
-            
             let bs = &self.buffer_sets[process_idx];
             
-            // 2. READ: Buffer is already marked as in-use by wait_for_completion
-            // No need to set in_use again - wait_for_completion already did it atomically
-            // after GPU completion, preventing race condition with dispatch thread
+            // 2. READ: Mark buffer as in-use while CPU reads
+            bs.in_use.store(true, Ordering::Release);
             
             // Direct copy from GPU buffer (zero-copy on unified memory)
             let output_ptr = bs.output_buffer.contents() as *const u8;
@@ -1539,15 +1509,21 @@ impl GpuKeyGenerator {
             // Accumulate raw data
             raw_buffer.extend_from_slice(output_slice);
             
-            // Mark buffer as available (CPU read complete)
-            bs.in_use.store(false, Ordering::Release);
-            
-            // GLV produces keys_per_dispatch keys
+            // GLV produces 2x keys per dispatch
             pending_keys += keys_per_dispatch;
             self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
             
-            // 3. DISPATCH: Buffer free, dispatch new work (pubkey already computed!)
+            // 3. DISPATCH: Now buffer is free, dispatch new work to SAME buffer
             // This maintains pipeline depth while avoiding race condition
+            // Note: Offset increments by base keys (not 2x) because GLV uses λ*k space
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            
+            // Mark buffer as available BEFORE dispatch (CPU read complete)
+            bs.in_use.store(false, Ordering::Release);
+            
+            // Dispatch to the SAME buffer we just read from (configured GLV mode)
             self.dispatch_with_mode(process_idx, next_offset)?;
             
             current_buf += 1;
@@ -1684,19 +1660,13 @@ impl GpuKeyGenerator {
                 return Err(format!("GPU batch processing failed: {}", e));
             }
             
-            // LATENCY HIDING: Precompute next pubkey IMMEDIATELY after wait
-            // This overlaps EC point computation with parallel scan below.
-            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
-            let next_privkey = Self::offset_to_privkey(next_offset);
-            self.precompute_pubkey(&next_privkey);  // CPU work - overlaps with scan
-            
             let bs = &self.buffer_sets[process_idx];
             
-            // 2. PROCESS: Buffer is already marked as in-use by wait_for_completion
-            // No need to set in_use again - wait_for_completion already did it atomically
-            // after GPU completion, preventing race condition with dispatch thread
+            // 2. PROCESS: Mark buffer as in-use while CPU processes
+            bs.in_use.store(true, Ordering::Release);
             
             // ZERO-COPY: Direct access to GPU buffer via Unified Memory
+            // GLV outputs 2x keys per dispatch
             let output_ptr = bs.output_buffer.contents() as *const u8;
             let output_slice = unsafe {
                 std::slice::from_raw_parts(output_ptr, output_size)
@@ -1758,13 +1728,18 @@ impl GpuKeyGenerator {
                 }
             }
             
-            // GLV: keys_per_dispatch keys per batch
+            // GLV: 2 keys per EC operation
             self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
             
-            // Mark buffer as available (CPU processing complete)
+            // 3. DISPATCH: Now buffer is free, dispatch new work to SAME buffer
+            let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
+            let next_privkey = Self::offset_to_privkey(next_offset);
+            self.precompute_pubkey(&next_privkey);
+            
+            // Mark buffer as available BEFORE dispatch (CPU processing complete)
             bs.in_use.store(false, Ordering::Release);
             
-            // 3. DISPATCH: Buffer free, dispatch new work (pubkey already computed!)
+            // Dispatch to the SAME buffer we just processed (configured GLV mode)
             self.dispatch_with_mode(process_idx, next_offset)?;
             
             current_buf += 1;

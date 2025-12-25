@@ -11,5 +11,4 @@
 pub mod generator;
 pub mod reader;
 pub mod bridge;
-pub mod cli;
 

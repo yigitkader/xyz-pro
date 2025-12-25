@@ -44,9 +44,6 @@ fxhash = "0.2"
 lazy_static = "1.4"
 once_cell = "1.19"  # Modern lazy initialization (for lock-free pipeline stats)
 
-# CLI
-clap = { version = "4.5", features = ["derive"] }
-
 # XOR Filter - O(1) probabilistic lookup, 10x less memory than HashSet
 xorf = { version = "0.8", optional = true }
 

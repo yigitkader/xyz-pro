@@ -14,56 +14,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use clap::{Parser, ValueEnum};
 
 use xyz_pro::reader::{TargetSet, RawFileScanner, save_matches, ReaderConfig};
-use xyz_pro::cli::{CommonArgs, format_number};
-
-#[derive(Parser, Debug)]
-#[command(name = "btc_reader", about = "BTC Address Reader & Matcher", long_about = None)]
-struct Args {
-    /// Path to targets.json file
-    #[arg(short = 'T', long = "targets", default_value = "targets.json")]
-    targets: String,
-    
-    /// Directory with .raw files
-    #[arg(short = 'i', long = "input", default_value = "./output")]
-    input: String,
-    
-    /// Output file for matches
-    #[arg(short = 'o', long = "output", default_value = "matches.json")]
-    output: String,
-    
-    /// Watch mode: continuously scan for new files
-    #[arg(short = 'w', long = "watch")]
-    watch: bool,
-    
-    /// Watch interval in seconds
-    #[arg(short = 's', long = "interval", default_value_t = 5)]
-    interval: u64,
-    
-    /// Number of threads (default: auto-detect)
-    #[arg(short = 't', long = "threads")]
-    threads: Option<usize>,
-    
-    /// Print help information
-    #[arg(short = 'h', long = "help")]
-    help: bool,
-}
 
 fn main() {
-    let args = Args::parse();
-    
-    let mut config = ReaderConfig::default();
-    config.targets_path = args.targets;
-    config.input_dir = args.input;
-    config.output_path = args.output;
-    if let Some(threads) = args.threads {
-        config.threads = threads;
-    }
-    
-    let watch_mode = args.watch;
-    let interval = args.interval;
+    let args: Vec<String> = std::env::args().collect();
+    let config = parse_args(&args);
+    let watch_mode = args.iter().any(|a| a == "--watch" || a == "-w");
+    let interval = parse_interval(&args);
     
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║           🔍 BTC Address Reader v1.0                       ║");
@@ -171,6 +129,135 @@ fn print_results(result: &xyz_pro::reader::ScanResult, output_path: &str) {
     }
 }
 
+fn parse_args(args: &[String]) -> ReaderConfig {
+    let mut config = ReaderConfig::default();
+    
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--targets" | "-t" => {
+                if i + 1 < args.len() {
+                    config.targets_path = args[i + 1].clone();
+                    i += 1;
+                } else {
+                    eprintln!("❌ --targets requires a file path");
+                    std::process::exit(1);
+                }
+            }
+            "--input" | "-i" => {
+                if i + 1 < args.len() {
+                    config.input_dir = args[i + 1].clone();
+                    i += 1;
+                } else {
+                    eprintln!("❌ --input requires a directory path");
+                    std::process::exit(1);
+                }
+            }
+            "--output" | "-o" => {
+                if i + 1 < args.len() {
+                    config.output_path = args[i + 1].clone();
+                    i += 1;
+                } else {
+                    eprintln!("❌ --output requires a file path");
+                    std::process::exit(1);
+                }
+            }
+            "--threads" | "-n" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<usize>() {
+                        Ok(n) if n > 0 => config.threads = n,
+                        Ok(_) => {
+                            eprintln!("❌ --threads must be greater than 0");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Invalid thread count '{}': {}", args[i + 1], e);
+                            std::process::exit(1);
+                        }
+                    }
+                    i += 1;
+                } else {
+                    eprintln!("❌ --threads requires a number");
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    config
+}
 
+/// Parse interval argument with explicit error handling
+fn parse_interval(args: &[String]) -> u64 {
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--interval" || args[i] == "-s" {
+            let val = &args[i + 1];
+            match val.parse::<u64>() {
+                Ok(n) if n > 0 => return n,
+                Ok(_) => {
+                    eprintln!("❌ Invalid interval: must be > 0");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("❌ Invalid interval value '{}': {}", val, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    5 // Default 5 seconds
+}
 
+fn print_help() {
+    println!("BTC Address Reader & Matcher");
+    println!();
+    println!("USAGE:");
+    println!("    btc_reader [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -t, --targets FILE     Path to targets.json (default: targets.json)");
+    println!("    -i, --input DIR        Directory with .raw files (default: ./output)");
+    println!("    -o, --output FILE      Output file for matches (default: matches.json)");
+    println!("    -w, --watch            Watch mode: continuously scan for new files");
+    println!("    -s, --interval SECS    Watch interval in seconds (default: 5)");
+    println!("    -n, --threads N        Number of threads (default: auto)");
+    println!("    -h, --help             Print this help message");
+    println!();
+    println!("EXAMPLES:");
+    println!("    btc_reader --targets targets.json --input ./keys");
+    println!("    btc_reader --watch --input ./keys --interval 10");
+    println!();
+    println!("FILE FORMAT:");
+    println!("    Reads .raw files generated by btc_keygen --format raw");
+    println!("    Header: [magic:4][version:1][reserved:3][count:8] = 16 bytes");
+    println!("    Entry:  [privkey:32][pubkey_hash:20][p2sh_hash:20] = 72 bytes");
+    println!();
+    println!("ADDRESS MATCHING:");
+    println!("    pubkey_hash = hash160(compressed_pubkey)");
+    println!("      → P2PKH  (1...)   : base58check(0x00 + pubkey_hash)");
+    println!("      → P2WPKH (bc1q...): bech32(version=0, pubkey_hash)");
+    println!("    p2sh_hash = hash160(0x0014 + pubkey_hash)");
+    println!("      → P2SH   (3...)   : base58check(0x05 + p2sh_hash)");
+}
+
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && (chars.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(*c);
+    }
+    
+    result
+}
 

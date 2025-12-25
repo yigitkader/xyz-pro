@@ -377,23 +377,7 @@ impl AsyncRawWriter {
     /// 
     /// This prevents unbounded memory growth from queued writes
     /// while maintaining maximum throughput when I/O can keep up.
-    /// 
-    /// # Parameters
-    /// - `data`: Raw key data (72 bytes per key: privkey:32 + hash160:20 + p2sh_hash:20)
-    /// - `key_count`: Number of keys in data (MUST match actual count for header correctness)
-    /// 
-    /// # Header Writing
-    /// The writer thread will write a v1 header (16 bytes) before the data:
-    /// - magic: "BTCR" (4 bytes)
-    /// - version: 1 (1 byte)
-    /// - reserved: 0 (3 bytes)
-    /// - count: key_count as u64 little-endian (8 bytes)
-    /// 
-    /// This header is REQUIRED for btc_reader compatibility. Without it, scanner.rs
-    /// will reject files with "Invalid magic bytes" error.
     pub fn write_async(&self, data: Vec<u8>, key_count: usize) -> Result<(), String> {
-        // CRITICAL: key_count must match the actual number of keys in data
-        // This count is written to the file header and used by btc_reader for validation
         self.sender.send(WriterMessage::WriteRaw(data, key_count))
             .map_err(|e| format!("Failed to send to writer: {}", e))
     }
@@ -440,13 +424,6 @@ impl AsyncRawWriter {
     }
     
     /// Writer thread - processes writes in background
-    /// 
-    /// CRITICAL: Each file MUST include the v1 header (16 bytes) written by
-    /// write_raw_mmap(). This header is required for btc_reader compatibility.
-    /// Without it, scanner.rs will reject files with "Invalid magic bytes" error.
-    /// 
-    /// The key_count parameter is used to write the count field in the header,
-    /// which must match the actual number of keys in the data section.
     fn writer_thread(output_dir: String, receiver: Receiver<WriterMessage>) -> u64 {
         let mut file_counter = 0u64;
         
@@ -457,8 +434,6 @@ impl AsyncRawWriter {
                     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
                     let filename = format!("{}/keys_{}_{:06}.raw", output_dir, timestamp, file_counter);
                     
-                    // CRITICAL: write_raw_mmap() writes the v1 header (16 bytes) before data
-                    // This ensures btc_reader can properly parse the file
                     if let Err(e) = Self::write_raw_mmap(&filename, &data, key_count) {
                         eprintln!("❌ Write error: {}", e);
                     }
@@ -471,22 +446,6 @@ impl AsyncRawWriter {
     }
     
     /// Memory-mapped write with versioned header
-    /// 
-    /// CRITICAL: This function MUST write the v1 header (16 bytes) to ensure
-    /// compatibility with btc_reader. Without the header, scanner.rs will
-    /// reject files with "Invalid magic bytes" error.
-    /// 
-    /// Header format (v1):
-    /// - magic:    4 bytes ("BTCR")
-    /// - version:  1 byte  (FORMAT_VERSION = 1)
-    /// - reserved: 3 bytes (must be 0)
-    /// - count:    8 bytes (little-endian u64, number of keys)
-    /// 
-    /// Total header: 16 bytes
-    /// 
-    /// The count field is written at file creation time and must match the
-    /// actual number of keys in the data section. This allows btc_reader to
-    /// validate file integrity and determine the exact number of entries.
     fn write_raw_mmap(filename: &str, data: &[u8], key_count: usize) -> std::io::Result<()> {
         let total_size = HEADER_SIZE + data.len();
         
@@ -501,17 +460,14 @@ impl AsyncRawWriter {
         
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
         
-        // CRITICAL: Write v1 header - REQUIRED for btc_reader compatibility
-        // Without this header, scanner.rs will reject the file with "Invalid magic bytes"
-        mmap[0..4].copy_from_slice(b"BTCR");              // magic (4 bytes)
-        mmap[4] = FORMAT_VERSION;                         // version (1 byte)
-        mmap[5..8].copy_from_slice(&[0u8; 3]);           // reserved (3 bytes, must be 0)
-        mmap[8..16].copy_from_slice(&(key_count as u64).to_le_bytes()); // count (8 bytes, little-endian)
-        
-        // Write data section after header
+        // Versioned header (16 bytes)
+        mmap[0..4].copy_from_slice(b"BTCR");              // magic
+        mmap[4] = FORMAT_VERSION;                         // version
+        mmap[5..8].copy_from_slice(&[0u8; 3]);           // reserved
+        mmap[8..16].copy_from_slice(&(key_count as u64).to_le_bytes()); // count
         mmap[HEADER_SIZE..].copy_from_slice(data);
         
-        // Sync write for durability - ensures header and data are written atomically
+        // Sync write for durability
         mmap.flush()?;
         
         Ok(())
