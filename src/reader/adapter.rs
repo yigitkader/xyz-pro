@@ -61,26 +61,21 @@ impl Matcher for TargetMatcher {
         let mut matches = Vec::new();
         
         // P2PKH and P2WPKH use the same hash160 (pubkey_hash)
-        // Check if this hash exists in our target set
-        let hash_match = self.targets.contains_hash160(pubkey_hash);
-        
-        if hash_match {
-            // The hash matches - but we need to report the correct address type(s)
-            // that were actually loaded from targets.json
-            // If a P2PKH address was in targets, it would have been decoded to hash160
-            // If a P2WPKH address was in targets, it would have been decoded to hash160
-            // Both decode to the SAME hash for the same public key
-            
-            // Only report the types that actually exist in targets
-            if self.targets.stats.p2pkh > 0 {
+        // FIXED: Now uses precise type tracking per hash, not global stats!
+        // 
+        // OLD BUG: If targets had [1AddressA (P2PKH), bc1qAddressB (P2WPKH)],
+        //          and we found 1AddressA's key, we'd report BOTH P2PKH and P2WPKH
+        //          because both types existed in global stats.
+        // 
+        // NEW: Each hash160 tracks which address type(s) it came from.
+        //      A match for 1AddressA only reports P2PKH.
+        if let Some(types) = self.targets.get_hash160_types(pubkey_hash) {
+            if types.has_p2pkh() {
                 matches.push(MatchType::P2PKH);
             }
-            if self.targets.stats.p2wpkh > 0 {
+            if types.has_p2wpkh() {
                 matches.push(MatchType::P2WPKH);
             }
-            // Note: We removed the fallback to P2PKH because:
-            // If hash_match is true but no P2PKH/P2WPKH targets exist,
-            // the match is spurious (shouldn't happen with correct loading)
         }
         
         // Check P2SH separately (different hash: RIPEMD160(SHA256(witness_script)))

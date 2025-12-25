@@ -34,7 +34,9 @@ use xorf::{Filter, Xor8};
 type FxHashSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 /// Cache file format version (increment when format changes)
-const CACHE_VERSION: u32 = 1;
+/// v1: Initial format
+/// v2: Added hash160_types, p2wsh_list, checksum
+const CACHE_VERSION: u32 = 2;
 
 /// Statistics about loaded targets
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -55,13 +57,37 @@ struct CacheMetadata {
     source_mtime: u64,
 }
 
-/// Cached target data
+/// Address type flags for precise match reporting
+/// A single hash160 can belong to multiple address types (same key, different formats)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AddressTypeFlags(pub u8);
+
+impl AddressTypeFlags {
+    pub const NONE: u8 = 0;
+    pub const P2PKH: u8 = 0x01;   // 1... addresses
+    pub const P2WPKH: u8 = 0x02;  // bc1q... (20 byte) addresses
+    
+    #[inline]
+    pub fn has_p2pkh(&self) -> bool { self.0 & Self::P2PKH != 0 }
+    #[inline]
+    pub fn has_p2wpkh(&self) -> bool { self.0 & Self::P2WPKH != 0 }
+    #[inline]
+    pub fn add_p2pkh(&mut self) { self.0 |= Self::P2PKH; }
+    #[inline]
+    pub fn add_p2wpkh(&mut self) { self.0 |= Self::P2WPKH; }
+}
+
+/// Cached target data (v2 - includes type flags and P2WSH)
 #[derive(Serialize, Deserialize)]
 struct CachedTargets {
     metadata: CacheMetadata,
     hash160_list: Vec<[u8; 20]>,
+    hash160_types: Vec<u8>,  // AddressTypeFlags for each hash160
     p2sh_list: Vec<[u8; 20]>,
+    p2wsh_list: Vec<[u8; 32]>,  // 32-byte SHA256 witness program
     stats: TargetStats,
+    #[serde(default)]
+    checksum: u64,  // XOR checksum of all hashes for integrity
 }
 
 /// Fast target lookup using FxHashSet (~3x faster than default)
@@ -71,14 +97,25 @@ struct CachedTargets {
 /// - No string storage (saves ~2GB for 50M addresses)
 /// - Pre-allocated HashSets
 /// - XOR filters for fast negative lookups
+/// - **Precise type tracking**: Each hash160 knows which address type(s) it came from
+/// - **P2WSH support**: 32-byte witness program hashes are now tracked
 pub struct TargetSet {
     /// Hash160 lookups for P2PKH/P2WPKH (decoded from address)
     /// Uses FxHash for faster lookup on fixed-size keys
     /// Memory: 50M × 20 bytes = 1GB + HashSet overhead (~50%) = 1.5GB
     hash160_set: FxHashSet<[u8; 20]>,
-    /// P2SH script hashes
+    
+    /// Type flags for each hash160 - tracks which address types this hash came from
+    /// This allows precise match reporting (P2PKH vs P2WPKH vs both)
+    hash160_types: std::collections::HashMap<[u8; 20], AddressTypeFlags, BuildHasherDefault<FxHasher>>,
+    
+    /// P2SH script hashes (20 bytes - RIPEMD160 of SHA256)
     /// Uses FxHash for faster lookup on fixed-size keys
     p2sh_set: FxHashSet<[u8; 20]>,
+    
+    /// P2WSH witness program hashes (32 bytes - SHA256)
+    /// bc1q... addresses with length > 44 characters
+    p2wsh_set: FxHashSet<[u8; 32]>,
     
     /// XOR Filter for hash160 - ultra-fast negative lookup
     /// False positive rate ~0.4%, but HashSet confirms positives
@@ -152,9 +189,26 @@ impl TargetSet {
             return None;
         }
         
+        // Verify checksum for data integrity
+        let computed_checksum = compute_checksum(&cached.hash160_list, &cached.p2sh_list, &cached.p2wsh_list);
+        if cached.checksum != 0 && cached.checksum != computed_checksum {
+            println!("⚠️ Cache checksum mismatch, rebuilding...");
+            return None;
+        }
+        
         // Cache is valid - rebuild FxHashSets from lists
         let hash160_set: FxHashSet<[u8; 20]> = cached.hash160_list.iter().copied().collect();
         let p2sh_set: FxHashSet<[u8; 20]> = cached.p2sh_list.iter().copied().collect();
+        let p2wsh_set: FxHashSet<[u8; 32]> = cached.p2wsh_list.iter().copied().collect();
+        
+        // Rebuild hash160_types map from cached data
+        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+        let mut hash160_types: FxHashMap<[u8; 20], AddressTypeFlags> = FxHashMap::default();
+        hash160_types.reserve(cached.hash160_list.len());
+        
+        for (hash, type_flag) in cached.hash160_list.iter().zip(cached.hash160_types.iter()) {
+            hash160_types.insert(*hash, AddressTypeFlags(*type_flag));
+        }
         
         // Build XOR filters if feature enabled
         #[cfg(feature = "xor-filter")]
@@ -205,7 +259,9 @@ impl TargetSet {
         
         Some(Self {
             hash160_set,
+            hash160_types,
             p2sh_set,
+            p2wsh_set,
             #[cfg(feature = "xor-filter")]
             hash160_xor,
             #[cfg(feature = "xor-filter")]
@@ -233,15 +289,29 @@ impl TargetSet {
             .map_err(|e| format!("Time error: {}", e))?
             .as_secs();
         
+        // Collect lists in consistent order for caching
+        let hash160_list: Vec<[u8; 20]> = self.hash160_set.iter().copied().collect();
+        let hash160_types: Vec<u8> = hash160_list.iter()
+            .map(|h| self.hash160_types.get(h).map(|t| t.0).unwrap_or(0))
+            .collect();
+        let p2sh_list: Vec<[u8; 20]> = self.p2sh_set.iter().copied().collect();
+        let p2wsh_list: Vec<[u8; 32]> = self.p2wsh_set.iter().copied().collect();
+        
+        // Compute checksum for integrity verification
+        let checksum = compute_checksum(&hash160_list, &p2sh_list, &p2wsh_list);
+        
         let cached = CachedTargets {
             metadata: CacheMetadata {
                 version: CACHE_VERSION,
                 source_size: source_meta.len(),
                 source_mtime,
             },
-            hash160_list: self.hash160_set.iter().copied().collect(),
-            p2sh_list: self.p2sh_set.iter().copied().collect(),
+            hash160_list,
+            hash160_types,
+            p2sh_list,
+            p2wsh_list,
             stats: self.stats.clone(),
+            checksum,
         };
         
         let encoded = bincode::serialize(&cached)
@@ -353,8 +423,17 @@ impl TargetSet {
         let mut hash160_set: FxHashSet<[u8; 20]> = FxHashSet::default();
         hash160_set.reserve(initial_capacity);
         
+        // Type tracking for each hash160 - allows precise match reporting
+        type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+        let mut hash160_types: FxHashMap<[u8; 20], AddressTypeFlags> = FxHashMap::default();
+        hash160_types.reserve(initial_capacity);
+        
         let mut p2sh_set: FxHashSet<[u8; 20]> = FxHashSet::default();
         p2sh_set.reserve(initial_capacity / 10); // P2SH typically fewer
+        
+        // NEW: P2WSH support - 32-byte witness program hashes
+        let mut p2wsh_set: FxHashSet<[u8; 32]> = FxHashSet::default();
+        p2wsh_set.reserve(initial_capacity / 100); // P2WSH typically rare
         
         let mut stats = TargetStats::default();
         let mut last_progress = Instant::now();
@@ -365,10 +444,13 @@ impl TargetSet {
             .map_err(|e| format!("JSON parse error: {}", e))?;
         
         // Recursively extract all string values that look like Bitcoin addresses
+        // NOW WITH: precise type tracking and P2WSH support
         fn extract_addresses_recursive(
             value: &Value,
             hash160_set: &mut FxHashSet<[u8; 20]>,
+            hash160_types: &mut FxHashMap<[u8; 20], AddressTypeFlags>,
             p2sh_set: &mut FxHashSet<[u8; 20]>,
+            p2wsh_set: &mut FxHashSet<[u8; 32]>,
             stats: &mut TargetStats,
             start: &Instant,
             estimated_count: usize,
@@ -381,9 +463,14 @@ impl TargetSet {
                     }
                     
                     // Classify and store - only count if decode succeeds
+                    // FIXED: Now tracks which address type each hash160 came from
                     if addr.starts_with('1') {
                         if let Some(hash) = decode_p2pkh(addr) {
                             hash160_set.insert(hash);
+                            // Track type: this hash came from a P2PKH address
+                            hash160_types.entry(hash)
+                                .or_insert(AddressTypeFlags::default())
+                                .add_p2pkh();
                             stats.p2pkh += 1;
                             stats.total += 1;
                         }
@@ -395,14 +482,24 @@ impl TargetSet {
                         }
                     } else if addr.starts_with("bc1q") {
                         if addr.len() <= 44 {
+                            // P2WPKH: 20-byte witness program
                             if let Some(hash) = decode_bech32(addr) {
                                 hash160_set.insert(hash);
+                                // Track type: this hash came from a P2WPKH address
+                                hash160_types.entry(hash)
+                                    .or_insert(AddressTypeFlags::default())
+                                    .add_p2wpkh();
                                 stats.p2wpkh += 1;
                                 stats.total += 1;
                             }
                         } else {
-                            stats.p2wsh += 1;
-                            stats.total += 1;
+                            // P2WSH: 32-byte witness program
+                            // FIXED: Now actually storing the hash instead of just counting!
+                            if let Some(hash) = decode_bech32_p2wsh(addr) {
+                                p2wsh_set.insert(hash);
+                                stats.p2wsh += 1;
+                                stats.total += 1;
+                            }
                         }
                     }
                     
@@ -423,7 +520,7 @@ impl TargetSet {
                 Value::Array(arr) => {
                     for item in arr {
                         extract_addresses_recursive(
-                            item, hash160_set, p2sh_set, stats, 
+                            item, hash160_set, hash160_types, p2sh_set, p2wsh_set, stats, 
                             start, estimated_count, last_progress
                         );
                     }
@@ -431,7 +528,7 @@ impl TargetSet {
                 Value::Object(obj) => {
                     for (_, v) in obj {
                         extract_addresses_recursive(
-                            v, hash160_set, p2sh_set, stats,
+                            v, hash160_set, hash160_types, p2sh_set, p2wsh_set, stats,
                             start, estimated_count, last_progress
                         );
                     }
@@ -442,13 +539,27 @@ impl TargetSet {
         
         // Extract all addresses from the parsed JSON
         extract_addresses_recursive(
-            &json, &mut hash160_set, &mut p2sh_set, &mut stats,
+            &json, &mut hash160_set, &mut hash160_types, &mut p2sh_set, &mut p2wsh_set, &mut stats,
             &start, estimated_count, &mut last_progress
         );
         
+        // Print P2SH scope warning if P2SH addresses are present
+        if stats.p2sh > 0 {
+            println!("   ⚠️  P2SH NOTE: Only P2SH-P2WPKH (nested SegWit) scripts are scannable.");
+            println!("      Multi-sig or custom P2SH scripts will NOT be matched.");
+        }
+        
+        // Print P2WSH warning if present (requires additional GPU work not yet implemented)
+        if stats.p2wsh > 0 {
+            println!("   ⚠️  P2WSH NOTE: P2WSH scanning requires witness script generation.");
+            println!("      Currently only single-key scripts (P2WPKH wrapped) are supported.");
+        }
+        
         // Shrink to fit after loading (release unused capacity)
         hash160_set.shrink_to_fit();
+        hash160_types.shrink_to_fit();
         p2sh_set.shrink_to_fit();
+        p2wsh_set.shrink_to_fit();
         
         // Build XOR filters if feature enabled
         #[cfg(feature = "xor-filter")]
@@ -500,15 +611,18 @@ impl TargetSet {
         
         // Memory usage estimate
         let hash160_mem = hash160_set.len() * 20 * 3 / 2; // ~1.5x for HashSet overhead
+        let hash160_types_mem = hash160_types.len() * (20 + 1) * 3 / 2; // key + flag
         let p2sh_mem = p2sh_set.len() * 20 * 3 / 2;
-        let total_mem_mb = (hash160_mem + p2sh_mem) as f64 / (1024.0 * 1024.0);
+        let p2wsh_mem = p2wsh_set.len() * 32 * 3 / 2;
+        let total_mem_mb = (hash160_mem + hash160_types_mem + p2sh_mem + p2wsh_mem) as f64 / (1024.0 * 1024.0);
         
         println!("✅ Parsed {} targets in {:.1}s", format_count(stats.total), stats.load_time_ms as f64 / 1000.0);
         println!("   P2PKH: {}, P2SH: {}, P2WPKH: {}, P2WSH: {}", 
                  format_count(stats.p2pkh), format_count(stats.p2sh), 
                  format_count(stats.p2wpkh), format_count(stats.p2wsh));
-        println!("   Hash160 set: {} entries", format_count(hash160_set.len()));
+        println!("   Hash160 set: {} entries (with type tracking)", format_count(hash160_set.len()));
         println!("   P2SH set: {} entries", format_count(p2sh_set.len()));
+        println!("   P2WSH set: {} entries", format_count(p2wsh_set.len()));
         println!("   Estimated memory: {:.1} MB", total_mem_mb);
         
         #[cfg(feature = "xor-filter")]
@@ -520,7 +634,9 @@ impl TargetSet {
         
         Ok(Self {
             hash160_set,
+            hash160_types,
             p2sh_set,
+            p2wsh_set,
             #[cfg(feature = "xor-filter")]
             hash160_xor,
             #[cfg(feature = "xor-filter")]
@@ -585,8 +701,26 @@ impl TargetSet {
         }
     }
     
+    /// Check if P2WSH witness program hash exists (32 bytes)
+    #[inline]
+    pub fn contains_p2wsh(&self, hash: &[u8; 32]) -> bool {
+        self.p2wsh_set.contains(hash)
+    }
+    
+    /// Get the address types for a hash160 (P2PKH, P2WPKH, or both)
+    /// 
+    /// This allows precise match reporting - we know exactly which
+    /// address type(s) the hash came from in targets.json
+    #[inline]
+    pub fn get_hash160_types(&self, hash: &[u8; 20]) -> Option<AddressTypeFlags> {
+        self.hash160_types.get(hash).copied()
+    }
+    
     /// Check raw key data against all target types
     /// Returns (p2pkh_match, p2sh_match, p2wpkh_match)
+    /// 
+    /// FIXED: Now uses precise type tracking instead of global stats.
+    /// If a hash matches, we return only the types that hash was loaded from.
     /// 
     /// When xor-filter is enabled:
     /// 1. XOR filter provides ultra-fast negative lookup (rejects ~99.6% of non-matches)
@@ -600,7 +734,7 @@ impl TargetSet {
             let p2sh_key = hash160_to_u64(p2sh_hash);
             
             // Check hash160 (P2PKH/P2WPKH)
-            let maybe_p2pkh = self.hash160_xor
+            let maybe_hash160 = self.hash160_xor
                 .as_ref()
                 .map(|xor| xor.contains(&pubkey_key))
                 .unwrap_or(false);
@@ -612,22 +746,84 @@ impl TargetSet {
                 .unwrap_or(false);
             
             // If XOR filter says no, it's definitely no (no false negatives)
-            // If XOR filter says maybe, confirm with HashSet
-            let p2pkh = maybe_p2pkh && self.hash160_set.contains(pubkey_hash);
+            // If XOR filter says maybe, confirm with HashSet AND get precise types
+            let (p2pkh, p2wpkh) = if maybe_hash160 && self.hash160_set.contains(pubkey_hash) {
+                // FIXED: Use precise type tracking, not global stats
+                if let Some(types) = self.hash160_types.get(pubkey_hash) {
+                    (types.has_p2pkh(), types.has_p2wpkh())
+                } else {
+                    // Fallback (shouldn't happen if loading was correct)
+                    (true, true)
+                }
+            } else {
+                (false, false)
+            };
+            
             let p2sh = maybe_p2sh && self.p2sh_set.contains(p2sh_hash);
-            let p2wpkh = p2pkh; // Same hash for P2WPKH
             
             (p2pkh, p2sh, p2wpkh)
         }
         
         #[cfg(not(feature = "xor-filter"))]
         {
-            let p2pkh = self.hash160_set.contains(pubkey_hash);
+            let (p2pkh, p2wpkh) = if self.hash160_set.contains(pubkey_hash) {
+                // FIXED: Use precise type tracking, not global stats
+                if let Some(types) = self.hash160_types.get(pubkey_hash) {
+                    (types.has_p2pkh(), types.has_p2wpkh())
+                } else {
+                    (true, true)
+                }
+            } else {
+                (false, false)
+            };
             let p2sh = self.p2sh_set.contains(p2sh_hash);
-            let p2wpkh = p2pkh; // Same hash for P2WPKH
             (p2pkh, p2sh, p2wpkh)
         }
     }
+}
+
+/// Compute XOR checksum for data integrity verification
+/// 
+/// Combines all hash data into a single u64 checksum.
+/// If cache is corrupted or truncated, checksum will mismatch.
+fn compute_checksum(
+    hash160_list: &[[u8; 20]], 
+    p2sh_list: &[[u8; 20]], 
+    p2wsh_list: &[[u8; 32]]
+) -> u64 {
+    let mut checksum: u64 = 0xDEADBEEF_CAFEBABE; // Magic seed
+    
+    // XOR all hash160 values
+    for hash in hash160_list {
+        let p1 = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+        let p2 = u64::from_le_bytes(hash[8..16].try_into().unwrap());
+        let p3 = u32::from_le_bytes(hash[16..20].try_into().unwrap()) as u64;
+        checksum ^= p1.rotate_left(7) ^ p2.rotate_left(13) ^ p3.rotate_left(23);
+    }
+    
+    // XOR all P2SH values
+    for hash in p2sh_list {
+        let p1 = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+        let p2 = u64::from_le_bytes(hash[8..16].try_into().unwrap());
+        let p3 = u32::from_le_bytes(hash[16..20].try_into().unwrap()) as u64;
+        checksum ^= p1.rotate_left(11) ^ p2.rotate_left(17) ^ p3.rotate_left(29);
+    }
+    
+    // XOR all P2WSH values (32 bytes)
+    for hash in p2wsh_list {
+        let p1 = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+        let p2 = u64::from_le_bytes(hash[8..16].try_into().unwrap());
+        let p3 = u64::from_le_bytes(hash[16..24].try_into().unwrap());
+        let p4 = u64::from_le_bytes(hash[24..32].try_into().unwrap());
+        checksum ^= p1.rotate_left(3) ^ p2.rotate_left(19) ^ p3.rotate_left(31) ^ p4.rotate_left(37);
+    }
+    
+    // Mix in list lengths to detect truncation
+    checksum ^= (hash160_list.len() as u64).rotate_left(41);
+    checksum ^= (p2sh_list.len() as u64).rotate_left(43);
+    checksum ^= (p2wsh_list.len() as u64).rotate_left(47);
+    
+    checksum
 }
 
 /// Convert 20-byte hash160 to u64 key for XOR filter
@@ -740,7 +936,7 @@ fn decode_p2sh(addr: &str) -> Option<[u8; 20]> {
     Some(hash)
 }
 
-/// Decode bech32 address to hash
+/// Decode bech32 address to hash (P2WPKH - 20 bytes)
 /// 
 /// Bitcoin address encoding rules:
 /// - Witness version 0 (P2WPKH/P2WSH): MUST use Bech32 encoding
@@ -782,6 +978,42 @@ fn decode_bech32(addr: &str) -> Option<[u8; 20]> {
     // P2WPKH has 20-byte program, P2WSH has 32-byte
     if program.len() == 20 {
         let mut hash = [0u8; 20];
+        hash.copy_from_slice(&program);
+        Some(hash)
+    } else {
+        None
+    }
+}
+
+/// Decode bech32 address to hash (P2WSH - 32 bytes)
+/// 
+/// P2WSH uses a 32-byte SHA256 witness program hash.
+/// Only witness version 0 with Bech32 encoding is supported.
+fn decode_bech32_p2wsh(addr: &str) -> Option<[u8; 32]> {
+    use bech32::{FromBase32, Variant};
+    
+    let (hrp, data_5bit, variant) = bech32::decode(addr).ok()?;
+    
+    if hrp != "bc" {
+        return None;
+    }
+    
+    if data_5bit.is_empty() {
+        return None;
+    }
+    
+    let witness_version = data_5bit[0].to_u8();
+    
+    // Witness version 0 with Bech32 encoding
+    if witness_version != 0 || variant != Variant::Bech32 {
+        return None;
+    }
+    
+    let program = Vec::<u8>::from_base32(&data_5bit[1..]).ok()?;
+    
+    // P2WSH has 32-byte program
+    if program.len() == 32 {
+        let mut hash = [0u8; 32];
         hash.copy_from_slice(&program);
         Some(hash)
     } else {
