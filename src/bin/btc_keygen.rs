@@ -77,12 +77,16 @@ fn run_scan_mode(args: &[String]) {
     
     // Scan-mode specific arguments:
     // --targets / -T : Path to targets JSON file (note: -T uppercase, -t is for --threads)
-    // --output / -o  : Path to matches output file (overrides config.output_dir in scan mode)
+    // --output-file / -O : Path to matches output file (preferred, unambiguous)
+    // --output / -o : Legacy, also accepted for backward compatibility
     let targets_path = parse_string_arg(args, "--targets").unwrap_or_else(|| "targets.json".to_string());
     
-    // In scan mode, --output is the matches file, NOT output directory
-    // If user specified --output, use it; otherwise default to "matches.txt"
-    let output_file = parse_string_arg(args, "--output").unwrap_or_else(|| "matches.txt".to_string());
+    // SCAN MODE OUTPUT: Prefer --output-file, fallback to --output for compatibility
+    // This resolves the ambiguity where --output meant different things in different modes
+    let output_file = parse_string_arg(args, "--output-file")
+        .or_else(|| parse_string_arg(args, "--output"))
+        .unwrap_or_else(|| "matches.txt".to_string());
+    
     // Clear output_dir since it's not used in scan mode (prevents confusion)
     config.output_dir = String::new();
     
@@ -194,9 +198,23 @@ fn run_scan_mode(args: &[String]) {
 fn parse_string_arg(args: &[String], name: &str) -> Option<String> {
     // Define short flag mappings
     // NOTE: -t is reserved for --threads, so --targets uses -T (uppercase)
+    // 
+    // CRITICAL FIX: --output is AMBIGUOUS and should not be used!
+    // - Scan mode: expects a FILE path for matches output
+    // - Generator mode: expects a DIRECTORY path for key files
+    // 
+    // Use explicit flags instead:
+    // - --output-file (-O): File path for scan mode matches
+    // - --output-dir (-o): Directory path for generator mode
+    // 
+    // For backward compatibility, --output is still accepted but maps to:
+    // - --output-file in scan mode context
+    // - --output-dir in generator mode context
     let short_flag = match name {
-        "--output" => Some("-o"),
-        "--targets" => Some("-T"),  // Uppercase T to avoid conflict with -t (threads)
+        "--output-file" => Some("-O"),  // Uppercase O for file (scan mode)
+        "--output-dir" => Some("-o"),   // Lowercase o for directory (gen mode)
+        "--output" => Some("-o"),       // Legacy: maps based on context
+        "--targets" => Some("-T"),      // Uppercase T to avoid conflict with -t (threads)
         "--input" => Some("-i"),
         "--format" => Some("-f"),
         _ => None,
@@ -316,12 +334,14 @@ fn parse_args(args: &[String]) -> GeneratorConfig {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--output" | "-o" => {
+            // GENERATOR MODE: --output-dir (-o) for directory path
+            // --output also accepted for backward compatibility
+            "--output-dir" | "--output" | "-o" => {
                 if i + 1 < args.len() {
                     config.output_dir = args[i + 1].clone();
                     i += 1;
                 } else {
-                    eprintln!("❌ --output requires a directory path");
+                    eprintln!("❌ --output-dir requires a directory path");
                     std::process::exit(1);
                 }
             }
@@ -489,14 +509,16 @@ fn print_help() {
     println!("    Generator mode (--gen):   Generate keys and write to disk");
     println!();
     println!("SCANNER OPTIONS (DEFAULT MODE):");
-    println!("    --targets FILE           Path to targets.json (default: targets.json)");
+    println!("    -T, --targets FILE       Path to targets.json (default: targets.json)");
     println!("    --start N                Start key (hex: 0x... or decimal, default: 1)");
-    println!("    --output FILE            Output file for matches (default: matches.txt)");
+    println!("    -O, --output-file FILE   Output file for matches (default: matches.txt)");
+    println!("                             (--output also accepted for compatibility)");
     println!();
     println!("GENERATOR OPTIONS (--gen or --generate):");
     println!("    --gen, --generate        Switch to generator mode (disk I/O)");
     println!("    -g, --gpu                Use GPU acceleration (Metal)");
-    println!("    -o, --output DIR         Output directory (default: ./output)");
+    println!("    -o, --output-dir DIR     Output directory (default: ./output)");
+    println!("                             (--output also accepted for compatibility)");
     println!("    -f, --format FORMAT      Output format: json, binary, compact, raw, both");
     println!("    -b, --batch SIZE         Batch size (default: 100000)");
     println!("    -k, --keys-per-file N    Keys per file (default: 1000000000)");
@@ -518,7 +540,7 @@ fn print_help() {
     println!("    btc_keygen --targets targets.json --start 0x1");
     println!();
     println!("    # Generator mode - writes to disk");
-    println!("    btc_keygen --gen --gpu --format raw --target 100000000");
+    println!("    btc_keygen --gen --gpu --format raw --output-dir ./keys --target 100000000");
 }
 
 fn format_number(n: u64) -> String {

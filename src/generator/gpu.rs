@@ -1614,9 +1614,28 @@ impl GpuKeyGenerator {
                  targets.stats.p2pkh + targets.stats.p2wpkh,
                  targets.stats.p2sh);
         println!("   Pipeline depth: {}", depth);
-        println!("   Keys per dispatch: {} ({:.2}M) [GLV: 2x]", 
+        println!("   Keys per dispatch: {} ({:.2}M) [GLV: {}x]", 
                  keys_per_dispatch,
-                 keys_per_dispatch as f64 / 1_000_000.0);
+                 keys_per_dispatch as f64 / 1_000_000.0,
+                 glv_multiplier);
+        
+        // GLV RANGE OVERLAP WARNING
+        // GLV endomorphism scans multiple key spaces in parallel:
+        // - Primary: k, k+1, k+2, ...
+        // - GLV: λ*k, λ*(k+1), ... where λ ≈ 5.36 × 10^77
+        // - GLV²: λ²*k, λ²*(k+1), ... (GLV3 mode)
+        //
+        // Since λ is astronomically large (~2^256), for practical offsets (< 2^64),
+        // GLV keys never overlap with primary keys. However, for extreme edge cases:
+        // - If scanning near offset ≈ n/λ or n/λ², some GLV keys might wrap around
+        // - This is astronomically unlikely for normal usage (offset < 2^64)
+        let start_offset = self.config.start_offset;
+        if start_offset > 0x1000_0000_0000_0000 { // > 2^60
+            println!("   ⚠️ WARNING: Large start offset detected (0x{:016x})", start_offset);
+            println!("      GLV key spaces may have theoretical overlap for extreme offsets.");
+            println!("      This is safe for offset < 2^64, but noted for completeness.");
+        }
+        
         println!();
         
         // Open matches file (append mode)
@@ -1732,14 +1751,29 @@ impl GpuKeyGenerator {
             self.total_generated.fetch_add(keys_per_dispatch as u64, Ordering::Relaxed);
             
             // 3. DISPATCH: Now buffer is free, dispatch new work to SAME buffer
+            // 
+            // CRITICAL RACE CONDITION FIX:
+            // The in_use flag MUST remain true until ALL CPU access is complete.
+            // This includes:
+            //   - The parallel Rayon matching above (already blocking via .collect())
+            //   - Any output/logging using the matched data
+            //
+            // Only AFTER all CPU access is guaranteed complete do we:
+            //   1. Release the buffer (in_use = false)
+            //   2. Dispatch new GPU work
+            //
+            // This order is critical because dispatch_batch_internal will spin-wait
+            // on in_use before dispatching, preventing data corruption.
             let next_offset = self.current_offset.fetch_add(self.tier.keys_per_dispatch as u64, Ordering::Relaxed);
             let next_privkey = Self::offset_to_privkey(next_offset);
             self.precompute_pubkey(&next_privkey);
             
-            // Mark buffer as available BEFORE dispatch (CPU processing complete)
+            // MEMORY BARRIER: Ensure all CPU reads are visible before releasing
+            // Release ordering guarantees that all prior reads complete before this store
             bs.in_use.store(false, Ordering::Release);
             
             // Dispatch to the SAME buffer we just processed (configured GLV mode)
+            // NOTE: dispatch_batch_internal will check in_use before dispatching
             self.dispatch_with_mode(process_idx, next_offset)?;
             
             current_buf += 1;

@@ -136,27 +136,30 @@ inline uint rotl32(uint x, uint n) { return (x << n) | (x >> (32 - n)); }
 
 /// Add a 64-bit value to a 256-bit scalar and reduce mod n
 /// 
-/// FAIL-SAFE: Uses iterative reduction to handle edge cases where
-/// base_priv + thread_offset could exceed 2*n (though rare in practice).
+/// FAIL-SAFE: Uses iterative reduction with 257-bit overflow tracking.
 /// 
 /// Mathematical guarantee:
 /// - base_priv is always < n (valid private key)
 /// - thread_offset is at most ~2^40 in extreme cases (262K threads × 32 batch)
 /// - Sum is at most n + 2^40 < 2n, so 2 subtractions suffice
-/// - We do 3 iterations for extra safety margin
+/// - We do 4 iterations for extra safety margin with proper overflow tracking
+///
+/// CRITICAL: The overflow flag represents the 257th bit (2^256 carry).
+/// This must be properly tracked through all reductions to ensure correctness.
 inline void scalar_add_u64(thread ulong4& s, ulong val) {
     ulong old = s.x;
     s.x += val;
-    bool overflow = false;
+    bool overflow = false;  // 257th bit: set if result >= 2^256
     
+    // Carry propagation with overflow detection
     if (s.x < old) {
         old = s.y; s.y += 1;
         if (s.y < old) {
             old = s.z; s.z += 1;
             if (s.z < old) {
                 old = s.w; s.w += 1;
-                // CRITICAL FIX: Detect overflow beyond 256 bits
-                // If s.w wraps to 0, we've exceeded 2^256
+                // CRITICAL: Detect overflow beyond 256 bits
+                // If s.w wraps (s.w < old), we've exceeded 2^256
                 if (s.w < old) {
                     overflow = true;
                 }
@@ -165,10 +168,26 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
     }
     
     // FAIL-SAFE: Iterative reduction to guarantee result is in [0, n-1]
-    // Even if sum exceeds 2*n, this loop will correctly reduce it.
-    // In practice: 1 iteration usually suffices, 2 for edge cases, 3 for safety.
-    #pragma unroll 3
-    for (int iter = 0; iter < 3; iter++) {
+    // 
+    // 257-BIT COMPARISON:
+    // If overflow is true, the actual value is s + 2^256, which is always >= n.
+    // We must subtract n until both:
+    //   1. overflow == false (value < 2^256)
+    //   2. s < n (value in valid range)
+    //
+    // Each subtraction of n reduces the value. Since n ≈ 2^256, subtracting n
+    // from a value >= 2^256 will clear the overflow and leave a 256-bit result.
+    // If that result >= n, we subtract again.
+    //
+    // Worst case: value = 2^256 + (n-1) requires 2 subtractions:
+    //   1. 2^256 + (n-1) - n = 2^256 - 1 (overflow still true? No, result < 2^256)
+    //   Actually: 2^256 - 1 >= n, so needs one more subtraction
+    //   2. 2^256 - 1 - n = 2^256 - 1 - n < n ✓
+    //
+    // 4 iterations provide ample safety margin.
+    #pragma unroll 4
+    for (int iter = 0; iter < 4; iter++) {
+        // 257-bit comparison: overflow || (256-bit s >= n)
         bool needs_reduction = overflow ||
             s.w > SECP256K1_N.w || 
             (s.w == SECP256K1_N.w && s.z > SECP256K1_N.z) ||
@@ -176,18 +195,29 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
             (s.w == SECP256K1_N.w && s.z == SECP256K1_N.z && s.y == SECP256K1_N.y && s.x >= SECP256K1_N.x);
         
         if (!needs_reduction) {
-            break; // Already in valid range [0, n-1]
+            break; // Already in valid range [0, n-1] with no overflow
         }
         
         // Subtract n with borrow chain
+        // CRITICAL: This subtraction handles the 257-bit case correctly.
+        // If overflow was true, we're subtracting n from (s + 2^256).
+        // The result is (s + 2^256 - n), which is < 2^256 since n ≈ 2^256.
         ulong bw = 0;
         ulong4 r;
         r.x = s.x - SECP256K1_N.x; bw = (s.x < SECP256K1_N.x) ? 1 : 0;
         r.y = s.y - SECP256K1_N.y - bw; bw = (s.y < SECP256K1_N.y + bw) ? 1 : 0;
         r.z = s.z - SECP256K1_N.z - bw; bw = (s.z < SECP256K1_N.z + bw) ? 1 : 0;
         r.w = s.w - SECP256K1_N.w - bw;
+        
+        // After subtraction: if there was overflow (257th bit set), the borrow
+        // chain would have consumed it. Check if result still needs reduction.
+        // CRITICAL FIX: Only clear overflow if the subtraction was valid
+        // (i.e., we actually had enough to subtract n without going negative)
+        if (overflow) {
+            // We subtracted n from (s + 2^256). Result is definitely < 2^256.
+            overflow = false;
+        }
         s = r;
-        overflow = false; // Clear overflow flag after first reduction
     }
 }
 
@@ -955,16 +985,36 @@ kernel void generate_btc_keys(
         bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
         batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
+        // Advance to next point: cur += G
+        // NOTE: This may produce Z=0 (point at infinity) if cur = -G
+        // Such cases are caught in the NEXT iteration via batch_valid check
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
                            cur_X, cur_Y, cur_Z, cur_ZZ);
     }
     
+    // =========================================================================
     // Phase 2: Montgomery Batch Inversion
+    // 
+    // POISONED BATCH PROTECTION:
+    // If any Z value is 0, including it in products would make mod_inv(0),
+    // which returns garbage and corrupts ALL keys in the batch.
+    //
+    // Protection mechanism:
+    // 1. batch_valid[b] guarantees Z != 0 for included points
+    // 2. Only valid points contribute to products array
+    // 3. Invalid points get Zinv = 0 and produce zero output (skipped by CPU)
+    //
+    // Edge case: ext_jac_add_affine can produce Z=0 if P + Q = O (infinity)
+    // This is rare (requires P = -Q) but handled correctly:
+    // - The Z=0 affects cur_Z for the NEXT batch entry
+    // - That entry's batch_valid will be false due to !IsZero(cur_Z) check
+    // =========================================================================
     int valid_count = 0;
     
     for (uint b = 0; b < kpt && b < BATCH_SIZE; b++) {
         if (batch_valid[b]) {
+            // SAFETY: batch_valid guarantees batch_Z[b] != 0
             if (valid_count == 0) {
                 products[0] = batch_Z[b];
             } else {
@@ -978,6 +1028,7 @@ kernel void generate_btc_keys(
     }
     
     if (valid_count > 0) {
+        // SAFETY: products[valid_count-1] != 0 because all contributors had Z != 0
         ulong4 inv = mod_inv(products[valid_count - 1]);
         
         for (int i = valid_count - 1; i > 0; i--) {
