@@ -214,26 +214,37 @@ where
         // When we break out of the loop, there are still batches waiting in the
         // GPU that have been computed but not yet retrieved.
         // Without draining, we lose the last `pipeline_depth - 1` batches of data!
+        //
+        // FIX: Use drain_buffer() instead of generate_with_retry() to avoid
+        // dispatching new work beyond the range. drain_buffer() only reads
+        // pending GPU results without scheduling new computations.
         if range_complete {
             let depth = self.generator.pipeline_depth();
             if depth > 1 {
                 println!("🔄 Draining pipeline ({} pending batches)...", depth - 1);
-                for _ in 0..(depth - 1) {
-                    // Generate batch to retrieve pending GPU results
-                    // This doesn't dispatch new work since range is complete
-                    if let Ok(batch_data) = self.generate_with_retry() {
-                        let batch = KeyBatch::new(batch_data);
-                        
-                        // Check for matches in drained batch
-                        let matches = if self.config.parallel_matching {
-                            self.match_batch_parallel(&batch)
-                        } else {
-                            self.matcher.check_batch(&batch)
-                        };
-                        
-                        if !matches.is_empty() {
-                            self.matches_found.fetch_add(matches.len() as u64, Ordering::Relaxed);
-                            self.output.on_matches(&matches)?;
+                for i in 0..(depth - 1) {
+                    // CRITICAL FIX: Use drain_buffer instead of generate_batch
+                    // This retrieves pending GPU results WITHOUT dispatching new work
+                    // that would scan beyond the configured range.
+                    match self.generator.drain_buffer(i) {
+                        Ok(batch_data) => {
+                            let batch = KeyBatch::new(batch_data);
+                            
+                            // Check for matches in drained batch
+                            let matches = if self.config.parallel_matching {
+                                self.match_batch_parallel(&batch)
+                            } else {
+                                self.matcher.check_batch(&batch)
+                            };
+                            
+                            if !matches.is_empty() {
+                                self.matches_found.fetch_add(matches.len() as u64, Ordering::Relaxed);
+                                self.output.on_matches(&matches)?;
+                            }
+                        }
+                        Err(e) => {
+                            // Non-fatal: log and continue draining remaining buffers
+                            eprintln!("⚠️ Drain buffer {} failed: {}", i, e);
                         }
                     }
                 }

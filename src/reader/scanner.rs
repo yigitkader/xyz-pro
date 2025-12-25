@@ -229,62 +229,74 @@ impl RawFileScanner {
             return Err("Invalid magic bytes".to_string());
         }
         
-        // ROBUST FORMAT DETECTION: Use filesize validation, not just version byte
-        // This prevents ambiguity when legacy count's first byte equals a valid version
+        // =========================================================================
+        // ROBUST FORMAT DETECTION
+        // =========================================================================
+        // 
+        // STRICT PRIORITY ORDER: Prevents format confusion attacks
+        // 
+        // Problem: V1's header bytes 4-12 could theoretically match V0's count
+        // if a malicious/corrupted file is crafted. We prevent this by:
+        // 
+        // 1. FIRST check if bytes 4-7 indicate a versioned format (version + reserved)
+        // 2. Only fall back to legacy (v0) if bytes 4-7 are NOT a valid version header
+        // 
+        // V0 (Legacy): magic(4) + count(8) = 12 bytes header
+        // V1+:         magic(4) + version(1) + reserved(3) + count(8) = 16 bytes header
         //
-        // Legacy (v0): magic(4) + count(8) = 12 bytes header
-        // V1:          magic(4) + version(1) + reserved(3) + count(8) = 16 bytes header
+        // Detection heuristic:
+        // - If mmap[4] == 1 AND mmap[5..8] == 0,0,0 → definitely versioned format
+        // - If mmap[4] == 0 AND file_size matches v0 → legacy format
+        // - Otherwise → validate by exact file size match
+        // =========================================================================
         
         let file_size = mmap.len();
         
-        // Try v1 format first (more strict validation)
-        let v1_valid = if file_size >= HEADER_SIZE {
+        // STEP 1: Check for versioned format signature (version byte + reserved zeros)
+        let has_version_header = if file_size >= HEADER_SIZE {
             let version = mmap[4];
             let reserved_ok = mmap[5] == 0 && mmap[6] == 0 && mmap[7] == 0;
+            // Version 1+ with proper reserved bytes = definitely versioned format
+            version >= 1 && version <= FORMAT_VERSION && reserved_ok
+        } else {
+            false
+        };
+        
+        if has_version_header {
+            // VERSIONED FORMAT: Do NOT try legacy format
+            let version = mmap[4];
+            if version > FORMAT_VERSION {
+                return Err(format!(
+                    "Unsupported file version {} (max supported: {}). Please update the software.",
+                    version, FORMAT_VERSION
+                ));
+            }
+            
             let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
             let expected = HEADER_SIZE + (count as usize * ENTRY_SIZE);
             
-            version == FORMAT_VERSION && reserved_ok && file_size == expected
+            if file_size != expected {
+                return Err(format!(
+                    "V{} file corrupted: expected {} bytes, got {}",
+                    version, expected, file_size
+                ));
+            }
+            // Valid v1 format - continue to main processing below
         } else {
-            false
-        };
-        
-        // Try legacy format
-        let legacy_valid = if file_size >= 12 {
-            let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
-            let expected = 12 + (count as usize * ENTRY_SIZE);
-            
-            file_size == expected
-        } else {
-            false
-        };
-        
-        // Choose format based on exact match
-        if v1_valid && legacy_valid {
-            // Ambiguous - prefer v1 (newer)
-            // This should be rare; log a warning
-            eprintln!("⚠️ File '{}' matches both v0 and v1 format, using v1", path.display());
-        }
-        
-        if legacy_valid && !v1_valid {
-            // Legacy format
-            let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
-            return self.scan_file_legacy(path, &mmap, count);
-        }
-        
-        if !v1_valid && !legacy_valid {
-            // Try relaxed v1 (count within reasonable bounds but not exact match)
-            if file_size >= HEADER_SIZE {
-                let version = mmap[4];
-                if version > FORMAT_VERSION {
-                    return Err(format!(
-                        "Unsupported file version {} (max supported: {}). Please update the software.",
-                        version, FORMAT_VERSION
-                    ));
+            // STEP 2: Not a versioned format, try legacy (v0)
+            if file_size >= 12 {
+                let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap());
+                let expected = 12 + (count as usize * ENTRY_SIZE);
+                
+                if file_size == expected {
+                    // Valid legacy format
+                    return self.scan_file_legacy(path, &mmap, count);
                 }
             }
+            
+            // Neither format matches
             return Err(format!(
-                "Invalid file format: size {} doesn't match expected header+data layout",
+                "Invalid file format: size {} doesn't match v0 or v1 layout",
                 file_size
             ));
         }

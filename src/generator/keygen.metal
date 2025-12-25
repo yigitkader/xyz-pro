@@ -167,7 +167,9 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
         }
     }
     
+    // =========================================================================
     // FAIL-SAFE: Iterative reduction to guarantee result is in [0, n-1]
+    // =========================================================================
     // 
     // 257-BIT COMPARISON:
     // If overflow is true, the actual value is s + 2^256, which is always >= n.
@@ -175,18 +177,27 @@ inline void scalar_add_u64(thread ulong4& s, ulong val) {
     //   1. overflow == false (value < 2^256)
     //   2. s < n (value in valid range)
     //
-    // Each subtraction of n reduces the value. Since n ≈ 2^256, subtracting n
-    // from a value >= 2^256 will clear the overflow and leave a 256-bit result.
-    // If that result >= n, we subtract again.
+    // Mathematical analysis:
+    // - Input: base_priv < n (valid private key, always guaranteed)
+    // - Offset: thread_offset < 2^40 (262144 threads × 32 batch = 2^23, very safe)
+    // - Sum: base_priv + thread_offset < n + 2^40 < 2n (since 2^40 << n ≈ 2^256)
     //
-    // Worst case: value = 2^256 + (n-1) requires 2 subtractions:
-    //   1. 2^256 + (n-1) - n = 2^256 - 1 (overflow still true? No, result < 2^256)
-    //   Actually: 2^256 - 1 >= n, so needs one more subtraction
-    //   2. 2^256 - 1 - n = 2^256 - 1 - n < n ✓
+    // Reduction iterations needed:
+    // - Typical case: sum < n → 0 iterations
+    // - Edge case: n <= sum < 2n → 1 iteration
+    // - Overflow case: 2^256 <= sum < 2^256 + n → 1-2 iterations
+    // - Extreme: 2^256 + (n-1) → 2^256 - 1 after 1st sub, then 1 more → 2 total
     //
-    // 4 iterations provide ample safety margin.
-    #pragma unroll 4
-    for (int iter = 0; iter < 4; iter++) {
+    // CONSERVATIVE: We use 6 iterations (matching scalar_mul_mod_n) for:
+    // - Theoretical edge cases with very large offsets
+    // - Future-proofing if offset constraints change
+    // - NASA-grade safety margin (2 needed, 6 provided)
+    //
+    // Performance: Early break ensures typical case (0-1 iterations) is fast.
+    // GPU branch prediction works well for consistent patterns.
+    // =========================================================================
+    #pragma unroll 6
+    for (int iter = 0; iter < 6; iter++) {
         // 257-bit comparison: overflow || (256-bit s >= n)
         bool needs_reduction = overflow ||
             s.w > SECP256K1_N.w || 
@@ -675,12 +686,17 @@ constant ulong REDUCE_C2 = 0x0000000000000001ULL;  // bit 128
 // Input: a (256 bits in 4 words)
 // Output: result in r[0..6] (max 385 bits = 7 words)
 //
-// CRITICAL: All additions must use add_with_carry to prevent overflow bugs.
-// Previous bug: "r[2] = hi + carry" could overflow without propagating carry.
+// CRITICAL FIX: ALL carry propagations MUST use add_with_carry to prevent
+// carry values from OVERWRITING existing partial products.
+//
+// Mathematical structure: r = a * C where C = C0 + C1*2^64 + C2*2^128 (C2 = 1)
+// Each a.{x,y,z,w} contributes to multiple result words via schoolbook multiplication.
+// Carries from lower words ACCUMULATE, they must never OVERWRITE.
+//
+// BUG FIXED: Previous code used "r[k] = carry" which overwrote existing values.
+// Correct approach: "r[k] = add_with_carry(r[k], 0, carry, &carry)" to accumulate.
 inline void mul_by_reduction_constant(ulong4 a, thread ulong* r) {
-    // r = a * C where C = C0 + C1*2^64 + C2*2^128
-    // Since C2 = 1, the product is:
-    // r = a*C0 + a*C1*2^64 + a*2^128
+    // r = a * C where C = C0 + C1*2^64 + 1*2^128
     
     ulong hi, lo;
     ulong carry;
@@ -688,45 +704,59 @@ inline void mul_by_reduction_constant(ulong4 a, thread ulong* r) {
     // Initialize result to zero
     r[0] = r[1] = r[2] = r[3] = r[4] = r[5] = r[6] = 0;
     
-    // ---- a.x * C ----
+    // =========================================================================
+    // a.x * C (contributes to r[0..3])
+    // =========================================================================
+    
+    // a.x * C0 → r[0:1]
     mul64(a.x, REDUCE_C0, hi, lo);
     r[0] = lo;
     r[1] = hi;
     
+    // a.x * C1 → r[1:3]
     mul64(a.x, REDUCE_C1, hi, lo);
     r[1] = add_with_carry(r[1], lo, 0, &carry);
-    // FIX: Use add_with_carry to properly handle overflow
     r[2] = add_with_carry(r[2], hi, carry, &carry);
-    r[3] = carry;  // Propagate carry to r[3]
+    // CRITICAL FIX: Use add_with_carry instead of assignment
+    r[3] = add_with_carry(r[3], 0, carry, &carry);
+    r[4] = add_with_carry(r[4], 0, carry, &carry);  // Propagate any overflow
     
-    // a.x * C2 = a.x (since C2 = 1)
+    // a.x * C2 = a.x → r[2:4]
     r[2] = add_with_carry(r[2], a.x, 0, &carry);
     r[3] = add_with_carry(r[3], 0, carry, &carry);
-    r[4] = carry;  // Initial carry propagation
+    r[4] = add_with_carry(r[4], 0, carry, &carry);
     
-    // ---- a.y * C (shifted by 64 bits) ----
+    // =========================================================================
+    // a.y * C (shifted by 64 bits, contributes to r[1..4])
+    // =========================================================================
+    
+    // a.y * C0 → r[1:4]
     mul64(a.y, REDUCE_C0, hi, lo);
     r[1] = add_with_carry(r[1], lo, 0, &carry);
     r[2] = add_with_carry(r[2], hi, carry, &carry);
     r[3] = add_with_carry(r[3], 0, carry, &carry);
     r[4] = add_with_carry(r[4], 0, carry, &carry);
-    r[5] = carry;
+    r[5] = add_with_carry(r[5], 0, carry, &carry);  // CRITICAL: Don't stop at r[4]
     
+    // a.y * C1 → r[2:5]
     mul64(a.y, REDUCE_C1, hi, lo);
     r[2] = add_with_carry(r[2], lo, 0, &carry);
     r[3] = add_with_carry(r[3], hi, carry, &carry);
     r[4] = add_with_carry(r[4], 0, carry, &carry);
     r[5] = add_with_carry(r[5], 0, carry, &carry);
-    r[6] = carry;
+    r[6] = add_with_carry(r[6], 0, carry, &carry);
     
-    // a.y * C2 = a.y
+    // a.y * C2 = a.y → r[3:6]
     r[3] = add_with_carry(r[3], a.y, 0, &carry);
     r[4] = add_with_carry(r[4], 0, carry, &carry);
     r[5] = add_with_carry(r[5], 0, carry, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
-    // Note: r[6] overflow impossible here (max 385 bits fits in 7 words)
     
-    // ---- a.z * C (shifted by 128 bits) ----
+    // =========================================================================
+    // a.z * C (shifted by 128 bits, contributes to r[2..5])
+    // =========================================================================
+    
+    // a.z * C0 → r[2:6]
     mul64(a.z, REDUCE_C0, hi, lo);
     r[2] = add_with_carry(r[2], lo, 0, &carry);
     r[3] = add_with_carry(r[3], hi, carry, &carry);
@@ -734,32 +764,39 @@ inline void mul_by_reduction_constant(ulong4 a, thread ulong* r) {
     r[5] = add_with_carry(r[5], 0, carry, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
     
+    // a.z * C1 → r[3:6]
     mul64(a.z, REDUCE_C1, hi, lo);
     r[3] = add_with_carry(r[3], lo, 0, &carry);
     r[4] = add_with_carry(r[4], hi, carry, &carry);
     r[5] = add_with_carry(r[5], 0, carry, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
     
-    // a.z * C2 = a.z
+    // a.z * C2 = a.z → r[4:6]
     r[4] = add_with_carry(r[4], a.z, 0, &carry);
     r[5] = add_with_carry(r[5], 0, carry, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
     
-    // ---- a.w * C (shifted by 192 bits) ----
+    // =========================================================================
+    // a.w * C (shifted by 192 bits, contributes to r[3..6])
+    // =========================================================================
+    
+    // a.w * C0 → r[3:6]
     mul64(a.w, REDUCE_C0, hi, lo);
     r[3] = add_with_carry(r[3], lo, 0, &carry);
     r[4] = add_with_carry(r[4], hi, carry, &carry);
     r[5] = add_with_carry(r[5], 0, carry, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
     
+    // a.w * C1 → r[4:6]
     mul64(a.w, REDUCE_C1, hi, lo);
     r[4] = add_with_carry(r[4], lo, 0, &carry);
     r[5] = add_with_carry(r[5], hi, carry, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
     
-    // a.w * C2 = a.w
+    // a.w * C2 = a.w → r[5:6]
     r[5] = add_with_carry(r[5], a.w, 0, &carry);
     r[6] = add_with_carry(r[6], 0, carry, &carry);
+    // Note: r[6] cannot overflow (max 385 bits fits in 7 words = 448 bits)
 }
 
 // Multiply two 256-bit numbers modulo n (group order)

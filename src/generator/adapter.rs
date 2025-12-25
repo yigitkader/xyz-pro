@@ -297,6 +297,64 @@ impl KeyGenerator for GpuGeneratorAdapter {
     fn pipeline_depth(&self) -> usize {
         self.inner.pipeline_depth()
     }
+    
+    /// Drain a buffer from the pipeline WITHOUT dispatching new work
+    /// 
+    /// CRITICAL for range scanning: When the range is complete, we need to retrieve
+    /// remaining batches from the GPU pipeline without dispatching new work that
+    /// would scan beyond the configured range.
+    /// 
+    /// This method:
+    /// 1. Waits for GPU completion on the current buffer
+    /// 2. Copies the computed key data to CPU buffer
+    /// 3. Does NOT dispatch new work - just releases the buffer
+    fn drain_buffer(&self, _buffer_idx: usize) -> Result<&[u8], String> {
+        // Acquire write lock
+        let _guard = self.write_lock.lock();
+        
+        let depth = self.inner.pipeline_depth();
+        
+        // Get current buffer indices (same as generate_batch but NO dispatch)
+        let gpu_idx = self.gpu_buf_idx.load(Ordering::SeqCst) % depth;
+        let out_idx = self.output_buf_idx.load(Ordering::SeqCst) % NUM_OUTPUT_BUFFERS;
+        
+        // Get the GPU buffer set for reading
+        let bs = self.inner.buffer_set(gpu_idx);
+        
+        // Wait for GPU completion
+        if let Err(e) = self.inner.wait_for_completion(gpu_idx) {
+            return Err(format!("GPU drain error: {}", e));
+        }
+        
+        // Increment indices (buffer is now consumed)
+        self.gpu_buf_idx.fetch_add(1, Ordering::SeqCst);
+        self.output_buf_idx.fetch_add(1, Ordering::SeqCst);
+        
+        // CRITICAL: NO dispatch here - we're draining, not generating
+        // This is the key difference from generate_batch()
+        
+        // Copy GPU data to output buffer
+        bs.in_use.store(true, std::sync::atomic::Ordering::Release);
+        
+        let gpu_ptr = bs.output_buffer.contents() as *const u8;
+        let buffer = unsafe { &mut *self.batch_buffers[out_idx].get() };
+        
+        unsafe {
+            std::ptr::copy_nonoverlapping(gpu_ptr, buffer.as_mut_ptr(), self.buffer_size);
+        }
+        
+        bs.in_use.store(false, std::sync::atomic::Ordering::Release);
+        
+        // Update stats
+        self.inner.add_generated(self.batch_size() as u64);
+        
+        let result_ptr = buffer.as_ptr();
+        let result_len = self.buffer_size;
+        
+        Ok(unsafe {
+            std::slice::from_raw_parts(result_ptr, result_len)
+        })
+    }
 }
 
 /// Simpler adapter for when we just need the raw buffer access

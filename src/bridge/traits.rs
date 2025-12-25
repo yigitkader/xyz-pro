@@ -57,6 +57,27 @@ pub trait KeyGenerator: Send + Sync {
     fn pipeline_depth(&self) -> usize {
         1
     }
+    
+    /// Drain a single buffer from the pipeline WITHOUT dispatching new work
+    /// 
+    /// CRITICAL for range scanning: When the range is complete, we must retrieve
+    /// remaining batches that are already computed in the GPU pipeline, but we
+    /// must NOT dispatch new work (which would scan beyond the range).
+    /// 
+    /// This method:
+    /// 1. Waits for GPU completion on the specified buffer
+    /// 2. Reads the computed key data
+    /// 3. Does NOT dispatch new work to the buffer
+    /// 
+    /// Default implementation falls back to generate_batch() for backwards compatibility,
+    /// but optimized implementations should override this to avoid unnecessary dispatch.
+    /// 
+    /// Returns the raw key data from the drained buffer, or error if drain fails.
+    fn drain_buffer(&self, _buffer_idx: usize) -> Result<&[u8], String> {
+        // Default: fall back to generate_batch for compatibility
+        // This may dispatch new work, but range-complete generators should handle this
+        self.generate_batch()
+    }
 }
 
 /// Matcher Trait

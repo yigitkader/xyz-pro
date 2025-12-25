@@ -891,32 +891,48 @@ impl GpuKeyGenerator {
     fn dispatch_batch_internal(&self, buf_idx: usize, base_offset: u64, use_glv: bool) -> Result<(), String> {
         let bs = &self.buffer_sets[buf_idx];
         
-        // RACE CONDITION PREVENTION: Wait for CPU to finish reading this buffer
-        // If CPU is still reading (in_use = true), we cannot dispatch to this buffer
-        // as it would corrupt data being processed.
+        // =========================================================================
+        // BUFFER SYNCHRONIZATION: Prevent GPU/CPU data corruption
+        // =========================================================================
         // 
-        // Spin-wait with exponential backoff to avoid busy-waiting
+        // THREAD SAFETY MODEL:
+        // - SINGLE dispatcher thread calls dispatch_batch_internal (enforced by Mutex)
+        // - SINGLE consumer thread reads via wait_for_completion → in_use = true
+        // - in_use flag provides VISIBILITY (Acquire/Release) not mutual exclusion
+        //
+        // FLOW:
+        // 1. GPU dispatch: wait for in_use == false, then dispatch (GPU owns buffer)
+        // 2. GPU completes: wait_for_completion sets in_use = true (CPU claims buffer)
+        // 3. CPU reads: processes buffer contents
+        // 4. CPU releases: in_use = false (buffer available for next dispatch)
+        //
+        // CAS ALTERNATIVE (for multi-threaded dispatch):
+        // If multiple threads could dispatch, use compare_exchange:
+        //   while bs.in_use.compare_exchange(false, true, AcqRel, Acquire).is_err() { ... }
+        // Current single-threaded model doesn't require CAS overhead.
+        //
+        // =========================================================================
+        
         let mut spin_count = 0;
         const MAX_SPINS: u32 = 1000;
         const YIELD_THRESHOLD: u32 = 10;
         
+        // Wait for CPU to finish reading this buffer
+        // ACQUIRE ordering ensures we see all CPU writes before proceeding
         while bs.in_use.load(Ordering::Acquire) {
             spin_count += 1;
             
             if spin_count > MAX_SPINS {
-                // Buffer still in use after many attempts - this indicates
-                // CPU is severely lagging behind GPU. Log warning and wait.
+                // Buffer still in use after many attempts - CPU is severely lagging
                 if spin_count == MAX_SPINS + 1 {
                     eprintln!("⚠️ Buffer {} still in use - CPU lagging behind GPU", buf_idx);
                 }
                 std::thread::sleep(Duration::from_micros(100));
             } else if spin_count > YIELD_THRESHOLD {
-                // Yield to other threads after initial spins
                 std::thread::yield_now();
             }
-            // else: spin-wait (fast path for short waits)
+            // else: spin-wait (fast path)
             
-            // Check for shutdown request
             if self.should_stop.load(Ordering::SeqCst) {
                 return Err("Generator stopped while waiting for buffer".to_string());
             }
