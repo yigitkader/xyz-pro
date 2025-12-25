@@ -104,9 +104,11 @@ impl CpuKeyGenerator {
     /// Convenience constructor with start_offset
     /// 
     /// Quick way to create a generator starting from a specific offset.
-    /// Uses GLV2 mode by default for optimal throughput.
+    /// 
+    /// Uses GLV3 mode (3x throughput) by default to match GPU behavior.
+    /// Use `new()` with explicit glv_multiplier if you need different mode.
     pub fn with_seed(start_offset: u64) -> Self {
-        Self::new(start_offset.max(1), None, 2)  // GLV2 mode by default
+        Self::new(start_offset.max(1), None, 3)  // GLV3 mode (matches GPU default)
     }
     
     /// Create with explicit base private key (256-bit)

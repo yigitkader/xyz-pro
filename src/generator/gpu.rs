@@ -33,9 +33,11 @@ use super::{AddressEncoder, GeneratorConfig, GeneratorStats, GlvMode, KeyEntry, 
 
 /// Metal shader source - embedded at compile time for release builds
 /// This ensures the binary is self-contained and doesn't require external shader files
-const SHADER_SOURCE: &str = include_str!("keygen.metal");
+const SHADER_SOURCE_RAW: &str = include_str!("keygen.metal");
 
-/// Keys per thread (Montgomery batch size) - must match shader
+/// Keys per thread (Montgomery batch size)
+/// SINGLE SOURCE OF TRUTH: This value is injected into the Metal shader at runtime
+/// to guarantee CPU/GPU synchronization. Never define BATCH_SIZE in keygen.metal!
 const BATCH_SIZE: u32 = 32;
 
 /// Output size per key: 32 (privkey) + 20 (pubkey_hash) + 20 (p2sh_hash) = 72 bytes
@@ -174,6 +176,9 @@ pub struct BufferSet {
     pub base_pubkey_y_buf: Buffer,
     pub output_buffer: Buffer,
     pub keys_per_thread_buf: Buffer,
+    /// RANGE LIMIT: Maximum keys to generate (0 = unlimited)
+    /// Used to prevent GPU from generating keys beyond end_offset
+    pub keys_remaining_buf: Buffer,
     /// Last dispatched command buffer - used for proper GPU sync
     /// CRITICAL: Always wait on THIS buffer, not a new empty one
     pending_command: std::sync::Mutex<Option<metal::CommandBuffer>>,
@@ -234,15 +239,24 @@ impl GpuTier {
         let output_buffer_mb = (keys_per_dispatch * OUTPUT_SIZE * GLV_MAX_MULTIPLIER) / (1024 * 1024);
         let total_buffer_mb = output_buffer_mb * base_depth;
         
-        // HARD RESERVE: Prevent OOM during heavy disk I/O
-        // Rule: Keep at least 4GB free OR 25% of total RAM, whichever is larger
-        // 4GB ensures room for:
-        // - AsyncRawWriter buffers (~100MB)
-        // - Rayon thread pool (~50MB per core)
-        // - macOS kernel caches and VM pressure handling
-        // - File system buffers during heavy writes
-        const HARD_RESERVE_MB: u64 = 4096; // 4GB minimum
-        let min_free_mb = std::cmp::max(HARD_RESERVE_MB, total_ram_mb / 4);
+        // SMART RESERVE: Balance OOM prevention with GPU utilization
+        // 
+        // OLD POLICY (too aggressive): 4GB or 25% of RAM
+        // Problem: 8GB machine with 3GB free → GPU disabled (waste of capacity)
+        //
+        // NEW POLICY (adaptive):
+        // 1. Hard minimum: 1GB for OS/kernel
+        // 2. Buffer headroom: 1.5x required buffer size (for I/O spikes)
+        // 3. Proportional: 15% of total RAM (not 25%)
+        // Take the LARGEST of these three values
+        const HARD_MINIMUM_MB: u64 = 1024; // 1GB absolute minimum for OS
+        let buffer_headroom_mb = (total_buffer_mb as u64 * 3) / 2; // 1.5x buffer size
+        let proportional_mb = total_ram_mb / 7; // ~15% of total RAM
+        
+        let min_free_mb = std::cmp::max(
+            HARD_MINIMUM_MB,
+            std::cmp::max(buffer_headroom_mb, proportional_mb)
+        );
         let available_for_gpu = free_ram_mb.saturating_sub(min_free_mb);
         
         println!("[GPU] Buffer requirements: {} MB per set × {} sets = {} MB total",
@@ -487,9 +501,19 @@ impl GpuKeyGenerator {
         // Detect GPU tier (may fail if insufficient memory)
         let tier = GpuTier::detect(&device)?;
         
+        // CRITICAL: Inject BATCH_SIZE into shader to ensure CPU/GPU sync
+        // This prevents the dangerous scenario where shader and Rust have different values
+        let shader_preamble = format!(
+            "// === AUTO-INJECTED BY RUST (DO NOT MODIFY) ===\n\
+             #define BATCH_SIZE {}\n\
+             // === END AUTO-INJECTED ===\n\n",
+            BATCH_SIZE
+        );
+        let shader_source = format!("{}{}", shader_preamble, SHADER_SOURCE_RAW);
+        
         // Compile embedded shader (self-contained binary, no external file needed)
         let library = device
-            .new_library_with_source(SHADER_SOURCE, &metal::CompileOptions::new())
+            .new_library_with_source(&shader_source, &metal::CompileOptions::new())
             .map_err(|e| format!("Failed to compile shader: {}", e))?;
         
         let function = library
@@ -540,6 +564,14 @@ impl GpuKeyGenerator {
                 *ptr = BATCH_SIZE;
             }
             
+            // Create keys_remaining buffer for range limiting
+            // 0 = unlimited (no range limit), >0 = max keys to generate this dispatch
+            let keys_remaining_buf = device.new_buffer(8, storage); // u64
+            unsafe {
+                let ptr = keys_remaining_buf.contents() as *mut u64;
+                *ptr = 0; // Default: no limit
+            }
+            
             buffer_sets.push(BufferSet {
                 queue: device.new_command_queue(),
                 base_privkey_buf: device.new_buffer(32, storage),
@@ -547,6 +579,7 @@ impl GpuKeyGenerator {
                 base_pubkey_y_buf: device.new_buffer(32, storage),
                 output_buffer: device.new_buffer(output_buffer_size as u64, storage),
                 keys_per_thread_buf,
+                keys_remaining_buf,
                 pending_command: std::sync::Mutex::new(None),
                 in_use: AtomicBool::new(false), // Initially available for dispatch
             });
@@ -912,6 +945,17 @@ impl GpuKeyGenerator {
             
             let y_ptr = bs.base_pubkey_y_buf.contents() as *mut u8;
             std::ptr::copy_nonoverlapping(pubkey_y.as_ptr(), y_ptr, 32);
+            
+            // RANGE LIMIT: Calculate keys_remaining for this dispatch
+            // 0 = unlimited, >0 = max keys to generate
+            let keys_remaining: u64 = if let Some(end) = self.config.end_offset {
+                // Keys remaining from base_offset to end_offset
+                end.saturating_sub(base_offset)
+            } else {
+                0 // No limit
+            };
+            let remaining_ptr = bs.keys_remaining_buf.contents() as *mut u64;
+            *remaining_ptr = keys_remaining;
         }
         
         let command_buffer = bs.queue.new_command_buffer();
@@ -927,6 +971,7 @@ impl GpuKeyGenerator {
         compute_encoder.set_buffer(3, Some(&self.wnaf_table_buffer), 0);
         compute_encoder.set_buffer(4, Some(&bs.output_buffer), 0);
         compute_encoder.set_buffer(5, Some(&bs.keys_per_thread_buf), 0);
+        compute_encoder.set_buffer(6, Some(&bs.keys_remaining_buf), 0);  // RANGE LIMIT
         
         let grid_size = MTLSize::new(self.tier.threads_per_dispatch as u64, 1, 1);
         let threadgroup_size = MTLSize::new(self.tier.threadgroup_size as u64, 1, 1);
@@ -1004,6 +1049,15 @@ impl GpuKeyGenerator {
             
             let y_ptr = bs.base_pubkey_y_buf.contents() as *mut u8;
             std::ptr::copy_nonoverlapping(pubkey_y.as_ptr(), y_ptr, 32);
+            
+            // RANGE LIMIT: Calculate keys_remaining for this dispatch
+            let keys_remaining: u64 = if let Some(end) = self.config.end_offset {
+                end.saturating_sub(base_offset)
+            } else {
+                0
+            };
+            let remaining_ptr = bs.keys_remaining_buf.contents() as *mut u64;
+            *remaining_ptr = keys_remaining;
         }
         
         let command_buffer = bs.queue.new_command_buffer();
@@ -1017,6 +1071,7 @@ impl GpuKeyGenerator {
         compute_encoder.set_buffer(3, Some(&self.wnaf_table_buffer), 0);
         compute_encoder.set_buffer(4, Some(&bs.output_buffer), 0);
         compute_encoder.set_buffer(5, Some(&bs.keys_per_thread_buf), 0);
+        compute_encoder.set_buffer(6, Some(&bs.keys_remaining_buf), 0);  // RANGE LIMIT
         
         let grid_size = MTLSize::new(self.tier.threads_per_dispatch as u64, 1, 1);
         let threadgroup_size = MTLSize::new(self.tier.threadgroup_size as u64, 1, 1);

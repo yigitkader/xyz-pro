@@ -89,7 +89,9 @@ constant uchar RIPEMD_RR[80] = {5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0
 constant uchar RIPEMD_SL[80] = {11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
 constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
 
-#define BATCH_SIZE 32
+// BATCH_SIZE is injected by Rust at compile time to ensure CPU/GPU sync
+// DO NOT define BATCH_SIZE here - it comes from gpu.rs via shader preprocessing
+// #define BATCH_SIZE __INJECTED_FROM_RUST__
 #define OUTPUT_SIZE 72
 #define GLV_OUTPUT_SIZE 144  // 2 keys per thread (primary + GLV)
 
@@ -881,10 +883,18 @@ kernel void generate_btc_keys(
     constant uchar* wnaf_table [[buffer(3)]],
     device uchar* output [[buffer(4)]],
     constant uint* keys_per_thread [[buffer(5)]],
+    constant ulong* keys_remaining_ptr [[buffer(6)]],  // RANGE LIMIT: max keys to generate
     uint gid [[thread_position_in_grid]]
 ) {
     uint kpt = *keys_per_thread;
     uint thread_offset = gid * kpt;
+    
+    // RANGE LIMIT: Skip entire thread if beyond remaining keys
+    // 0 = unlimited (no range limit)
+    ulong keys_remaining = *keys_remaining_ptr;
+    if (keys_remaining > 0 && thread_offset >= keys_remaining) {
+        return; // Thread completely out of range
+    }
     
     // Load base private key and pubkey
     ulong4 base_priv = load_be(base_privkey);
@@ -938,11 +948,12 @@ kernel void generate_btc_keys(
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
-        // CRITICAL FIX: Check BOTH conditions for validity:
+        // VALIDITY CHECK (3 conditions):
         // 1. EC point is not at infinity (Z != 0)
-        // 2. Private key is not zero (priv != 0)
-        // If base_priv + offset = n (curve order), reduction gives 0 = invalid key
-        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv);
+        // 2. Private key is not zero (priv != 0)  
+        // 3. RANGE LIMIT: Key offset within remaining range (if set)
+        bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
+        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
@@ -1031,10 +1042,17 @@ kernel void generate_btc_keys_glv(
     constant uchar* wnaf_table [[buffer(3)]],
     device uchar* output [[buffer(4)]],
     constant uint* keys_per_thread [[buffer(5)]],
+    constant ulong* keys_remaining_ptr [[buffer(6)]],  // RANGE LIMIT
     uint gid [[thread_position_in_grid]]
 ) {
     uint kpt = *keys_per_thread;
     uint thread_offset = gid * kpt;
+    
+    // RANGE LIMIT: Skip entire thread if beyond remaining keys
+    ulong keys_remaining = *keys_remaining_ptr;
+    if (keys_remaining > 0 && thread_offset >= keys_remaining) {
+        return;
+    }
     
     // Load base private key and pubkey
     ulong4 base_priv = load_be(base_privkey);
@@ -1088,11 +1106,12 @@ kernel void generate_btc_keys_glv(
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
-        // CRITICAL FIX: Check BOTH conditions for validity:
+        // VALIDITY CHECK (3 conditions):
         // 1. EC point is not at infinity (Z != 0)
-        // 2. Private key is not zero (priv != 0)
-        // If base_priv + offset = n (curve order), reduction gives 0 = invalid key
-        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv);
+        // 2. Private key is not zero (priv != 0)  
+        // 3. RANGE LIMIT: Key offset within remaining range (if set)
+        bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
+        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,
@@ -1227,10 +1246,17 @@ kernel void generate_btc_keys_glv3(
     constant uchar* wnaf_table [[buffer(3)]],
     device uchar* output [[buffer(4)]],
     constant uint* keys_per_thread [[buffer(5)]],
+    constant ulong* keys_remaining_ptr [[buffer(6)]],  // RANGE LIMIT
     uint gid [[thread_position_in_grid]]
 ) {
     uint kpt = *keys_per_thread;
     uint thread_offset = gid * kpt;
+    
+    // RANGE LIMIT: Skip entire thread if beyond remaining keys
+    ulong keys_remaining = *keys_remaining_ptr;
+    if (keys_remaining > 0 && thread_offset >= keys_remaining) {
+        return;
+    }
     
     // Load base private key and pubkey
     ulong4 base_priv = load_be(base_privkey);
@@ -1284,11 +1310,12 @@ kernel void generate_btc_keys_glv3(
         batch_Y[b] = cur_Y;
         batch_Z[b] = cur_Z;
         batch_ZZ[b] = cur_ZZ;
-        // CRITICAL FIX: Check BOTH conditions for validity:
+        // VALIDITY CHECK (3 conditions):
         // 1. EC point is not at infinity (Z != 0)
-        // 2. Private key is not zero (priv != 0)
-        // If base_priv + offset = n (curve order), reduction gives 0 = invalid key
-        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv);
+        // 2. Private key is not zero (priv != 0)  
+        // 3. RANGE LIMIT: Key offset within remaining range (if set)
+        bool in_range = (keys_remaining == 0) || ((thread_offset + b) < keys_remaining);
+        batch_valid[b] = !IsZero(cur_Z) && !IsZero(priv) && in_range;
         
         ext_jac_add_affine(cur_X, cur_Y, cur_Z, cur_ZZ,
                            SECP256K1_GX, SECP256K1_GY,

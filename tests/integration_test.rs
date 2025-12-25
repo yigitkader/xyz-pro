@@ -1969,15 +1969,15 @@ fn test_gpu_buffer_to_rawkeydata_slice() {
 // CPU/GPU GLV CONSISTENCY TESTS
 // ============================================================================
 
-/// Test that CPU KeyGenerator with GLV produces 2x keys
+/// Test that CPU KeyGenerator with GLV3 produces 3x keys
 #[test]
-fn test_cpu_glv_produces_double_keys() {
+fn test_cpu_glv_produces_triple_keys() {
     use xyz_pro::generator::CpuKeyGenerator;
     
-    println!("\n🧪 CPU GLV Double Key Production Test");
+    println!("\n🧪 CPU GLV3 Triple Key Production Test");
     println!("{}", "=".repeat(60));
     
-    let gen = CpuKeyGenerator::with_seed(12345);
+    let gen = CpuKeyGenerator::with_seed(12345);  // GLV3 by default
     assert!(gen.is_glv_enabled(), "GLV should be enabled by default");
     
     // Generate 100 base keys
@@ -1986,9 +1986,9 @@ fn test_cpu_glv_produces_double_keys() {
     println!("   Base counter: 100");
     println!("   Keys produced: {}", batch.len());
     
-    // With GLV, should get close to 200 keys (some might fail validation)
-    assert!(batch.len() > 150, "GLV should produce >150 keys from 100 counters, got {}", batch.len());
-    assert!(batch.len() <= 200, "GLV should produce <=200 keys from 100 counters, got {}", batch.len());
+    // With GLV3, should get close to 300 keys (some might fail validation)
+    assert!(batch.len() > 250, "GLV3 should produce >250 keys from 100 counters, got {}", batch.len());
+    assert!(batch.len() <= 300, "GLV3 should produce <=300 keys from 100 counters, got {}", batch.len());
     
     // All keys should be unique
     let mut seen = std::collections::HashSet::new();
@@ -1996,7 +1996,7 @@ fn test_cpu_glv_produces_double_keys() {
         assert!(seen.insert(key.private_key), "Duplicate key found!");
     }
     
-    println!("✅ CPU GLV mode produces ~2x unique keys per counter");
+    println!("✅ CPU GLV3 mode produces ~3x unique keys per counter");
 }
 
 /// Test that CPU GLV lambda matches GPU GLV lambda
@@ -2047,17 +2047,16 @@ fn test_cpu_gpu_glv_lambda_consistency() {
     println!("✅ CPU and GPU use the same GLV Lambda constant");
 }
 
-/// Test that CPU GLV addresses match GPU GLV addresses for same key
+/// Test that CPU GLV3 addresses are unique and consistent
 #[test]
 fn test_cpu_gpu_glv_address_consistency() {
     use xyz_pro::generator::CpuKeyGenerator;
-    use xyz_pro::bridge::RawKeyData;
     use std::collections::HashSet;
     
-    println!("\n🧪 CPU/GPU GLV Address Consistency Test");
+    println!("\n🧪 CPU/GPU GLV3 Address Consistency Test");
     println!("{}", "=".repeat(60));
     
-    // Generate keys with CPU GLV
+    // Generate keys with CPU GLV3 (default)
     let cpu_gen = CpuKeyGenerator::with_seed(99999);
     let cpu_batch = cpu_gen.generate_batch(100);
     
@@ -2069,16 +2068,16 @@ fn test_cpu_gpu_glv_address_consistency() {
     println!("   CPU keys generated: {}", cpu_batch.len());
     println!("   Unique pubkey hashes: {}", cpu_hashes.len());
     
-    // Verify we have GLV pairs (should have many unique hashes)
-    assert!(cpu_hashes.len() > 100, "Should have >100 unique hashes with GLV");
+    // Verify we have GLV3 triplets (should have ~3x unique hashes)
+    assert!(cpu_hashes.len() > 200, "Should have >200 unique hashes with GLV3, got {}", cpu_hashes.len());
     
     // Verify no duplicates in CPU output
     assert_eq!(cpu_hashes.len(), cpu_batch.len(), "All CPU keys should have unique pubkey_hash");
     
-    println!("✅ CPU GLV produces unique addresses consistent with GPU model");
+    println!("✅ CPU GLV3 produces unique addresses consistent with GPU model");
 }
 
-/// Test effective_keys_generated correctly reports 2x for GLV mode
+/// Test effective_keys_generated correctly reports 3x for GLV3 mode (default)
 #[test]
 fn test_cpu_effective_keys_counter() {
     use xyz_pro::generator::CpuKeyGenerator;
@@ -2086,7 +2085,7 @@ fn test_cpu_effective_keys_counter() {
     println!("\n🧪 CPU Effective Keys Counter Test");
     println!("{}", "=".repeat(60));
     
-    let gen = CpuKeyGenerator::with_seed(11111);
+    let gen = CpuKeyGenerator::with_seed(11111);  // GLV3 by default
     
     // Before generating
     assert_eq!(gen.current_count(), 0);
@@ -2098,12 +2097,12 @@ fn test_cpu_effective_keys_counter() {
     // Counter should be 100 (base keys processed)
     assert_eq!(gen.current_count(), 100, "Counter should be 100");
     
-    // Effective should be 200 (2x for GLV)
-    assert_eq!(gen.effective_keys_generated(), 200, "Effective should be 200 (2x GLV)");
+    // Effective should be 300 (3x for GLV3)
+    assert_eq!(gen.effective_keys_generated(), 300, "Effective should be 300 (3x GLV3)");
     
     println!("   Counter (base): 100");
-    println!("   Effective (GLV): 200");
-    println!("✅ Statistics correctly report 2x for GLV mode");
+    println!("   Effective (GLV3): 300");
+    println!("✅ Statistics correctly report 3x for GLV3 mode");
 }
 
 // ============================================================================
