@@ -1,15 +1,21 @@
-//! Batch processor with deduplication
+//! Batch processor for high-throughput key generation
 //! 
 //! Handles high-throughput key generation with:
 //! - Parallel batch processing
-//! - Lock-free deduplication using DashMap
 //! - Automatic file writing at configured intervals
+//! 
+//! ## Deduplication Note
+//! 
+//! **Sequential mode (default)**: Deduplication is DISABLED because mathematically
+//! no duplicates can occur. The offset-based generation guarantees unique keys:
+//! `key[i] = base + i` where `i` is strictly increasing.
+//! 
+//! This saves significant RAM (previously used GB of memory for DashSet).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashSet;
 use rayon::prelude::*;
 
 use super::{
@@ -18,14 +24,18 @@ use super::{
 };
 
 /// Batch processor for high-throughput key generation
+/// 
+/// ## Memory Efficiency
+/// 
+/// In sequential mode (the only mode now), deduplication is disabled because:
+/// - Keys are generated as `base + offset` where offset is strictly increasing
+/// - Mathematically impossible to produce duplicates
+/// - Saves gigabytes of RAM that was previously wasted on DashSet
 pub struct BatchProcessor {
     config: GeneratorConfig,
     keygen: Arc<CpuKeyGenerator>,
-    /// Lock-free set for deduplication (stores private key hashes)
-    seen_keys: Arc<DashSet<[u8; 32]>>,
     /// Statistics
     total_generated: Arc<AtomicU64>,
-    duplicates: Arc<AtomicU64>,
     /// Stop signal
     should_stop: Arc<AtomicBool>,
 }
@@ -50,9 +60,7 @@ impl BatchProcessor {
         Self {
             config: config.clone(),
             keygen: Arc::new(CpuKeyGenerator::new(config.start_offset, config.end_offset, glv_mult)),
-            seen_keys: Arc::new(DashSet::new()),
             total_generated: Arc::new(AtomicU64::new(0)),
-            duplicates: Arc::new(AtomicU64::new(0)),
             should_stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -76,9 +84,7 @@ impl BatchProcessor {
         Self {
             config: config.clone(),
             keygen: Arc::new(CpuKeyGenerator::new(start_offset.max(1), config.end_offset, glv_mult)),
-            seen_keys: Arc::new(DashSet::new()),
             total_generated: Arc::new(AtomicU64::new(0)),
-            duplicates: Arc::new(AtomicU64::new(0)),
             should_stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -120,16 +126,12 @@ impl BatchProcessor {
             // Generate batch
             let raw_keys = self.keygen.generate_batch(self.config.batch_size);
             
-            // Process with parallel encoding and deduplication
+            // Process with parallel encoding
+            // NOTE: No deduplication needed - sequential mode guarantees unique keys
+            // (key[i] = base + i where i is strictly increasing)
             let new_entries: Vec<KeyEntry> = raw_keys
                 .into_par_iter()
-                .filter_map(|raw| {
-                    // Check for duplicate
-                    if !self.seen_keys.insert(raw.private_key) {
-                        self.duplicates.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    }
-                    
+                .map(|raw| {
                     // Encode addresses (thread-local encoder)
                     thread_local! {
                         static ENCODER: std::cell::RefCell<AddressEncoder> = 
@@ -137,7 +139,7 @@ impl BatchProcessor {
                     }
                     
                     ENCODER.with(|enc| {
-                        Some(enc.borrow_mut().encode(&raw))
+                        enc.borrow_mut().encode(&raw)
                     })
                 })
                 .collect();
@@ -151,24 +153,19 @@ impl BatchProcessor {
                 let filename = writer.write_batch(&current_batch)?;
                 println!("📁 Written: {} ({} keys)", filename, current_batch.len());
                 current_batch.clear();
-                
-                // Clear seen_keys to save memory (we've written to file, no duplicates in new file needed)
-                self.seen_keys.clear();
             }
             
             // Progress report
             if last_report.elapsed() >= report_interval {
                 let total = self.total_generated.load(Ordering::Relaxed);
-                let dupes = self.duplicates.load(Ordering::Relaxed);
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let rate = total as f64 / elapsed;
                 
                 println!(
-                    "⚡ Progress: {} keys | {:.2}M/sec | {:.2}M/min | Duplicates: {} | Pending: {}",
+                    "⚡ Progress: {} keys | {:.2}M/sec | {:.2}M/min | Pending: {}",
                     format_number(total),
                     rate / 1_000_000.0,
                     rate * 60.0 / 1_000_000.0,
-                    format_number(dupes),
                     format_number(current_batch.len() as u64)
                 );
                 
@@ -186,26 +183,27 @@ impl BatchProcessor {
         
         Ok(GeneratorStats {
             total_generated: self.total_generated.load(Ordering::Relaxed),
-            duplicates_skipped: self.duplicates.load(Ordering::Relaxed),
+            duplicates_skipped: 0, // Sequential mode: no duplicates possible
             files_written: writer.files_written(),
             elapsed_secs: elapsed,
         })
     }
     
     /// Generate exactly N keys (for testing)
+    /// 
+    /// NOTE: No deduplication - sequential mode guarantees unique keys
     pub fn generate_n(&self, n: usize) -> Vec<KeyEntry> {
         let mut result = Vec::with_capacity(n);
         let mut encoder = AddressEncoder::new();
         
         while result.len() < n {
-            let batch = self.keygen.generate_batch(self.config.batch_size.min(n - result.len()));
+            let remaining = n - result.len();
+            let batch = self.keygen.generate_batch(self.config.batch_size.min(remaining));
             
             for raw in batch {
-                if self.seen_keys.insert(raw.private_key) {
-                    result.push(encoder.encode(&raw));
-                    if result.len() >= n {
-                        break;
-                    }
+                result.push(encoder.encode(&raw));
+                if result.len() >= n {
+                    break;
                 }
             }
         }
@@ -217,7 +215,7 @@ impl BatchProcessor {
     pub fn stats(&self, elapsed: Duration) -> GeneratorStats {
         GeneratorStats {
             total_generated: self.total_generated.load(Ordering::Relaxed),
-            duplicates_skipped: self.duplicates.load(Ordering::Relaxed),
+            duplicates_skipped: 0, // Sequential mode: no duplicates possible
             files_written: 0,
             elapsed_secs: elapsed.as_secs_f64(),
         }

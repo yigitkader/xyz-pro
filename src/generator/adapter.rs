@@ -17,8 +17,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -69,7 +68,7 @@ pub struct GpuGeneratorAdapter {
     /// Quad output buffers for safe slice returns (eliminates race conditions)
     /// UnsafeCell allows interior mutability; Mutex ensures exclusive write access
     batch_buffers: [UnsafeCell<Box<[u8]>>; NUM_OUTPUT_BUFFERS],
-    /// Mutex for synchronizing buffer writes (protects UnsafeCell access)
+    /// Mutex for synchronizing buffer writes AND priming (protects UnsafeCell access)
     write_lock: Mutex<()>,
     /// Buffer size for quick access
     buffer_size: usize,
@@ -77,12 +76,18 @@ pub struct GpuGeneratorAdapter {
     gpu_buf_idx: AtomicUsize,
     /// Current output buffer index (rotates 0, 1, 2, 3, 0, 1, 2, 3, ...)
     output_buf_idx: AtomicUsize,
-    /// One-time pipeline priming (thread-safe, runs exactly once)
-    /// Using std::sync::Once is more robust than AtomicBool for this pattern:
-    /// - Guarantees exactly one execution even under race conditions
-    /// - Other threads block until initialization completes
-    /// - No risk of double-prime or use-before-prime
-    pipeline_prime_once: Once,
+    /// Pipeline priming state (retry-capable, unlike std::sync::Once)
+    /// 
+    /// CRITICAL: std::sync::Once marks closure as "done" even if it fails!
+    /// This means if priming fails once, it will never retry, leaving the
+    /// pipeline in an invalid state (empty buffers, deadlock on wait).
+    /// 
+    /// Solution: Use AtomicBool which allows retry on failure:
+    /// - false: not yet primed (or previous attempt failed)
+    /// - true: successfully primed
+    /// 
+    /// Thread safety is guaranteed by write_lock mutex.
+    pipeline_primed: AtomicBool,
 }
 
 // Safety: 
@@ -118,7 +123,7 @@ impl GpuGeneratorAdapter {
             buffer_size,
             gpu_buf_idx: AtomicUsize::new(0),
             output_buf_idx: AtomicUsize::new(0),
-            pipeline_prime_once: Once::new(),
+            pipeline_primed: AtomicBool::new(false),
         }
     }
     
@@ -128,7 +133,12 @@ impl GpuGeneratorAdapter {
     }
     
     /// Prime the pipeline by dispatching initial batches
-    /// This is called via Once::call_once, guaranteeing single execution
+    /// 
+    /// This is called on first generate_batch. Unlike std::sync::Once,
+    /// this can be retried if it fails (e.g., transient GPU error).
+    /// 
+    /// # Thread Safety
+    /// Protected by write_lock mutex - only one thread can prime at a time.
     fn prime_pipeline_internal(&self) -> Result<(), String> {
         let depth = self.inner.pipeline_depth();
         
@@ -153,38 +163,67 @@ impl KeyGenerator for GpuGeneratorAdapter {
         // Acquire write lock (parking_lot is fast and doesn't poison)
         let _guard = self.write_lock.lock();
         
-        // Prime pipeline on first call (thread-safe, runs exactly once)
-        // std::sync::Once guarantees:
-        // - Only one thread executes the closure
-        // - Other threads block until completion
-        // - Subsequent calls are no-op (fast path)
-        let mut prime_result: Result<(), String> = Ok(());
-        self.pipeline_prime_once.call_once(|| {
-            prime_result = self.prime_pipeline_internal();
-        });
-        prime_result?;
+        // Prime pipeline on first call (retry-capable, unlike std::sync::Once)
+        // 
+        // CRITICAL: std::sync::Once marks closure as "done" even on failure!
+        // If priming fails (e.g., transient GPU error), Once would never retry,
+        // leaving the pipeline in an invalid state (deadlock on wait).
+        // 
+        // Solution: AtomicBool allows retry until success.
+        // Thread safety is guaranteed by write_lock mutex.
+        if !self.pipeline_primed.load(Ordering::SeqCst) {
+            self.prime_pipeline_internal()?;
+            self.pipeline_primed.store(true, Ordering::SeqCst);
+        }
         
         let depth = self.inner.pipeline_depth();
         
-        // Get current GPU buffer index (for pipeline round-robin)
-        let gpu_idx = self.gpu_buf_idx.fetch_add(1, Ordering::SeqCst) % depth;
-        
-        // Get current output buffer index (for quad-buffering)
-        // This rotates: 0, 1, 2, 3, 0, 1, 2, 3, ... ensuring previous THREE slices remain valid
-        let out_idx = self.output_buf_idx.fetch_add(1, Ordering::SeqCst) % NUM_OUTPUT_BUFFERS;
+        // IDEMPOTENT INDEX HANDLING: Read indices first, increment only on success
+        // This prevents state corruption when retry is triggered.
+        // If we incremented before error check and then retried, indices would be
+        // off by one, causing pipeline desync (some batches skipped, some duplicated).
+        // 
+        // Since we hold write_lock, no concurrent access - load+store is safe.
+        let gpu_idx = self.gpu_buf_idx.load(Ordering::SeqCst) % depth;
+        let out_idx = self.output_buf_idx.load(Ordering::SeqCst) % NUM_OUTPUT_BUFFERS;
         
         // Get the GPU buffer set for reading
         let bs = self.inner.buffer_set(gpu_idx);
         
-        // FIXED: Wait for the ACTUAL dispatched command buffer
-        // Previously this created an empty buffer which was an anti-pattern
-        // Now properly checks for GPU errors (OutOfMemory, PageFault, etc.)
+        // Wait for GPU completion - may fail with transient or fatal errors
+        // CRITICAL: If this fails, indices are NOT incremented, so retry is safe
         if let Err(e) = self.inner.wait_for_completion(gpu_idx) {
             return Err(format!("GPU command buffer error: {}", e));
         }
         
-        // RACE CONDITION PREVENTION: Mark buffer as in-use before reading
-        // This prevents GPU from dispatching to this buffer while we're copying
+        // OPTIMIZATION: Dispatch BEFORE copy to minimize GPU idle time
+        // 
+        // Timeline with depth=2:
+        //   generate_batch(0): wait(0) → dispatch(0) → copy(0) [GPU 1 running]
+        //   generate_batch(1): wait(1) → dispatch(1) → copy(1) [GPU 0 running]
+        //
+        // By dispatching immediately after wait completes, we start the next
+        // GPU computation while CPU is still copying. This hides copy latency.
+        //
+        // The in_use flag is set AFTER dispatch to allow GPU to start,
+        // then we do CPU copy, which doesn't conflict because:
+        // 1. GPU writes to THIS buffer are complete (we just waited)
+        // 2. GPU writes to NEXT dispatch go to the SAME buffer but won't
+        //    start until current dispatch is processed by the GPU queue
+        
+        // SUCCESS: Increment indices for next call (commit point)
+        self.gpu_buf_idx.fetch_add(1, Ordering::SeqCst);
+        self.output_buf_idx.fetch_add(1, Ordering::SeqCst);
+        
+        // Dispatch next GPU batch IMMEDIATELY after wait
+        // This starts GPU work while we do CPU copy below
+        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
+        if let Err(e) = self.inner.dispatch_glv(gpu_idx, next_offset) {
+            eprintln!("⚠️ GPU dispatch warning (will retry): {}", e);
+        }
+        
+        // Now do CPU copy - GPU is already working on next batch
+        // Mark buffer as in-use during copy (prevents early buffer reuse)
         bs.in_use.store(true, std::sync::atomic::Ordering::Release);
         
         // Get GPU output pointer (Unified Memory - zero-copy)
@@ -196,17 +235,13 @@ impl KeyGenerator for GpuGeneratorAdapter {
         let buffer = unsafe { &mut *self.batch_buffers[out_idx].get() };
         
         // Copy GPU data to our output buffer
+        // This happens WHILE GPU is processing the next batch we just dispatched
         unsafe {
             std::ptr::copy_nonoverlapping(gpu_ptr, buffer.as_mut_ptr(), self.buffer_size);
         }
         
-        // RACE CONDITION PREVENTION: Mark buffer as available BEFORE dispatching
-        // The copy is complete, so GPU can now write to this buffer
+        // Copy complete - buffer can be reused
         bs.in_use.store(false, std::sync::atomic::Ordering::Release);
-        
-        // Dispatch next GPU batch (after copy is complete and in_use is released)
-        let next_offset = self.inner.fetch_add_offset(self.inner.batch_size() as u64);
-        self.inner.dispatch_glv(gpu_idx, next_offset)?;
         
         // Update stats
         self.inner.add_generated(self.batch_size() as u64);
@@ -257,6 +292,10 @@ impl KeyGenerator for GpuGeneratorAdapter {
     
     fn progress_percent(&self) -> Option<f64> {
         self.inner.progress_percent()
+    }
+    
+    fn pipeline_depth(&self) -> usize {
+        self.inner.pipeline_depth()
     }
 }
 

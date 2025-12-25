@@ -1,8 +1,14 @@
-//! Address encoding for all 3 Bitcoin address types
+//! Address encoding for Bitcoin address types
 //! 
-//! - P2PKH: Legacy addresses (1...)
-//! - P2SH: Nested SegWit (3...)
-//! - P2WPKH: Native SegWit Bech32 (bc1q...)
+//! ## Supported Address Types
+//! - **P2PKH**: Legacy addresses (1...) - `HASH160(pubkey)`
+//! - **P2SH-P2WPKH**: Wrapped SegWit (3...) - `HASH160(0x0014 || HASH160(pubkey))`
+//! - **P2WPKH**: Native SegWit Bech32 (bc1q...) - `HASH160(pubkey)` with bech32
+//!
+//! ## Important Limitation
+//! The P2SH support is specifically for **P2SH-wrapped-P2WPKH** (single-key wrapped SegWit).
+//! Arbitrary P2SH scripts (like multisig) are NOT supported, as they require
+//! knowledge of the full redeem script, not just the public key.
 //!
 //! Uses thread-local singleton pattern for zero-allocation encoding.
 
@@ -99,17 +105,25 @@ impl AddressEncoder {
         base58check_encode(&self.base58_buffer)
     }
     
-    /// P2SH: Nested SegWit address (prefix 0x05 for mainnet)
-    /// Format: Base58Check(0x05 || HASH160(OP_0 PUSH20 <pubkey_hash>))
+    /// P2SH-P2WPKH: Wrapped SegWit address (prefix 0x05 for mainnet)
+    /// 
+    /// **IMPORTANT**: This generates P2SH-wrapped-P2WPKH addresses (3xxx format).
+    /// It does NOT support arbitrary P2SH scripts (like multisig).
+    /// 
+    /// Formula: Base58Check(0x05 || HASH160(0x0014 || pubkey_hash))
+    /// Where 0x0014 = OP_0 (0x00) + PUSH20 (0x14)
+    /// 
+    /// This is specifically for single-key wrapped SegWit, not general P2SH.
     #[inline]
     fn encode_p2sh(&mut self, pubkey_hash: &[u8; 20]) -> String {
         // Build witness program: OP_0 PUSH20 <20-byte-pubkey-hash>
+        // This is the redeemScript for P2SH-P2WPKH (wrapped SegWit)
         let mut witness_program = [0u8; 22];
-        witness_program[0] = 0x00; // OP_0
-        witness_program[1] = 0x14; // PUSH20 (20 bytes)
+        witness_program[0] = 0x00; // OP_0 (witness version 0)
+        witness_program[1] = 0x14; // PUSH20 (20 bytes = pubkey_hash length)
         witness_program[2..22].copy_from_slice(pubkey_hash);
         
-        // HASH160 of witness program
+        // HASH160 of witness program gives us the script hash for P2SH
         let script_hash = hash160(&witness_program);
         
         self.base58_buffer.clear();

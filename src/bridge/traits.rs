@@ -46,6 +46,17 @@ pub trait KeyGenerator: Send + Sync {
     fn progress_percent(&self) -> Option<f64> {
         None // Default: unknown progress
     }
+    
+    /// Get the pipeline depth (number of batches dispatched ahead)
+    /// 
+    /// This is used for draining the pipeline when range scanning completes.
+    /// When `is_range_complete()` returns true, there may still be `pipeline_depth - 1`
+    /// batches waiting in the GPU pipeline that need to be processed.
+    /// 
+    /// Default: 1 (no pipelining, each generate_batch is synchronous)
+    fn pipeline_depth(&self) -> usize {
+        1
+    }
 }
 
 /// Matcher Trait

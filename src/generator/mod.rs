@@ -67,12 +67,25 @@ pub struct KeyOutput {
 }
 
 /// Raw key data for internal processing (minimal allocations)
+/// 
 /// Layout must match GPU output: [privkey:32][pubkey_hash:20][p2sh_hash:20] = 72 bytes
+/// 
+/// ## Address Types Supported
+/// - **P2PKH** (1xxx): Uses `pubkey_hash` directly
+/// - **P2WPKH** (bc1q...): Uses `pubkey_hash` with bech32 encoding  
+/// - **P2SH-P2WPKH** (3xxx): Uses `p2sh_hash` (wrapped SegWit only)
+/// 
+/// **NOTE**: The `p2sh_hash` field is specifically for P2SH-wrapped-P2WPKH addresses.
+/// It does NOT support arbitrary P2SH scripts (like multisig). For multisig P2SH,
+/// a different approach with full script parsing would be required.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct RawKeyData {
+    /// Private key (32 bytes, big-endian)
     pub private_key: [u8; 32],
+    /// HASH160(compressed_pubkey) - used for P2PKH and P2WPKH addresses
     pub pubkey_hash: [u8; 20],
+    /// HASH160(0x0014 || pubkey_hash) - used for P2SH-P2WPKH (wrapped SegWit) only
     pub p2sh_hash: [u8; 20],
 }
 

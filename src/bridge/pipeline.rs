@@ -174,11 +174,14 @@ where
         
         self.print_banner();
         
+        let mut range_complete = false;
+        
         while !self.generator.should_stop() {
             // Check if range is complete BEFORE generating next batch
             // This prevents wrap-around when scanning specific ranges
             if self.generator.is_range_complete() {
                 println!("🏁 Range scan complete - reached end offset");
+                range_complete = true;
                 break;
             }
             
@@ -203,6 +206,38 @@ where
             if last_report.elapsed() >= report_interval {
                 self.report_progress(start_time.elapsed());
                 last_report = Instant::now();
+            }
+        }
+        
+        // CRITICAL: Drain the pipeline when range is complete
+        // The GPU pipeline has `pipeline_depth` batches dispatched ahead.
+        // When we break out of the loop, there are still batches waiting in the
+        // GPU that have been computed but not yet retrieved.
+        // Without draining, we lose the last `pipeline_depth - 1` batches of data!
+        if range_complete {
+            let depth = self.generator.pipeline_depth();
+            if depth > 1 {
+                println!("🔄 Draining pipeline ({} pending batches)...", depth - 1);
+                for _ in 0..(depth - 1) {
+                    // Generate batch to retrieve pending GPU results
+                    // This doesn't dispatch new work since range is complete
+                    if let Ok(batch_data) = self.generate_with_retry() {
+                        let batch = KeyBatch::new(batch_data);
+                        
+                        // Check for matches in drained batch
+                        let matches = if self.config.parallel_matching {
+                            self.match_batch_parallel(&batch)
+                        } else {
+                            self.matcher.check_batch(&batch)
+                        };
+                        
+                        if !matches.is_empty() {
+                            self.matches_found.fetch_add(matches.len() as u64, Ordering::Relaxed);
+                            self.output.on_matches(&matches)?;
+                        }
+                    }
+                }
+                println!("   ✓ Pipeline drained");
             }
         }
         
